@@ -6,17 +6,24 @@
 #  But  : tout installer et configurer avec des réglages sûrs, en guidant
 #         pas à pas, y compris pour ouvrir le port sur la box.
 #
-#  Installation :  sudo bash wg-pi.sh
+#  Installation :  curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | sudo bash
+#            ou :  sudo bash wg-pi.sh   (depuis le fichier téléchargé)
 #  Ensuite      :  sudo wg-pi          (menu)
 #                  sudo wg-pi help     (toutes les commandes)
 #
-#  Licence MIT
+#  Projet : https://github.com/y0uls/WireGuard-RP — Licence MIT
 # =============================================================================
 
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.0.0"
+readonly WGPI_VERSION="1.1.0"
+readonly WGPI_REPO="https://github.com/y0uls/WireGuard-RP"
+# Adresse de la dernière version (modifiable pour un fork : WGPI_URL=… sudo -E wg-pi update)
+readonly WGPI_URL="${WGPI_URL:-https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh}"
+# Fichier lancé, capturé hors de toute fonction : vide si le script arrive par un pipe
+# (dans une fonction, BASH_SOURCE[0] vaudrait alors « main » et pourrait désigner un fichier ./main)
+readonly WGPI_SELF="${BASH_SOURCE[0]:-}"
 readonly WG_IF="wg0"
 readonly WG_DIR="/etc/wireguard"
 readonly WG_CONF="$WG_DIR/$WG_IF.conf"
@@ -252,14 +259,21 @@ take_lock() {
   flock -n 9 || die "wg-pi est déjà en cours d'exécution dans un autre terminal."
 }
 
+# Chemin du fichier de ce script, vide s'il est lu depuis un pipe (curl … | sudo bash)
+self_path() {
+  local p=$WGPI_SELF
+  [[ -n $p && -f $p ]] && grep -q '^readonly WGPI_VERSION=' "$p" 2>/dev/null && readlink -f -- "$p"
+}
+
 require_root() {
   (( EUID == 0 )) && return 0
-  local self=""
-  [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]] && self=$(readlink -f -- "${BASH_SOURCE[0]}")
+  local self
+  self=$(self_path)
   if [[ -n $self ]] && command -v sudo >/dev/null 2>&1; then
     exec sudo -- bash "$self" "$@"
   fi
-  die "Ce script doit être lancé en administrateur : sudo bash $0"
+  if [[ -n $self ]]; then die "Ce script doit être lancé en administrateur : sudo bash $self"; fi
+  die "Ce script doit être lancé en administrateur : curl -fsSL $WGPI_URL | sudo bash"
 }
 
 # ----------------------------------------------------------------------------
@@ -425,7 +439,7 @@ save_settings() {
 }
 
 load_settings() {
-  is_installed || die "wg-pi n'est pas encore installé sur ce Pi. Lancez : sudo bash wg-pi.sh"
+  is_installed || die "wg-pi n'est pas encore installé sur ce Pi. Pour l'installer : curl -fsSL $WGPI_URL | sudo bash"
   # shellcheck source=/dev/null
   source "$SETTINGS_FILE"
 }
@@ -545,11 +559,42 @@ setup_unattended() {
   ok "Mises à jour de sécurité automatiques activées"
 }
 
+# download_script <variable> : télécharge la dernière version dans un fichier temporaire
+# et vérifie qu'il s'agit bien d'un script wg-pi valide
+download_script() {
+  local _f
+  _f=$(mktemp) || return 1
+  if ! curl -fsSL --max-time 60 "$WGPI_URL" -o "$_f" 2>>"$LOG_FILE"; then
+    rm -f "$_f"
+    return 1
+  fi
+  sed -i 's/\r$//' "$_f"   # au cas où le fichier aurait été envoyé avec des fins de ligne Windows
+  if ! head -n1 "$_f" | grep -q '^#!/usr/bin/env bash' || ! grep -q '^readonly WGPI_VERSION=' "$_f" ||
+     ! bash -n "$_f" 2>>"$LOG_FILE"; then
+    rm -f "$_f"
+    return 1
+  fi
+  printf -v "$1" '%s' "$_f"
+}
+
+script_version() { sed -n 's/^readonly WGPI_VERSION="\(.*\)"$/\1/p' "$1" | head -n1; }
+
+# put_bin <fichier> : remplace la commande wg-pi (renommage atomique, sans casser une exécution en cours)
+put_bin() {
+  install -m 755 "$1" "$BIN_PATH.new" && mv -f "$BIN_PATH.new" "$BIN_PATH"
+}
+
+# Installe la commande wg-pi : copie du fichier lancé, ou téléchargement depuis le dépôt
+# si le script arrive par un pipe (curl … | sudo bash)
 install_self() {
-  local src=""
-  [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]] && src=$(readlink -f -- "${BASH_SOURCE[0]}")
-  if [[ -n $src && $src != "$BIN_PATH" ]]; then
-    install -m 755 "$src" "$BIN_PATH" || return 1
+  local src tmp
+  src=$(self_path)
+  if [[ -n $src ]]; then
+    [[ $src == "$BIN_PATH" ]] || put_bin "$src" || return 1
+  else
+    download_script tmp || return 1
+    put_bin "$tmp"
+    rm -f "$tmp"
   fi
   [[ -x $BIN_PATH ]]
 }
@@ -632,7 +677,7 @@ upnp_open() {
   info "Ouverture automatique du port $WG_PORT/UDP sur la box (UPnP)…"
   out=$(upnpc -m "$LAN_IF" -s 2>&1)
   if ! grep -q "ExternalIPAddress" <<<"$out"; then
-    warn "La box ne répond pas en UPnP (option désactivée ?) : il faudra ouvrir le port à la main, je vous guide."
+    warn "La box ne répond pas en UPnP (option désactivée ?) : ouvrez le port à la main (guide pas à pas : sudo wg-pi box)."
     return 1
   fi
   ext=$(sed -n 's/^ExternalIPAddress = //p' <<<"$out" | head -n1 | tr -d '[:space:]')
@@ -645,7 +690,7 @@ upnp_open() {
     ok "Port $WG_PORT/UDP ouvert automatiquement sur la box"
     return 0
   fi
-  warn "La box a refusé l'ouverture automatique : il faudra le faire à la main, je vous guide."
+  warn "La box a refusé l'ouverture automatique : ouvrez le port à la main (guide pas à pas : sudo wg-pi box)."
   return 1
 }
 
@@ -763,8 +808,16 @@ add_client() {
   show_client "$name"
 }
 
+# Dossier ~/wireguard-clients de l'utilisateur qui a lancé sudo (vide si root direct)
+user_export_dir() {
+  local user=${SUDO_USER:-} home
+  [[ -n $user && $user != root ]] || return 0
+  home=$(getent passwd "$user" | cut -d: -f6)
+  [[ -n $home ]] && echo "$home/wireguard-clients"
+}
+
 remove_client() {
-  local name=$1 tmp user home
+  local name=$1 tmp dir
   client_exists "$name" || { fail "Aucun appareil nommé « $name »."; return 1; }
   tmp=$(mktemp)
   awk -v m="$MARK $name" -v p="$MARK " '
@@ -773,11 +826,8 @@ remove_client() {
     !skip { print }
   ' "$WG_CONF" >"$tmp" && cat "$tmp" >"$WG_CONF"
   rm -f "$tmp" "$CLIENTS_DIR/$name.conf"
-  user=${SUDO_USER:-}
-  if [[ -n $user && $user != root ]]; then
-    home=$(getent passwd "$user" | cut -d: -f6)
-    [[ -n $home ]] && rm -f "$home/wireguard-clients/$name.conf" "$home/wireguard-clients/$name.png"
-  fi
+  dir=$(user_export_dir)
+  [[ -n $dir ]] && rm -f "$dir/$name.conf" "$dir/$name.png"
   reload_wg
   ok "Appareil « $name » supprimé : il ne peut plus se connecter."
 }
@@ -1056,6 +1106,8 @@ choose_endpoint() {
     is_ipv4 "$OPT_ENDPOINT" || is_hostname "$OPT_ENDPOINT" || die "Adresse --endpoint invalide : $OPT_ENDPOINT"
     ENDPOINT=$OPT_ENDPOINT DDNS=none
     ok "Adresse publique imposée : $ENDPOINT"
+    [[ $ENDPOINT == *.duckdns.org ]] &&
+      warn "Une adresse donnée directement n'est pas mise à jour automatiquement. Pour DuckDNS, utilisez le menu (sudo wg-pi endpoint, sans adresse)."
     return 0
   fi
 
@@ -1072,7 +1124,7 @@ choose_endpoint() {
   local def=1 c
   [[ $ISP == orange ]] && def=2
   [[ -z $PUBLIC_IP ]] && def=3
-  if (( AUTO )); then
+  if ! interactive; then
     [[ -n $PUBLIC_IP ]] || die "IP publique introuvable : précisez-la avec --endpoint <adresse>."
     def=1
   fi
@@ -1234,7 +1286,7 @@ step_first_client() {
     ask name "Nom du premier appareil (ex. telephone, pc-portable)" "${OPT_CLIENT:-telephone}"
     valid_name "$name" && break
     warn "Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _ (sans espace ni accent)."
-    (( AUTO )) && die "Nom d'appareil invalide : $name"
+    interactive || die "Nom d'appareil invalide : $name"
   done
   add_client "$name" "$DEFAULT_ROUTE" || return 1
   interactive || return 0
@@ -1262,6 +1314,7 @@ step_done() {
       "  ${BOLD}sudo wg-pi list${RESET}          voir les appareils et qui est connecté" \
       "  ${BOLD}sudo wg-pi check${RESET}         diagnostic si quelque chose ne marche pas" \
       "  ${BOLD}sudo wg-pi backup${RESET}        sauvegarde (les cartes SD finissent par s'user !)" \
+      "  ${BOLD}sudo wg-pi update${RESET}        mettre à jour wg-pi" \
       "  ${BOLD}sudo wg-pi help${RESET}          toutes les commandes" ""
   [[ -f /run/reboot-required ]] && warn "Le système demande un redémarrage (mises à jour en attente) : sudo reboot"
   return 0
@@ -1278,8 +1331,6 @@ cmd_install() {
     shift
   done
   is_installed && die "wg-pi est déjà installé. Menu : sudo wg-pi — pour repartir de zéro : sudo wg-pi uninstall"
-  [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]] ||
-    die "Téléchargez d'abord le script puis lancez-le depuis le fichier : sudo bash wg-pi.sh"
   take_lock
   step_intro
   step_system
@@ -1316,7 +1367,7 @@ cmd_add() {
       if client_exists "$name"; then warn "Ce nom est déjà pris."; else warn "Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _."; fi
       interactive || exit 1
     done
-    choose c "Que doit faire passer cet appareil par la maison ?" "$([[ $DEFAULT_ROUTE == split ]] && echo 2 || echo 1)" \
+    choose c "Que doit faire passer cet appareil par la maison ?" "$([[ $route == split ]] && echo 2 || echo 1)" \
       "Tout son trafic" "Seulement l'accès au réseau de la maison"
     if (( c == 2 )); then route="split"; else route="full"; fi
   fi
@@ -1464,8 +1515,19 @@ cmd_check() {
 
 cmd_box() {
   load_settings
+  local old_ip=$LAN_IP
   detect_network
   title "Configurer la box"
+  if [[ $LAN_IP != "$old_ip" ]]; then
+    warn "L'adresse du Pi a changé : $old_ip → $LAN_IP. La redirection de la box doit maintenant pointer vers $LAN_IP."
+    if ask_yn "Enregistrer la nouvelle adresse du Pi ?" o; then
+      take_lock
+      save_settings
+      if (( IPV6_NAT )); then write_sysctl; sysctl -q -p "$SYSCTL_FILE" >>"$LOG_FILE" 2>&1; fi
+      ok "Nouvelle adresse enregistrée"
+    fi
+    echo
+  fi
   print_box_guide 1 1
   echo
 }
@@ -1475,6 +1537,10 @@ cmd_endpoint() {
   take_lock
   local f
   OPT_ENDPOINT=${1:-}
+  if [[ $DDNS == duckdns && -n $OPT_ENDPOINT && ${OPT_ENDPOINT,,} == "$ENDPOINT" ]]; then
+    ok "$ENDPOINT est déjà l'adresse utilisée, avec mise à jour DuckDNS automatique : rien à changer."
+    return 0
+  fi
   title "Changer l'adresse publique (actuellement : $ENDPOINT)"
   choose_endpoint
   for f in "$CLIENTS_DIR"/*.conf; do
@@ -1507,13 +1573,14 @@ cmd_backup() {
   [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && chown "$SUDO_USER:" "$f"
   ok "Sauvegarde créée : ${BOLD}$f${RESET}"
   warn "Elle contient les clés du VPN : gardez-la en lieu sûr (pas par e-mail)."
-  txt "   Restauration (ex. sur une nouvelle carte SD) : sudo bash wg-pi.sh restore $(basename "$f")"
+  txt "   Restauration (ex. sur une nouvelle carte SD), depuis le dossier de la sauvegarde :" \
+      "     curl -fsSL $WGPI_URL | sudo bash -s -- restore $(basename "$f")"
 }
 
 cmd_restore() {
   local file=${1:-} old_ip
-  [[ -f $file ]] || die "Usage : sudo bash wg-pi.sh restore <fichier-de-sauvegarde.tar.gz>"
-  [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]] || die "Lancez le script depuis le fichier : sudo bash wg-pi.sh restore …"
+  [[ -n $file ]] || die "Usage : sudo wg-pi restore <fichier.tar.gz>  (sur un Pi neuf : curl -fsSL $WGPI_URL | sudo bash -s -- restore <fichier.tar.gz>)"
+  [[ -f $file ]] || die "Fichier introuvable : $file"
   tar -tzf "$file" 2>/dev/null | grep -qx "${SETTINGS_FILE#/}" || die "Ce fichier n'est pas une sauvegarde wg-pi."
   take_lock
   if is_installed || [[ -f $WG_CONF ]]; then
@@ -1554,6 +1621,13 @@ cmd_uninstall() {
   if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q "^Status: active"; then
     ufw delete allow "$WG_PORT/udp" >/dev/null 2>&1
   fi
+  # Copies des configurations dans ~/wireguard-clients (elles contiennent les clés des appareils)
+  local dir name
+  dir=$(user_export_dir)
+  if [[ -n $dir && -d $dir ]]; then
+    while read -r name; do rm -f "$dir/$name.conf" "$dir/$name.png"; done < <(client_names)
+    rmdir "$dir" 2>/dev/null
+  fi
   rm -f "$WG_CONF" "$SYSCTL_FILE" "$UNATTENDED_FILE"
   rm -rf "$STATE_DIR"
   rm -f "$BIN_PATH"
@@ -1561,6 +1635,29 @@ cmd_uninstall() {
   txt "   • Les paquets restent installés (pour les retirer : sudo apt remove wireguard-tools qrencode miniupnpc)." \
       "   • Pensez à supprimer la redirection du port $WG_PORT/UDP sur la box." \
       "   • Le routage restera actif jusqu'au prochain redémarrage du Pi."
+  (( UNATTENDED )) && txt "   • Les mises à jour de sécurité automatiques restent actives (c'est recommandé)."
+  [[ $IP_MODE == nm ]] && txt "   • L'adresse IP fixe du Pi ($LAN_IP) reste configurée dans NetworkManager."
+  return 0
+}
+
+cmd_update() {
+  load_settings
+  take_lock
+  local tmp new old
+  old=$(script_version "$BIN_PATH" 2>/dev/null)
+  old=${old:-$WGPI_VERSION}
+  info "Recherche d'une nouvelle version sur $WGPI_REPO…"
+  command -v curl >/dev/null 2>&1 || ensure_packages curl ca-certificates || die "curl est nécessaire."
+  download_script tmp || die "Téléchargement impossible, ou fichier reçu invalide (rien n'a été changé). Détails : $LOG_FILE"
+  new=$(script_version "$tmp")
+  if [[ -f $BIN_PATH ]] && cmp -s "$tmp" "$BIN_PATH"; then
+    rm -f "$tmp"
+    ok "wg-pi est déjà à jour (v$old)."
+    return 0
+  fi
+  put_bin "$tmp" || { rm -f "$tmp"; die "Impossible de remplacer $BIN_PATH."; }
+  rm -f "$tmp"
+  ok "wg-pi mis à jour : v$old → v${new:-?} (vos réglages et appareils ne changent pas)"
 }
 
 cmd_menu() {
@@ -1576,7 +1673,8 @@ cmd_menu() {
         "   6) Aide pour configurer la box" \
         "   7) Changer l'adresse publique (IP, DuckDNS…)" \
         "   8) Sauvegarder la configuration" \
-        "   9) Désinstaller" \
+        "   9) Mettre à jour wg-pi" \
+        "  10) Désinstaller" \
         "   0) Quitter" ""
     ask c "Votre choix" "0"
     case $c in
@@ -1588,7 +1686,8 @@ cmd_menu() {
       6) (cmd_box) ;;
       7) (cmd_endpoint) ;;
       8) (cmd_backup) ;;
-      9) (cmd_uninstall); is_installed || return 0 ;;
+      9) (cmd_update) ;;
+      10) (cmd_uninstall); is_installed || return 0 ;;
       0|q|Q) return 0 ;;
       *) warn "Choix inconnu." ;;
     esac
@@ -1625,8 +1724,10 @@ Utilisation : sudo wg-pi [commande]
 
   (sans commande)       menu interactif (ou installation si rien n'est installé)
   install [options]     installation assistée
-  add [nom] [--split]   ajouter un appareil et afficher son QR code
-                        (--split : seulement l'accès au réseau de la maison)
+  add [nom] [--split|--full]
+                        ajouter un appareil et afficher son QR code
+                        (--split : seulement l'accès au réseau de la maison,
+                         --full : tout le trafic ; sinon le mode choisi à l'installation)
   remove [nom]          supprimer un appareil
   list                  appareils et état des connexions
   qr [nom]              réafficher le QR code / exporter la config d'un appareil
@@ -1635,6 +1736,7 @@ Utilisation : sudo wg-pi [commande]
   endpoint [adresse]    changer l'adresse publique (IP, nom de domaine, DuckDNS)
   backup                sauvegarder la configuration (clés comprises)
   restore <fichier>     restaurer une sauvegarde (ex. sur une nouvelle carte SD)
+  update                mettre à jour wg-pi depuis le dépôt GitHub
   uninstall             tout désinstaller
   help | version
 
@@ -1648,6 +1750,7 @@ Options d'installation :
   --client <nom>        nom du premier appareil (par défaut « telephone »)
 
 Journal : $LOG_FILE
+Projet  : $WGPI_REPO
 EOF
 }
 
@@ -1666,7 +1769,7 @@ main() {
 
   case $cmd in
     help|-h|--help|aide) usage; return 0 ;;
-    version|-v|--version) echo "wg-pi $WGPI_VERSION"; return 0 ;;
+    version|-v|--version) echo "wg-pi $WGPI_VERSION — $WGPI_REPO"; return 0 ;;
   esac
   require_root "${orig[@]+"${orig[@]}"}"
   init_input
@@ -1691,6 +1794,7 @@ main() {
     endpoint)                cmd_endpoint "$@" ;;
     backup|sauvegarde)       cmd_backup ;;
     restore)                 cmd_restore "$@" ;;
+    update|mise-a-jour)      cmd_update ;;
     uninstall|desinstaller)  cmd_uninstall ;;
     ddns-update)             cmd_ddns_update ;;
     upnp-refresh)            cmd_upnp_refresh ;;
