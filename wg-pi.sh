@@ -17,10 +17,13 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.1.1"
-readonly WGPI_REPO="https://github.com/y0uls/WireGuard-RP"
+readonly WGPI_VERSION="1.1.2"
+readonly WGPI_GH="y0uls/WireGuard-RP"
+readonly WGPI_BRANCH="main"
+readonly WGPI_REPO="https://github.com/$WGPI_GH"
+readonly WGPI_DEFAULT_URL="https://raw.githubusercontent.com/$WGPI_GH/$WGPI_BRANCH/wg-pi.sh"
 # Adresse de la dernière version (modifiable pour un fork : WGPI_URL=… sudo -E wg-pi update)
-readonly WGPI_URL="${WGPI_URL:-https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh}"
+readonly WGPI_URL="${WGPI_URL:-$WGPI_DEFAULT_URL}"
 # Fichier lancé, capturé hors de toute fonction : vide si le script arrive par un pipe
 # (dans une fonction, BASH_SOURCE[0] vaudrait alors « main » et pourrait désigner un fichier ./main)
 readonly WGPI_SELF="${BASH_SOURCE[0]:-}"
@@ -559,12 +562,35 @@ setup_unattended() {
   ok "Mises à jour de sécurité automatiques activées"
 }
 
+# Adresse à télécharger. Le lien « main » de raw.githubusercontent.com reste en cache jusqu'à
+# 5 minutes après un envoi : on demande donc le dernier commit à l'API GitHub et on télécharge
+# par son identifiant (adresse jamais en cache). Si l'API ne répond pas, on garde le lien habituel.
+latest_script_url() {
+  local sha
+  if [[ $WGPI_URL == "$WGPI_DEFAULT_URL" ]]; then
+    sha=$(curl -fsSL --max-time 15 -H "Accept: application/vnd.github.sha" \
+      "https://api.github.com/repos/$WGPI_GH/commits/$WGPI_BRANCH" 2>>"$LOG_FILE")
+    if [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
+      echo "https://raw.githubusercontent.com/$WGPI_GH/$sha/wg-pi.sh"
+      return 0
+    fi
+    echo "API GitHub indisponible, téléchargement via $WGPI_URL" >>"$LOG_FILE"
+    warn "API GitHub injoignable : la version récupérée peut avoir jusqu'à 5 minutes de retard." >&2
+  fi
+  echo "$WGPI_URL"
+}
+
+# version_lt <a> <b> : vrai si la version a est strictement plus ancienne que b
+version_lt() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]; }
+
 # download_script <variable> : télécharge la dernière version dans un fichier temporaire
 # et vérifie qu'il s'agit bien d'un script wg-pi valide
 download_script() {
-  local _f
+  local _f _url
   _f=$(mktemp) || return 1
-  if ! curl -fsSL --max-time 60 "$WGPI_URL" -o "$_f" 2>>"$LOG_FILE"; then
+  _url=$(latest_script_url)
+  echo "Téléchargement de $_url" >>"$LOG_FILE"
+  if ! curl -fsSL --max-time 60 "$_url" -o "$_f" 2>>"$LOG_FILE"; then
     rm -f "$_f"
     return 1
   fi
@@ -1667,6 +1693,12 @@ cmd_update() {
     ok "wg-pi est déjà à jour (v$old)."
     return 0
   fi
+  # Jamais de retour en arrière (ex. API en panne juste après un envoi → lien « main » encore en cache)
+  if [[ -n $new ]] && version_lt "$new" "$old"; then
+    rm -f "$tmp"
+    ok "Pas de version plus récente sur le dépôt (installée : v$old, dépôt : v$new)."
+    return 0
+  fi
   put_bin "$tmp" || { rm -f "$tmp"; die "Impossible de remplacer $BIN_PATH."; }
   rm -f "$tmp"
   ok "wg-pi mis à jour : v$old → v${new:-?} (vos réglages et appareils ne changent pas)"
@@ -1767,6 +1799,10 @@ EOF
 }
 
 main() {
+  # Copie temporaire lancée par l'amorçage plus bas : supprimée en sortant
+  if [[ -n ${WGPI_BOOTSTRAP:-} && $WGPI_BOOTSTRAP == "$WGPI_SELF" ]]; then
+    trap 'rm -f -- "$WGPI_BOOTSTRAP"' EXIT
+  fi
   local -a orig=("$@") args=()
   local a
   for a in "$@"; do
@@ -1784,6 +1820,14 @@ main() {
     version|-v|--version) echo "wg-pi $WGPI_VERSION — $WGPI_REPO"; return 0 ;;
   esac
   require_root "${orig[@]+"${orig[@]}"}"
+  # Arrivé par un pipe (curl … | sudo bash) : le lien « main » de GitHub peut servir une version
+  # en cache. On relance d'abord la toute dernière version, téléchargée par commit, pour que ce
+  # soit elle qui installe (et pas seulement elle qui soit copiée à la fin).
+  local boot
+  if [[ -z $(self_path) && $WGPI_URL == "$WGPI_DEFAULT_URL" && -z ${WGPI_BOOTSTRAP:-} ]] &&
+     command -v curl >/dev/null 2>&1 && download_script boot; then
+    WGPI_BOOTSTRAP=$boot exec bash "$boot" "${orig[@]+"${orig[@]}"}"
+  fi
   init_input
   touch "$LOG_FILE" 2>/dev/null
   trap 'printf "\n"; fail "Interrompu."; exit 130' INT

@@ -262,8 +262,9 @@ supprimez-le de l'ordinateur une fois importé : il contient la clé privée de 
 sudo wg-pi update
 ```
 
-La dernière version est téléchargée depuis ce dépôt et vérifiée avant de remplacer la commande.
-Vos réglages et vos appareils ne changent pas.
+La dernière version est téléchargée depuis ce dépôt, directement par le dernier commit (sans
+attendre le cache de GitHub), puis vérifiée avant de remplacer la commande. Vos réglages et vos
+appareils ne changent pas, et une version plus ancienne n'est jamais installée à la place.
 
 ## Sauvegarde et restauration
 
