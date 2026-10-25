@@ -28,6 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | 
 - [Installation](#installation)
 - [Aperçu](#aperçu)
 - [Utilisation](#utilisation)
+- [Interface web](#interface-web)
 - [Connecter un appareil](#connecter-un-appareil)
 - [Mise à jour](#mise-à-jour)
 - [Sauvegarde et restauration](#sauvegarde-et-restauration)
@@ -56,6 +57,8 @@ curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | 
 - **DNS au choix** : box, Cloudflare, Quad9, ou Pi-hole / AdGuard Home s'il est détecté sur le Pi.
 - **Commande `wg-pi`** pour gérer les appareils, faire un diagnostic complet, sauvegarder,
   restaurer et se mettre à jour.
+- **Interface web** (optionnelle) pour tout gérer depuis un navigateur, téléphone compris :
+  appareils connectés, ajout avec QR code, téléchargement du fichier `.conf`, suppression.
 - **Réglages sûrs par défaut** : clé pré-partagée par appareil, IPv6 sans fuite, compatibilité
   Docker et UFW, mises à jour de sécurité automatiques en option.
 
@@ -208,6 +211,7 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi endpoint [adresse]` | changer l'adresse publique : sans adresse, menu (IP, DuckDNS, nom de domaine) ; avec une adresse, IP ou nom fixe |
 | `sudo wg-pi backup` | sauvegarder la configuration, clés comprises |
 | `sudo wg-pi restore <fichier>` | restaurer une sauvegarde |
+| `sudo wg-pi web [off\|password]` | activer, désactiver l'interface web ou changer son mot de passe |
 | `sudo wg-pi update` | mettre à jour wg-pi depuis ce dépôt |
 | `sudo wg-pi uninstall` | tout désinstaller |
 | `sudo wg-pi help` | aide complète |
@@ -224,6 +228,47 @@ sudo wg-pi add nas-acces --split  # seulement l'accès au réseau de la maison
 ```
 
 `--yes` confirme automatiquement `remove` et `uninstall`, ce qui est pratique dans un script.
+
+## Interface web
+
+Tout ce que fait la commande `wg-pi` pour les appareils est aussi possible depuis un navigateur,
+sur un ordinateur ou sur le téléphone :
+
+- voir les appareils et qui est connecté (mise à jour automatique) ;
+- ajouter un appareil et afficher son **QR code** directement à l'écran ;
+- **télécharger le fichier `.conf`** d'un ordinateur, sans passer par `scp` ;
+- supprimer un appareil.
+
+Pour l'activer, y compris sur une installation existante après `sudo wg-pi update` :
+
+```bash
+sudo wg-pi web
+```
+
+Choisissez un mot de passe (8 caractères minimum), puis ouvrez l'adresse affichée,
+`https://<adresse du Pi>:51821`. Depuis l'extérieur, passez par le VPN avec
+`https://10.8.0.1:51821`.
+
+> [!NOTE]
+> La première fois, le navigateur affiche un avertissement de sécurité. C'est normal : le
+> certificat HTTPS a été créé par le Pi lui-même. Choisissez **Paramètres avancés** puis
+> **Continuer vers le site**.
+
+**Sécurité**
+- Le panneau n'accepte que le réseau de la maison et le VPN : **il n'y a rien à ouvrir sur la box,
+  et il ne faut surtout pas le faire**.
+- Il est servi en HTTPS et protégé par un mot de passe stocké haché. Les sessions sont protégées
+  contre le CSRF, et l'accès est bloqué 5 minutes après 5 essais ratés.
+- Il ne fait qu'appeler la commande `wg-pi` : le terminal et le navigateur voient toujours les mêmes
+  appareils.
+- Il ne demande que Python, déjà présent sur Raspberry Pi OS, sans Docker ni dépendance à
+  télécharger.
+
+| Commande | Rôle |
+|---|---|
+| `sudo wg-pi web` | activer (ou réafficher l'adresse) |
+| `sudo wg-pi web password` | changer le mot de passe (déconnecte les sessions ouvertes) |
+| `sudo wg-pi web off` | désactiver |
 
 ## Connecter un appareil
 
@@ -393,6 +438,7 @@ que le VPN est actif. C'est une limite commune à tous les VPN.
 | Appareils | `PersistentKeepalive = 25` pour garder la connexion à travers les NAT des réseaux mobiles |
 | Mises à jour | `unattended-upgrades` en option, dépôts Raspberry Pi OS inclus |
 | Sécurité des fichiers | clés et token DuckDNS en `600` (lisibles par root seulement) |
+| Interface web | Python (bibliothèque standard) en HTTPS sur le port 51821, réseau local et VPN uniquement, service `wg-pi-web` |
 
 Fichiers créés sur le Pi :
 
@@ -404,6 +450,7 @@ Fichiers créés sur le Pi :
 | `/etc/wg-pi/firewall.sh` | règles pare-feu et NAT |
 | `/etc/sysctl.d/99-wg-pi.conf` | activation du routage |
 | `/usr/local/sbin/wg-pi` | la commande de gestion |
+| `/etc/wg-pi/web.conf`, `/etc/wg-pi/web/` | interface web : port, mot de passe haché, certificat HTTPS |
 | `~/wireguard-clients/` | copies des configurations et QR codes, pour les récupérer facilement |
 
 ## Pourquoi ce projet
@@ -418,7 +465,8 @@ Plusieurs scripts existent déjà, mais aucun ne vise le cas « Raspberry Pi der
 | [wg-easy](https://github.com/wg-easy/wg-easy) | interface web | nécessite Docker ; la v15 ne prend plus en charge les Pi 32 bits |
 
 WireGuard-RP ajoute ce qui manque chez soi : le guidage pour la box et l'IP fixe, DuckDNS, l'UPnP,
-le test de connexion en direct, le diagnostic, la sauvegarde et la restauration.
+le test de connexion en direct, le diagnostic, la sauvegarde et la restauration. Il y ajoute une
+interface web sans Docker, qui fonctionne aussi sur les Pi 32 bits.
 
 > [!NOTE]
 > Le script a été testé dans un conteneur Debian 12 : installation, connexion réelle d'un client,

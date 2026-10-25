@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.1.2"
+readonly WGPI_VERSION="1.2.0"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -44,6 +44,11 @@ readonly LOCK_FILE="/run/wg-pi.lock"
 readonly MARK="### Client:"
 readonly KEEPALIVE=25
 readonly STEPS=7
+# Interface web d'administration (sudo wg-pi web)
+readonly WEB_CONF="$STATE_DIR/web.conf"
+readonly WEB_DIR="$STATE_DIR/web"
+readonly WEB_UNIT="wg-pi-web.service"
+readonly WEB_DEFAULT_PORT=51821
 
 # Réglages enregistrés dans $SETTINGS_FILE (valeurs par défaut ci-dessous)
 WG_PORT=51820
@@ -259,7 +264,12 @@ endpoint_str() {
 
 take_lock() {
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die "wg-pi est déjà en cours d'exécution dans un autre terminal."
+  if interactive; then
+    flock -n 9 || die "wg-pi est déjà en cours d'exécution dans un autre terminal."
+  else
+    # Sans terminal (interface web, scripts) : on attend son tour plutôt que d'échouer
+    flock -w 30 9 || die "Une autre opération wg-pi est en cours, réessayez dans un instant."
+  fi
 }
 
 # Chemin du fichier de ce script, vide s'il est lu depuis un pipe (curl … | sudo bash)
@@ -863,7 +873,14 @@ remove_client() {
   ' "$WG_CONF" >"$tmp" && cat "$tmp" >"$WG_CONF"
   rm -f "$tmp" "$CLIENTS_DIR/$name.conf"
   dir=$(user_export_dir)
-  [[ -n $dir ]] && rm -f "$dir/$name.conf" "$dir/$name.png"
+  if [[ -n $dir ]]; then
+    rm -f "$dir/$name.conf" "$dir/$name.png"
+  else
+    # Lancé sans sudo (interface web) : on retire la copie où qu'elle soit
+    for dir in /home/*/wireguard-clients; do
+      [[ -d $dir ]] && rm -f "$dir/$name.conf" "$dir/$name.png"
+    done
+  fi
   reload_wg
   ok "Appareil « $name » supprimé : il ne peut plus se connecter."
 }
@@ -1350,6 +1367,7 @@ step_done() {
       "  ${BOLD}sudo wg-pi list${RESET}          voir les appareils et qui est connecté" \
       "  ${BOLD}sudo wg-pi check${RESET}         diagnostic si quelque chose ne marche pas" \
       "  ${BOLD}sudo wg-pi backup${RESET}        sauvegarde (les cartes SD finissent par s'user !)" \
+      "  ${BOLD}sudo wg-pi web${RESET}           gérer le VPN depuis un navigateur (QR codes, appareils…)" \
       "  ${BOLD}sudo wg-pi update${RESET}        mettre à jour wg-pi" \
       "  ${BOLD}sudo wg-pi help${RESET}          toutes les commandes" ""
   [[ -f /run/reboot-required ]] && warn "Le système demande un redémarrage (mises à jour en attente) : sudo reboot"
@@ -1529,6 +1547,16 @@ cmd_check() {
     fi
   fi
 
+  if [[ -f $UNIT_DIR/$WEB_UNIT ]]; then
+    local wport
+    wport=$(web_conf_get port)
+    if systemctl is-active --quiet "$WEB_UNIT" && tcp_port_in_use "$wport"; then
+      ok "Interface web active : https://$LAN_IP:$wport"
+    else
+      fail "Interface web arrêtée → sudo wg-pi web  (journal : journalctl -u $WEB_UNIT)"; (( problems++ ))
+    fi
+  fi
+
   now=$(date +%s)
   while read -r _ _ pub; do
     (( total++ ))
@@ -1638,6 +1666,17 @@ cmd_restore() {
   save_settings
   apply_system || die "La restauration a échoué. Journal : $LOG_FILE"
   ok "Restauration terminée : vos appareils peuvent se reconnecter sans rien changer."
+  # L'interface web était activée dans la sauvegarde : on la remet en route (pas si elle avait été coupée)
+  if [[ $(web_conf_get enabled) == 1 && -n $(web_conf_get password) && -s $WEB_DIR/cert.pem ]] &&
+     ensure_packages python3 openssl; then
+    local wport
+    wport=$(web_conf_get port)
+    web_write_unit
+    web_ufw allow "$wport"
+    if web_start "$wport"; then ok "Interface web réactivée : https://$LAN_IP:$wport"
+    else warn "Interface web non redémarrée : sudo wg-pi web"
+    fi
+  fi
 }
 
 cmd_uninstall() {
@@ -1649,11 +1688,17 @@ cmd_uninstall() {
   fi
   ask_yn "Faire une sauvegarde avant ?" o && cmd_backup
   systemctl disable --now "wg-quick@$WG_IF" >>"$LOG_FILE" 2>&1
-  local t
+  local t wport
   for t in wg-pi-duckdns wg-pi-upnp; do
     systemctl disable --now "$t.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/$t.service" "$UNIT_DIR/$t.timer"
   done
+  if [[ -f $UNIT_DIR/$WEB_UNIT ]]; then
+    wport=$(web_conf_get port)
+    systemctl disable --now "$WEB_UNIT" >/dev/null 2>&1
+    rm -f "$UNIT_DIR/$WEB_UNIT"
+    [[ -n $wport ]] && web_ufw delete "$wport"
+  fi
   systemctl daemon-reload
   (( UPNP )) && command -v upnpc >/dev/null 2>&1 && upnpc -m "$LAN_IF" -d "$WG_PORT" UDP >/dev/null 2>&1
   if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q "^Status: active"; then
@@ -1702,6 +1747,791 @@ cmd_update() {
   put_bin "$tmp" || { rm -f "$tmp"; die "Impossible de remplacer $BIN_PATH."; }
   rm -f "$tmp"
   ok "wg-pi mis à jour : v$old → v${new:-?} (vos réglages et appareils ne changent pas)"
+  # L'interface web est générée par la commande : on la relance pour qu'elle prenne la nouvelle version
+  systemctl try-restart "$WEB_UNIT" >/dev/null 2>&1
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Interface web (sudo wg-pi web) : panneau HTTPS servi par le Pi, accessible
+# seulement depuis le réseau local et le VPN. Toutes les actions passent par wg-pi.
+# ----------------------------------------------------------------------------
+web_conf_get() { sed -n "s/^$1=//p" "$WEB_CONF" 2>/dev/null | head -n1; }
+
+web_conf_set() {
+  local tmp
+  install -d -m 700 "$STATE_DIR"
+  tmp=$(mktemp) || return 1
+  { grep -v "^$1=" "$WEB_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
+  cat "$tmp" >"$WEB_CONF"
+  rm -f "$tmp"
+  chmod 600 "$WEB_CONF"
+}
+
+tcp_port_in_use() { [[ -n $(ss -Hltn "sport = :$1" 2>/dev/null) ]]; }
+
+# Certificat auto-signé conforme aux exigences d'Apple (825 jours max, usage « serveur », pas une AC),
+# sinon Safari sur iPhone/Mac peut refuser la connexion. Renouvelé automatiquement par web-serve.
+web_make_cert() {
+  local host cfg rc
+  host=$(hostname)
+  install -d -m 700 "$WEB_DIR"
+  cfg=$(mktemp) || return 1
+  cat >"$cfg" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = wg-pi $host
+[ext]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = IP:$LAN_IP,IP:$WG_NET4.1,DNS:$host,DNS:$host.local
+EOF
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
+    -config "$cfg" -keyout "$WEB_DIR/key.pem" -out "$WEB_DIR/cert.pem"
+  rc=$?
+  rm -f "$cfg"
+  (( rc == 0 )) && chmod 600 "$WEB_DIR/key.pem" "$WEB_DIR/cert.pem"
+  return $rc
+}
+
+# Hache le mot de passe lu sur l'entrée standard (PBKDF2-SHA256, sel aléatoire)
+web_hash_password() {
+  python3 -I -c '
+import hashlib, os, sys
+pw = sys.stdin.buffer.read()
+salt = os.urandom(16)
+rounds = 200000
+print("pbkdf2_sha256$%d$%s$%s" % (rounds, salt.hex(), hashlib.pbkdf2_hmac("sha256", pw, salt, rounds).hex()))'
+}
+
+web_set_password() {
+  local p1="" p2 hash generated=0
+  if interactive; then
+    while true; do
+      printf '%s ' "${BOLD}?${RESET} Mot de passe de l'interface web (8 caractères minimum) :"
+      IFS= read -rs p1 <"$TTY" || p1=""
+      echo
+      (( ${#p1} >= 8 )) || { warn "Trop court : 8 caractères minimum."; continue; }
+      printf '%s ' "${BOLD}?${RESET} Retapez-le pour confirmer :"
+      IFS= read -rs p2 <"$TTY" || p2=""
+      echo
+      [[ $p1 == "$p2" ]] && break
+      warn "Les deux saisies sont différentes, recommencez."
+    done
+  else
+    p1=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+    generated=1
+  fi
+  hash=$(printf '%s' "$p1" | web_hash_password) || return 1
+  [[ $hash == pbkdf2_sha256\$* ]] || return 1
+  web_conf_set password "$hash"
+  (( generated )) && warn "Mot de passe généré (notez-le, il ne sera plus affiché) : $p1"
+  return 0
+}
+
+# web_ufw allow|delete <port> : autorise le panneau depuis le réseau local et le VPN si UFW est actif
+web_ufw() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  LC_ALL=C ufw status 2>/dev/null | grep -q "^Status: active" || return 0
+  local net
+  for net in "$LAN_NET" "$WG_NET4.0/24"; do
+    if [[ $1 == allow ]]; then
+      ufw allow from "$net" to any port "$2" proto tcp comment "wg-pi web" >>"$LOG_FILE" 2>&1
+    else
+      ufw delete allow from "$net" to any port "$2" proto tcp >>"$LOG_FILE" 2>&1
+    fi
+  done
+}
+
+web_write_unit() {
+  write_unit "$WEB_UNIT" "[Unit]" "Description=wg-pi : interface web d'administration du VPN" \
+    "Wants=network-online.target" "After=network-online.target wg-quick@$WG_IF.service" "" \
+    "[Service]" "ExecStart=$BIN_PATH web-serve" "Restart=on-failure" "RestartSec=5" \
+    "RuntimeDirectory=wg-pi-web" "RuntimeDirectoryMode=0700" "NoNewPrivileges=yes" "PrivateTmp=yes" "" \
+    "[Install]" "WantedBy=multi-user.target"
+  systemctl daemon-reload
+}
+
+# Démarre (ou redémarre) le service et attend que CE service écoute sur le port (et pas un autre
+# programme). En cas d'échec, le service est désactivé pour ne pas redémarrer en boucle.
+web_start() {
+  local port=$1 i pid
+  systemctl enable "$WEB_UNIT" >>"$LOG_FILE" 2>&1
+  if systemctl restart "$WEB_UNIT" >>"$LOG_FILE" 2>&1; then
+    for (( i = 0; i < 20; i++ )); do
+      sleep 0.5
+      pid=$(systemctl show -p MainPID --value "$WEB_UNIT" 2>/dev/null)
+      [[ -n $pid && $pid != 0 ]] && ss -Hltnp "sport = :$port" 2>/dev/null | grep -q "pid=$pid," && return 0
+    done
+  fi
+  systemctl disable --now "$WEB_UNIT" >>"$LOG_FILE" 2>&1
+  return 1
+}
+
+web_print_access() {
+  local port=$1
+  echo
+  txt "Ouvrez dans un navigateur (ordinateur ou téléphone) :"
+  kv "Depuis la maison" "https://$LAN_IP:$port"
+  kv "Depuis le VPN" "https://$WG_NET4.1:$port"
+  echo
+  txt "${DIM}La première fois, le navigateur affiche un avertissement de sécurité : c'est normal, le certificat${RESET}" \
+      "${DIM}a été créé par le Pi lui-même. Choisissez « Paramètres avancés » puis « Continuer vers le site ».${RESET}" \
+      "${DIM}Le panneau n'est joignable que depuis le réseau de la maison et le VPN : rien à ouvrir sur la box.${RESET}" "" \
+      "  Changer le mot de passe : ${BOLD}sudo wg-pi web password${RESET}   ·   Désactiver : ${BOLD}sudo wg-pi web off${RESET}"
+}
+
+web_enable() {
+  local port inst
+  take_lock
+  title "Interface web d'administration"
+  ensure_packages python3 openssl || die "Impossible d'installer python3 et openssl."
+  port=$(web_conf_get port)
+  # Pas de port enregistré, ou port repris entre-temps par un autre programme : on en choisit un libre
+  if [[ ! $port =~ ^[0-9]+$ ]] || { ! systemctl is-active --quiet "$WEB_UNIT" && tcp_port_in_use "$port"; }; then
+    port=$WEB_DEFAULT_PORT
+    while tcp_port_in_use "$port"; do (( port++ )); done
+    web_conf_set port "$port"
+  fi
+  # Le service lance la commande installée : elle doit connaître « web-serve »
+  inst=$(script_version "$BIN_PATH" 2>/dev/null)
+  if [[ -z $inst ]] || version_lt "$inst" "$WGPI_VERSION"; then
+    install_self || die "Impossible d'installer la commande wg-pi : lancez d'abord sudo wg-pi update."
+  fi
+  if [[ ! -s $WEB_DIR/cert.pem || ! -s $WEB_DIR/key.pem ]]; then
+    run "Création du certificat HTTPS du Pi" web_make_cert || die "Impossible de créer le certificat HTTPS."
+  fi
+  if [[ -z $(web_conf_get password) ]]; then
+    web_set_password || die "Le mot de passe n'a pas pu être enregistré."
+  fi
+  web_write_unit
+  web_ufw allow "$port"
+  if ! run "Démarrage de l'interface web (port $port)" web_start "$port"; then
+    journalctl -u "$WEB_UNIT" -n 20 --no-pager >&2
+    die "L'interface web ne démarre pas. Journal : journalctl -u $WEB_UNIT"
+  fi
+  web_conf_set enabled 1
+  ok "Interface web active (elle redémarrera toute seule avec le Pi)"
+  web_print_access "$port"
+}
+
+web_disable() {
+  local port
+  take_lock
+  port=$(web_conf_get port)
+  systemctl disable --now "$WEB_UNIT" >>"$LOG_FILE" 2>&1
+  rm -f "$UNIT_DIR/$WEB_UNIT"
+  systemctl daemon-reload
+  [[ -n $port ]] && web_ufw delete "$port"
+  web_conf_set enabled 0
+  ok "Interface web désactivée (mot de passe et certificat conservés pour une prochaine activation)."
+}
+
+cmd_web() {
+  load_settings
+  case ${1:-on} in
+    on|activer)
+      web_enable ;;
+    off|desactiver)
+      web_disable ;;
+    password|mot-de-passe)
+      take_lock
+      web_set_password || die "Le mot de passe n'a pas pu être enregistré."
+      # Les sessions sont en mémoire : redémarrer le panneau déconnecte tout le monde
+      systemctl try-restart "$WEB_UNIT" >/dev/null 2>&1
+      ok "Mot de passe de l'interface web changé (les sessions ouvertes ont été fermées)." ;;
+    *)
+      die "Usage : sudo wg-pi web [on|off|password]" ;;
+  esac
+}
+
+# Lancé par le service : écrit l'application de la version installée puis la démarre
+cmd_web_serve() {
+  load_settings
+  local port app dir=${RUNTIME_DIRECTORY:-/run/wg-pi-web}
+  port=$(web_conf_get port)
+  [[ $port =~ ^[0-9]+$ ]] || port=$WEB_DEFAULT_PORT
+  # Certificat absent ou expirant dans moins de 30 jours : on le refait
+  if ! openssl x509 -checkend 2592000 -noout -in "$WEB_DIR/cert.pem" >/dev/null 2>&1; then
+    web_make_cert >/dev/null 2>&1 || echo "wg-pi : impossible de renouveler le certificat HTTPS" >&2
+  fi
+  install -d -m 700 "$dir"
+  app="$dir/web.py"
+  web_app_source >"$app"
+  # env plutôt qu'une affectation devant exec : WGPI_VERSION est en lecture seule dans ce script
+  exec env WGPI_WEB_PORT="$port" WGPI_BIN="$BIN_PATH" WGPI_VERSION="$WGPI_VERSION" WGPI_WEB_CONF="$WEB_CONF" \
+    WGPI_WEB_DIR="$WEB_DIR" WGPI_CLIENTS="$CLIENTS_DIR" python3 -I "$app"
+}
+
+# État du serveur et des appareils en JSON (lu par l'interface web). Les champs sont sûrs :
+# noms validés, adresses IP, clés et compteurs ; aucun échappement JSON n'est nécessaire.
+cmd_json() {
+  load_settings
+  local -A hs=() rx=() tx=() ep=()
+  local pub _psk endpoint _allowed latest r t _ka name ip mode first=1 running=false
+  if wg show "$WG_IF" >/dev/null 2>&1; then
+    while IFS=$'\t' read -r pub _psk endpoint _allowed latest r t _ka; do
+      hs["$pub"]=$latest rx["$pub"]=$r tx["$pub"]=$t ep["$pub"]=$endpoint
+    done < <(wg show "$WG_IF" dump | tail -n +2)
+  fi
+  wg_running && running=true
+  printf '{"version":"%s","running":%s,"endpoint":"%s","net":"%s","lan_ip":"%s","default_route":"%s","now":%s,"peers":[' \
+    "$WGPI_VERSION" "$running" "$(endpoint_str)" "$WG_NET4.0/24" "$LAN_IP" "$DEFAULT_ROUTE" "$(date +%s)"
+  while read -r name ip pub; do
+    mode="split"
+    grep -q '^AllowedIPs = 0\.0\.0\.0/0' "$CLIENTS_DIR/$name.conf" 2>/dev/null && mode="full"
+    (( first )) || printf ','
+    first=0
+    printf '{"name":"%s","ip":"%s","mode":"%s","handshake":%s,"rx":%s,"tx":%s,"endpoint":"%s"}' \
+      "$name" "$ip" "$mode" "${hs["$pub"]:-0}" "${rx["$pub"]:-0}" "${tx["$pub"]:-0}" "${ep["$pub"]:-}"
+  done < <(peers_table)
+  printf ']}\n'
+}
+
+# Application web (Python 3, bibliothèque standard uniquement)
+web_app_source() {
+  cat <<'PYEOF'
+#!/usr/bin/env python3
+# Interface web de wg-pi, écrite et lancée par « wg-pi web-serve » (service wg-pi-web).
+# Bibliothèque standard uniquement. Toutes les modifications passent par la commande wg-pi.
+import base64
+import hashlib
+import hmac
+import html
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = os.environ.get("WGPI_VERSION", "?")
+PORT = int(os.environ.get("WGPI_WEB_PORT", "51821"))
+WGPI = os.environ.get("WGPI_BIN", "/usr/local/sbin/wg-pi")
+CONF = os.environ.get("WGPI_WEB_CONF", "/etc/wg-pi/web.conf")
+WEB_DIR = os.environ.get("WGPI_WEB_DIR", "/etc/wg-pi/web")
+CLIENTS = os.environ.get("WGPI_CLIENTS", "/etc/wg-pi/clients")
+COOKIE = "wgpi_session"
+SESSION_TTL = 12 * 3600
+MAX_FAILS = 5
+BLOCK_SECONDS = 300
+NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,15}")
+NEW_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")  # pas de « - » en tête (pris pour une option)
+# Seuls le réseau local, le VPN et la machine elle-même peuvent joindre le panneau
+ALLOWED_NETS = [ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
+CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self'; "
+       "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+
+sessions = {}   # jeton -> {"expires": horodatage, "csrf": jeton anti-CSRF}
+failures = {}   # ip -> (échecs, bloqué jusqu'à)
+lock = threading.Lock()
+login_lock = threading.Lock()   # une vérification de mot de passe à la fois (limite le débit des essais)
+esc = html.escape
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_conf():
+    conf = {}
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    conf[key] = value
+    except OSError:
+        pass
+    return conf
+
+
+def check_password(password):
+    try:
+        algo, rounds, salt, digest = read_conf().get("password", "").split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        calc = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(rounds)).hex()
+        return hmac.compare_digest(calc.encode(), digest.encode())
+    except ValueError:
+        return False
+
+
+def same(a, b):
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def run_wgpi(*args, timeout=90):
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    try:
+        return subprocess.run([WGPI, *args], stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", "wg-pi ne répond pas (délai dépassé).")
+
+
+def clean_message(text):
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+    lines = [line.strip().lstrip("✖⚠✔➜").strip() for line in text.splitlines() if line.strip()]
+    return " ".join(lines)[:400] or "Erreur inconnue."
+
+
+def human_bytes(n):
+    n = float(n or 0)
+    for unit in ("o", "Ko", "Mo", "Go", "To"):
+        if n < 1024 or unit == "To":
+            text = f"{n:.0f} {unit}" if unit == "o" else f"{n:.1f} {unit}"
+            return text.replace(".", ",")
+        n /= 1024
+
+
+def ago(ts, now):
+    s = max(0, int(now - ts))
+    if s < 60:
+        return f"il y a {s} s"
+    if s < 3600:
+        return f"il y a {s // 60} min"
+    if s < 86400:
+        return f"il y a {s // 3600} h"
+    return f"il y a {s // 86400} j"
+
+
+def get_status():
+    r = run_wgpi("json", timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(clean_message(r.stderr or r.stdout))
+    data = json.loads(r.stdout)
+    now = data.get("now") or time.time()
+    online = 0
+    for p in data["peers"]:
+        hs = int(p.get("handshake") or 0)
+        p["connected"] = hs > 0 and now - hs < 180
+        online += 1 if p["connected"] else 0
+        p["state"] = "● connecté" if p["connected"] else (ago(hs, now) if hs else "jamais")
+        p["rx_h"] = human_bytes(p.get("rx"))
+        p["tx_h"] = human_bytes(p.get("tx"))
+    data["online"] = online
+    return data
+
+
+def client_conf_path(name):
+    if not NAME_RE.fullmatch(name or ""):
+        return None
+    path = os.path.join(CLIENTS, name + ".conf")
+    return path if os.path.isfile(path) else None
+
+
+def qr_png_base64(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"], input=data,
+                       capture_output=True, timeout=20)
+    return base64.b64encode(r.stdout).decode("ascii") if r.returncode == 0 else ""
+
+
+CSS = """
+:root{--bg:#f3f5f7;--card:#fff;--text:#1d2329;--muted:#5f6b76;--line:#dde3e8;--accent:#88171a;--on-accent:#fff;
+--ok:#1a7f37;--ok-bg:#e6f4ea;--err:#b42318;--err-bg:#fdecea}
+@media (prefers-color-scheme:dark){:root{--bg:#111417;--card:#1b2026;--text:#e6e9ec;--muted:#9aa5af;--line:#2c333b;
+--accent:#e0484d;--on-accent:#fff;--ok:#4cc26a;--ok-bg:#16301e;--err:#ff7b72;--err-bg:#3a1714}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{background:var(--card);border-bottom:1px solid var(--line)}
+.wrap{max-width:980px;margin:0 auto;padding:16px}
+header .wrap{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:10px;padding-bottom:10px}
+.brand{font-weight:700;font-size:18px;color:inherit;text-decoration:none}
+.brand small{color:var(--muted);font-weight:400;font-size:13px;margin-left:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:16px 0}
+h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0 16px}
+.kv span{display:block;color:var(--muted);font-size:13px}.kv b{font-size:15px;word-break:break-all}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--muted);font-weight:600;font-size:13px}tr:last-child td{border-bottom:none}
+.state.on{color:var(--ok);font-weight:600}.muted{color:var(--muted)}.small{font-size:13px}.num{white-space:nowrap}
+.actions{display:flex;flex-wrap:wrap;gap:6px}
+a{color:var(--accent)}
+.btn,button{display:inline-block;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;
+padding:7px 12px;font:inherit;font-size:14px;line-height:1.3;cursor:pointer;text-decoration:none}
+.btn.primary,button.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+button.danger{color:var(--err);border-color:var(--err)}
+form.inline{display:inline;margin:0}
+input[type=text],input[type=password]{width:100%;max-width:360px;padding:9px 11px;border:1px solid var(--line);
+border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
+label{display:block;margin:12px 0 4px;font-weight:600}
+label.radio{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-weight:400}
+.msg{border-radius:8px;padding:10px 12px;margin:12px 0}.msg.ok{background:var(--ok-bg);color:var(--ok)}
+.msg.err{background:var(--err-bg);color:var(--err)}
+.qr{display:block;width:100%;max-width:300px;height:auto;image-rendering:pixelated;background:#fff;border-radius:8px;margin:8px auto}
+.center{text-align:center}
+footer{color:var(--muted);font-size:13px;text-align:center;padding:8px 16px 28px}
+@media (max-width:640px){.hide-sm{display:none}
+#devices thead{display:none}#devices tr{display:block;padding:12px 0;border-bottom:1px solid var(--line)}
+#devices tr:last-child{border-bottom:none}#devices td{display:inline-block;border:none;padding:2px 12px 2px 0}
+#devices td:first-child{display:block;font-size:16px}#devices td:last-child{display:block;padding-top:8px}
+#devices td.rx,#devices td.tx{display:none}}
+"""
+
+APP_JS = r"""
+"use strict";
+document.addEventListener("submit", function (e) {
+  var f = e.target, msg = f.getAttribute("data-confirm");
+  if (msg && !window.confirm(msg)) { e.preventDefault(); return; }
+  if (f.getAttribute("data-sent")) { e.preventDefault(); return; }  /* pas de double envoi */
+  f.setAttribute("data-sent", "1");
+});
+window.addEventListener("pageshow", function () {
+  document.querySelectorAll("form[data-sent]").forEach(function (f) { f.removeAttribute("data-sent"); });
+});
+function refresh() {
+  fetch("/api/status", {credentials: "same-origin", cache: "no-store"}).then(function (r) {
+    if (r.status === 401) { window.location.href = "/login"; return null; }
+    return r.ok ? r.json() : null;
+  }).then(function (d) {
+    if (!d) { return; }
+    d.peers.forEach(function (p) {
+      var row = document.querySelector('tr[data-name="' + p.name + '"]');
+      if (!row) { return; }
+      var st = row.querySelector(".state");
+      st.textContent = p.state;
+      st.className = "state" + (p.connected ? " on" : "");
+      row.querySelector(".rx").textContent = p.rx_h;
+      row.querySelector(".tx").textContent = p.tx_h;
+    });
+    var c = document.getElementById("online-count");
+    if (c) { c.textContent = d.online + " / " + d.peers.length; }
+  }).catch(function () {});
+}
+if (document.getElementById("devices")) { window.setInterval(refresh, 10000); }
+"""
+
+
+def page(title, body, sess=None):
+    logout = ""
+    if sess:
+        logout = (f'<form method="post" action="/logout" class="inline">'
+                  f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
+                  f'<button type="submit">Déconnexion</button></form>')
+    return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<meta name="robots" content="noindex"><title>{esc(title)} · wg-pi</title>'
+            f'<style>{CSS}</style></head><body>'
+            f'<header><div class="wrap"><a class="brand" href="/">wg-pi<small>VPN WireGuard · v{esc(VERSION)}</small></a>'
+            f'{logout}</div></header><main class="wrap">{body}</main>'
+            f'<footer>Panneau accessible uniquement depuis le réseau de la maison et le VPN.</footer>'
+            f'<script src="/static/app.js"></script></body></html>')
+
+
+def login_page(error=""):
+    err = f'<div class="msg err">{esc(error)}</div>' if error else ""
+    body = f"""<div class="card" style="max-width:400px;margin:40px auto"><h1>Connexion</h1>{err}
+<form method="post" action="/login"><label for="password">Mot de passe</label>
+<input type="password" id="password" name="password" required autofocus autocomplete="current-password">
+<p><button type="submit" class="primary">Se connecter</button></p></form>
+<p class="muted small">Mot de passe oublié ? Sur le Pi : <code>sudo wg-pi web password</code></p></div>"""
+    return page("Connexion", body)
+
+
+def dashboard(sess, msg="", err=""):
+    try:
+        st = get_status()
+    except Exception as e:  # état illisible : on l'affiche plutôt que de planter
+        return page("Appareils", f'<div class="msg err">Impossible de lire l\'état du VPN : {esc(str(e))}</div>', sess)
+    csrf = esc(sess["csrf"])
+    flash = (f'<div class="msg ok">{esc(msg)}</div>' if msg else "") + (f'<div class="msg err">{esc(err)}</div>' if err else "")
+    if st.get("running"):
+        server = '<b class="state on">● actif</b>'
+    else:
+        server = '<b style="color:var(--err)">● arrêté</b> <span class="muted small">(sudo wg-pi check)</span>'
+    rows = []
+    for p in st["peers"]:
+        n = esc(p["name"])
+        mode = "Tout le trafic" if p["mode"] == "full" else "Réseau maison"
+        on = " on" if p["connected"] else ""
+        rows.append(f"""<tr data-name="{n}"><td><a href="/device/{n}"><b>{n}</b></a></td>
+<td class="num">{esc(p['ip'])}</td><td class="hide-sm">{mode}</td><td class="state{on}">{esc(p['state'])}</td>
+<td class="num hide-sm rx">{esc(p['rx_h'])}</td><td class="num hide-sm tx">{esc(p['tx_h'])}</td>
+<td><div class="actions"><a class="btn" href="/device/{n}">QR code</a><a class="btn" href="/device/{n}/conf">Fichier</a>
+<form method="post" action="/remove" class="inline" data-confirm="Supprimer « {n} » ? Il ne pourra plus se connecter.">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="name" value="{n}">
+<button type="submit" class="danger">Supprimer</button></form></div></td></tr>""")
+    if rows:
+        table = (f'<div class="scroll"><table id="devices"><thead><tr><th>Appareil</th><th>IP VPN</th>'
+                 f'<th class="hide-sm">Mode</th><th>Dernière connexion</th><th class="hide-sm">Reçu</th>'
+                 f'<th class="hide-sm">Envoyé</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
+    else:
+        table = '<p class="muted">Aucun appareil pour l\'instant : ajoutez-en un ci-dessous.</p>'
+    split = st.get("default_route") == "split"
+    body = f"""{flash}<div class="card"><div class="grid">
+<div class="kv"><span>Serveur</span>{server}</div>
+<div class="kv"><span>Adresse publique</span><b>{esc(st['endpoint'])}</b></div>
+<div class="kv"><span>Réseau du VPN</span><b>{esc(st['net'])}</b></div>
+<div class="kv"><span>Connectés en ce moment</span><b id="online-count">{st['online']} / {len(st['peers'])}</b></div>
+</div></div>
+<div class="card"><h2>Appareils</h2>{table}</div>
+<div class="card"><h2>Ajouter un appareil</h2><form method="post" action="/add">
+<input type="hidden" name="csrf" value="{csrf}">
+<label for="name">Nom de l'appareil</label>
+<input type="text" id="name" name="name" required maxlength="15" pattern="[A-Za-z0-9_][A-Za-z0-9_\\-]{{0,14}}"
+ placeholder="ex. telephone, pc-salon" autocomplete="off" autocapitalize="off" spellcheck="false">
+<div class="muted small">1 à 15 caractères : lettres, chiffres, - et _ (sans espace ni accent).</div>
+<label>Ce que l'appareil fait passer par la maison</label>
+<label class="radio"><input type="radio" name="mode" value="full"{"" if split else " checked"}>
+<span><b>Tout son trafic</b><br><span class="muted small">Sécurité sur les Wi-Fi publics, Internet « depuis la maison »</span></span></label>
+<label class="radio"><input type="radio" name="mode" value="split"{" checked" if split else ""}>
+<span><b>Seulement le réseau de la maison</b><br><span class="muted small">NAS, PC de jeu, imprimante… le reste passe en direct</span></span></label>
+<p><button type="submit" class="primary">Créer et afficher le QR code</button></p></form></div>"""
+    return page("Appareils", body, sess)
+
+
+def device_page(sess, name, new=False):
+    path = client_conf_path(name)
+    if not path:
+        return None
+    n = esc(name)
+    csrf = esc(sess["csrf"])
+    qr = qr_png_base64(path)
+    img = (f'<img class="qr" alt="QR code de configuration de {n}" src="data:image/png;base64,{qr}">'
+           if qr else '<div class="msg err">QR code indisponible (qrencode).</div>')
+    banner = '<div class="msg ok">Appareil créé : scannez le QR code avec l\'application WireGuard.</div>' if new else ""
+    body = f"""<p><a href="/">← Tous les appareils</a></p>{banner}
+<div class="card center"><h1>{n}</h1>{img}
+<p class="muted small">Ce QR code contient la clé privée de l'appareil : ne le partagez pas.</p></div>
+<div class="cards">
+<div class="card"><h2>Téléphone ou tablette</h2><ol>
+<li>Installez l'application <b>WireGuard</b> (App Store / Google Play).</li>
+<li>Appuyez sur <b>+</b> › <b>Scanner un code QR</b>.</li>
+<li>Visez le QR code ci-dessus, puis activez le tunnel.</li></ol></div>
+<div class="card"><h2>Ordinateur</h2><ol>
+<li><a class="btn primary" href="/device/{n}/conf">Télécharger {n}.conf</a></li>
+<li>Application WireGuard › <b>Importer un tunnel depuis un fichier</b>.</li>
+<li>Supprimez ensuite le fichier téléchargé : il contient la clé privée.</li></ol></div>
+</div>
+<div class="card"><h2>Supprimer cet appareil</h2>
+<p class="muted">Il ne pourra plus se connecter. Les autres appareils ne sont pas touchés.</p>
+<form method="post" action="/remove" data-confirm="Supprimer « {n} » ? Il ne pourra plus se connecter.">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="name" value="{n}">
+<button type="submit" class="danger">Supprimer {n}</button></form></div>"""
+    return page(name, body, sess)
+
+
+def not_found(sess):
+    return page("Introuvable", '<div class="msg err">Cet appareil n\'existe pas (ou plus).</div>'
+                '<p><a href="/">← Tous les appareils</a></p>', sess)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "wg-pi"
+    sys_version = ""
+    timeout = 30
+
+    def setup(self):
+        super().setup()
+        self.connection.do_handshake()
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def is_allowed(self):
+        try:
+            ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return any(ip in net for net in ALLOWED_NETS)
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", CSP)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, location, headers=None):
+        self.send(303, "", headers=dict({"Location": location}, **(headers or {})))
+
+    def forbidden(self):
+        self.send(403, "Accès réservé au réseau de la maison et au VPN.\n", "text/plain; charset=utf-8")
+
+    def get_session(self):
+        token = ""
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == COOKIE:
+                token = value
+        if not token:
+            return None
+        with lock:
+            s = sessions.get(token)
+            if not s or s["expires"] < time.time():
+                sessions.pop(token, None)
+                return None
+            s["expires"] = time.time() + SESSION_TTL
+            return {"token": token, "csrf": s["csrf"]}
+
+    def do_GET(self):
+        if not self.is_allowed():
+            return self.forbidden()
+        url = urllib.parse.urlsplit(self.path)
+        path = url.path
+        if path == "/static/app.js":
+            return self.send(200, APP_JS, "application/javascript; charset=utf-8")
+        if path == "/login":
+            return self.send(200, login_page())
+        sess = self.get_session()
+        if not sess:
+            if path.startswith("/api/"):
+                return self.send(401, '{"error":"session"}', "application/json")
+            return self.redirect("/login")
+        query = urllib.parse.parse_qs(url.query)
+        if path == "/":
+            removed = (query.get("removed") or [""])[0]
+            msg = f"Appareil « {removed} » supprimé." if NAME_RE.fullmatch(removed) else ""
+            return self.send(200, dashboard(sess, msg=msg))
+        if path == "/api/status":
+            try:
+                return self.send(200, json.dumps(get_status()), "application/json")
+            except Exception as e:
+                return self.send(500, json.dumps({"error": str(e)}), "application/json")
+        m = re.fullmatch(r"/device/([A-Za-z0-9_-]{1,15})(/conf)?", path)
+        if m:
+            name = m.group(1)
+            conf = client_conf_path(name)
+            if not conf:
+                return self.send(404, not_found(sess))
+            if m.group(2):
+                with open(conf, "rb") as f:
+                    data = f.read()
+                log(f"{self.client_address[0]} : téléchargement de {name}.conf")
+                return self.send(200, data, "application/octet-stream",
+                                 {"Content-Disposition": f'attachment; filename="{name}.conf"'})
+            return self.send(200, device_page(sess, name, new="new" in query))
+        return self.send(404, not_found(sess))
+
+    def do_POST(self):
+        if not self.is_allowed():
+            return self.forbidden()
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 4096:
+            return self.send(413, "Requête refusée.\n", "text/plain; charset=utf-8")
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+
+        def field(key):
+            return (form.get(key) or [""])[0]
+
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/login":
+            return self.handle_login(field("password"))
+        sess = self.get_session()
+        if not sess:
+            return self.redirect("/login")
+        if not same(field("csrf"), sess["csrf"]):
+            return self.send(403, page("Refusé", '<div class="msg err">Formulaire expiré : rechargez la page et '
+                                       'recommencez.</div><p><a href="/">← Tous les appareils</a></p>', sess))
+        if path == "/logout":
+            with lock:
+                sessions.pop(sess["token"], None)
+            return self.redirect("/login", {"Set-Cookie": f"{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"})
+        if path == "/add":
+            name = field("name").strip()
+            if not NEW_NAME_RE.fullmatch(name):
+                return self.send(400, dashboard(sess, err="Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _ "
+                                                          "(sans tiret au début)."))
+            r = run_wgpi("add", name, "--split" if field("mode") == "split" else "--full")
+            if r.returncode != 0:
+                return self.send(400, dashboard(sess, err=clean_message(r.stderr or r.stdout)))
+            log(f"{self.client_address[0]} : appareil « {name} » ajouté")
+            return self.redirect(f"/device/{name}?new=1")
+        if path == "/remove":
+            name = field("name")
+            if not NEW_NAME_RE.fullmatch(name):
+                return self.redirect("/")
+            r = run_wgpi("remove", name, "--yes")
+            if r.returncode != 0:
+                return self.send(400, dashboard(sess, err=clean_message(r.stderr or r.stdout)))
+            log(f"{self.client_address[0]} : appareil « {name} » supprimé")
+            return self.redirect(f"/?removed={name}")
+        return self.send(404, not_found(sess))
+
+    def handle_login(self, password):
+        ip = self.client_address[0]
+        now = time.time()
+        # L'essai est compté AVANT la vérification, sous le verrou : des requêtes envoyées
+        # en parallèle ne peuvent pas contourner le blocage
+        with lock:
+            fails, until = failures.get(ip, (0, 0))
+            if until <= now:
+                fails += 1
+                failures[ip] = (0, now + BLOCK_SECONDS) if fails >= MAX_FAILS else (fails, 0)
+        if until > now:
+            wait = int((until - now) // 60) + 1
+            return self.send(429, login_page(f"Trop d'essais : réessayez dans {wait} min."))
+        with login_lock:
+            good = bool(password) and check_password(password)
+        if good:
+            token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            with lock:
+                failures.pop(ip, None)
+                for t in [t for t, s in sessions.items() if s["expires"] < now]:
+                    del sessions[t]
+                sessions[token] = {"expires": now + SESSION_TTL, "csrf": csrf}
+            log(f"{ip} : connexion réussie")
+            return self.redirect("/", {"Set-Cookie": f"{COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict"})
+        time.sleep(1)
+        log(f"{ip} : mot de passe incorrect")
+        return self.send(401, login_page("Mot de passe incorrect."))
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 32
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, OSError)):
+            return  # client non HTTPS, connexion coupée… sans intérêt dans le journal
+        super().handle_error(request, client_address)
+
+
+def main():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(os.path.join(WEB_DIR, "cert.pem"), os.path.join(WEB_DIR, "key.pem"))
+    httpd = Server(("0.0.0.0", PORT), Handler)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    log(f"Interface web wg-pi {VERSION} à l'écoute en HTTPS sur le port {PORT}")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
 }
 
 cmd_menu() {
@@ -1717,8 +2547,9 @@ cmd_menu() {
         "   6) Aide pour configurer la box" \
         "   7) Changer l'adresse publique (IP, DuckDNS…)" \
         "   8) Sauvegarder la configuration" \
-        "   9) Mettre à jour wg-pi" \
-        "  10) Désinstaller" \
+        "   9) Interface web (gérer depuis le navigateur)" \
+        "  10) Mettre à jour wg-pi" \
+        "  11) Désinstaller" \
         "   0) Quitter" ""
     ask c "Votre choix" "0"
     case $c in
@@ -1730,8 +2561,9 @@ cmd_menu() {
       6) (cmd_box) ;;
       7) (cmd_endpoint) ;;
       8) (cmd_backup) ;;
-      9) (cmd_update) ;;
-      10) (cmd_uninstall); is_installed || return 0 ;;
+      9) (cmd_web) ;;
+      10) (cmd_update) ;;
+      11) (cmd_uninstall); is_installed || return 0 ;;
       0|q|Q) return 0 ;;
       *) warn "Choix inconnu." ;;
     esac
@@ -1780,6 +2612,7 @@ Utilisation : sudo wg-pi [commande]
   endpoint [adresse]    changer l'adresse publique (IP, nom de domaine, DuckDNS)
   backup                sauvegarder la configuration (clés comprises)
   restore <fichier>     restaurer une sauvegarde (ex. sur une nouvelle carte SD)
+  web [off|password]    interface web d'administration (navigateur, réseau local et VPN)
   update                mettre à jour wg-pi depuis le dépôt GitHub
   uninstall             tout désinstaller
   help | version
@@ -1851,6 +2684,9 @@ main() {
     backup|sauvegarde)       cmd_backup ;;
     restore)                 cmd_restore "$@" ;;
     update|mise-a-jour)      cmd_update ;;
+    web)                     cmd_web "$@" ;;
+    web-serve)               cmd_web_serve ;;
+    json)                    cmd_json ;;
     uninstall|desinstaller)  cmd_uninstall ;;
     ddns-update)             cmd_ddns_update ;;
     upnp-refresh)            cmd_upnp_refresh ;;
