@@ -85,7 +85,15 @@ sudo ./wg-pi.sh
 ```
 
 <details>
-<summary>Pas de <code>curl</code> ? Avec <code>wget</code></summary>
+<summary>Pas de <code>curl</code> (Debian minimale) ? Avec <code>wget</code></summary>
+
+En une ligne :
+
+```bash
+wget -qO- https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | sudo bash
+```
+
+Ou en téléchargeant d'abord le script :
 
 ```bash
 wget -O wg-pi.sh https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh
@@ -224,14 +232,25 @@ sudo wg-pi add nas-acces --split  # seulement l'accès au réseau de la maison
 [iOS](https://apps.apple.com/app/wireguard/id1441195209)), puis **+** › **Scanner un code QR**.
 
 **Ordinateur** : la configuration est copiée dans `~/wireguard-clients/` sur le Pi. Récupérez-la
-depuis le PC (le script affiche la commande exacte) :
+en tapant la commande **sur l'ordinateur**, pas sur le Pi. Le script l'affiche avec votre
+utilisateur et l'adresse du Pi.
+
+Windows (PowerShell), le fichier arrive dans Téléchargements :
 
 ```bash
-scp utilisateur@192.168.1.50:wireguard-clients/pc-portable.conf .
+scp utilisateur@192.168.1.50:wireguard-clients/pc-portable.conf $HOME\Downloads\
 ```
 
-Importez-la ensuite dans l'application [WireGuard](https://www.wireguard.com/install/) avec
-**Importer un tunnel depuis un fichier**.
+Mac / Linux, le fichier arrive dans le dossier personnel :
+
+```bash
+scp utilisateur@192.168.1.50:wireguard-clients/pc-portable.conf ~/
+```
+
+La première fois, répondez `yes` (en entier) à la question sur l'empreinte du Pi, puis tapez le
+mot de passe de votre utilisateur sur le Pi. Importez ensuite le fichier dans l'application
+[WireGuard](https://www.wireguard.com/install/) avec **Importer un tunnel depuis un fichier**, et
+supprimez-le de l'ordinateur une fois importé : il contient la clé privée de l'appareil.
 
 > [!IMPORTANT]
 > Pour tester, utilisez la **4G/5G** et non le Wi-Fi de la maison : beaucoup de box ne savent pas
@@ -254,8 +273,9 @@ Les cartes SD finissent par s'user : faites une sauvegarde de temps en temps.
 sudo wg-pi backup
 ```
 
-Le fichier `wg-pi-sauvegarde-AAAAMMJJ-HHMMSS.tar.gz` est créé dans votre dossier personnel. Il
-contient les clés du VPN : gardez-le en lieu sûr.
+Le fichier `wg-pi-sauvegarde-AAAAMMJJ-HHMMSS.tar.gz` est créé dans votre dossier personnel, et le
+script affiche la commande `scp` pour le copier sur votre ordinateur. Faites-le : une sauvegarde
+restée sur la carte SD disparaît avec elle. Elle contient les clés du VPN, gardez-la en lieu sûr.
 
 Pour tout retrouver sur un Pi neuf, copiez-y la sauvegarde puis lancez, depuis le dossier où elle
 se trouve :

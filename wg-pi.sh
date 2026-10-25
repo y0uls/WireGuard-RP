@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.1.0"
+readonly WGPI_VERSION="1.1.1"
 readonly WGPI_REPO="https://github.com/y0uls/WireGuard-RP"
 # Adresse de la dernière version (modifiable pour un fork : WGPI_URL=… sudo -E wg-pi update)
 readonly WGPI_URL="${WGPI_URL:-https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh}"
@@ -742,15 +742,25 @@ export_client() {
   EXPORT_PATH="$dir/$name.conf"
 }
 
+# print_fetch_hint <chemin relatif au dossier personnel> : commande à taper sur l'ordinateur
+# pour récupérer un fichier du Pi (destination explicite : pas de « . » final facile à oublier)
+print_fetch_hint() {
+  local src="$SUDO_USER@$LAN_IP:$1"
+  txt "  Pour le récupérer, tapez sur l'ordinateur (pas sur le Pi) :" \
+      "    Windows (PowerShell) : ${BOLD}scp $src \$HOME\\Downloads\\${RESET}" \
+      "    Mac / Linux          : ${BOLD}scp $src ~/${RESET}" \
+      "  ${DIM}La première fois, répondez « yes », puis tapez le mot de passe de « $SUDO_USER » sur le Pi.${RESET}"
+}
+
 show_client() {
   local name=$1
   echo
   qrencode -t ansiutf8 -m 2 <"$CLIENTS_DIR/$name.conf"
   txt "  ↑ QR code de « ${BOLD}$name${RESET} » : application WireGuard › ${BOLD}+${RESET} › ${BOLD}Scanner un code QR${RESET}"
   if [[ -n $EXPORT_PATH ]]; then
-    txt "  Fichier pour un ordinateur : ${BOLD}$EXPORT_PATH${RESET} (+ image .png du QR code)" \
-        "  Pour le copier sur votre PC, tapez sur le PC :" \
-        "    ${BOLD}scp $SUDO_USER@$LAN_IP:wireguard-clients/$name.conf .${RESET}"
+    txt "  Fichier pour un ordinateur : ${BOLD}$EXPORT_PATH${RESET} (+ image .png du QR code)"
+    print_fetch_hint "wireguard-clients/$name.conf"
+    txt "  Puis dans l'application WireGuard : ${BOLD}Importer un tunnel depuis un fichier${RESET}."
   else
     txt "  Fichier de configuration : ${BOLD}$CLIENTS_DIR/$name.conf${RESET}"
   fi
@@ -1573,8 +1583,10 @@ cmd_backup() {
   [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && chown "$SUDO_USER:" "$f"
   ok "Sauvegarde créée : ${BOLD}$f${RESET}"
   warn "Elle contient les clés du VPN : gardez-la en lieu sûr (pas par e-mail)."
-  txt "   Restauration (ex. sur une nouvelle carte SD), depuis le dossier de la sauvegarde :" \
-      "     curl -fsSL $WGPI_URL | sudo bash -s -- restore $(basename "$f")"
+  # Copiée hors du Pi, elle survit à une carte SD morte
+  [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && print_fetch_hint "$(basename "$f")"
+  txt "  Restauration (ex. sur une nouvelle carte SD), depuis le dossier de la sauvegarde :" \
+      "    curl -fsSL $WGPI_URL | sudo bash -s -- restore $(basename "$f")"
 }
 
 cmd_restore() {
