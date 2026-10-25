@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.2.0"
+readonly WGPI_VERSION="1.2.1"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -2149,18 +2149,17 @@ CSS = """
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{background:var(--card);border-bottom:1px solid var(--line)}
-.wrap{max-width:980px;margin:0 auto;padding:16px}
-header .wrap{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:10px;padding-bottom:10px}
+.wrap{max-width:980px;margin:0 auto;padding:10px 16px}
+header .wrap{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:7px;padding-bottom:7px}
 .brand{font-weight:700;font-size:18px;color:inherit;text-decoration:none}
 .brand small{color:var(--muted);font-weight:400;font-size:13px;margin-left:8px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:16px 0}
-h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:0 0 12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 16px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:10px 0}
+h1{font-size:20px;margin:0 0 6px}h2{font-size:16px;margin:0 0 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px}
 .kv span{display:block;color:var(--muted);font-size:13px}.kv b{font-size:15px;word-break:break-all}
 .scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
 th{color:var(--muted);font-weight:600;font-size:13px}tr:last-child td{border-bottom:none}
 .state.on{color:var(--ok);font-weight:600}.muted{color:var(--muted)}.small{font-size:13px}.num{white-space:nowrap}
 .actions{display:flex;flex-wrap:wrap;gap:6px}
@@ -2176,9 +2175,18 @@ label{display:block;margin:12px 0 4px;font-weight:600}
 label.radio{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-weight:400}
 .msg{border-radius:8px;padding:10px 12px;margin:12px 0}.msg.ok{background:var(--ok-bg);color:var(--ok)}
 .msg.err{background:var(--err-bg);color:var(--err)}
-.qr{display:block;width:100%;max-width:300px;height:auto;image-rendering:pixelated;background:#fff;border-radius:8px;margin:8px auto}
+.qr{display:block;width:240px;max-width:100%;height:auto;image-rendering:pixelated;background:#fff;border-radius:8px;margin:6px auto}
 .center{text-align:center}
-footer{color:var(--muted);font-size:13px;text-align:center;padding:8px 16px 28px}
+.addrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px}
+.addrow input[type=text]{flex:1 1 180px;max-width:260px}
+.addrow label.radio{margin:0;align-items:center}
+.device{display:grid;grid-template-columns:260px 1fr;gap:8px 28px;align-items:start}
+.qrcol{text-align:center}.howto h2{margin:2px 0 6px}.howto ol{margin:0 0 10px;padding-left:20px}
+.howto p{margin:0 0 6px}
+hr{border:none;border-top:1px solid var(--line);margin:10px 0}
+.back{margin:2px 0}
+footer{color:var(--muted);font-size:13px;text-align:center;padding:2px 16px 14px}
+@media (max-width:720px){.device{grid-template-columns:1fr}}
 @media (max-width:640px){.hide-sm{display:none}
 #devices thead{display:none}#devices tr{display:block;padding:12px 0;border-bottom:1px solid var(--line)}
 #devices tr:last-child{border-bottom:none}#devices td{display:inline-block;border:none;padding:2px 12px 2px 0}
@@ -2284,17 +2292,18 @@ def dashboard(sess, msg="", err=""):
 </div></div>
 <div class="card"><h2>Appareils</h2>{table}</div>
 <div class="card"><h2>Ajouter un appareil</h2><form method="post" action="/add">
-<input type="hidden" name="csrf" value="{csrf}">
-<label for="name">Nom de l'appareil</label>
-<input type="text" id="name" name="name" required maxlength="15" pattern="[A-Za-z0-9_][A-Za-z0-9_\\-]{{0,14}}"
- placeholder="ex. telephone, pc-salon" autocomplete="off" autocapitalize="off" spellcheck="false">
-<div class="muted small">1 à 15 caractères : lettres, chiffres, - et _ (sans espace ni accent).</div>
-<label>Ce que l'appareil fait passer par la maison</label>
-<label class="radio"><input type="radio" name="mode" value="full"{"" if split else " checked"}>
-<span><b>Tout son trafic</b><br><span class="muted small">Sécurité sur les Wi-Fi publics, Internet « depuis la maison »</span></span></label>
-<label class="radio"><input type="radio" name="mode" value="split"{" checked" if split else ""}>
-<span><b>Seulement le réseau de la maison</b><br><span class="muted small">NAS, PC de jeu, imprimante… le reste passe en direct</span></span></label>
-<p><button type="submit" class="primary">Créer et afficher le QR code</button></p></form></div>"""
+<input type="hidden" name="csrf" value="{csrf}"><div class="addrow">
+<input type="text" id="name" name="name" aria-label="Nom de l'appareil" required maxlength="15"
+ pattern="[A-Za-z0-9_][A-Za-z0-9_\\-]{{0,14}}" placeholder="Nom (ex. telephone, pc-salon)"
+ autocomplete="off" autocapitalize="off" spellcheck="false">
+<label class="radio" title="Sécurité sur les Wi-Fi publics, Internet « depuis la maison »">
+<input type="radio" name="mode" value="full"{"" if split else " checked"}> Tout le trafic</label>
+<label class="radio" title="NAS, PC de jeu, imprimante… le reste passe en direct">
+<input type="radio" name="mode" value="split"{" checked" if split else ""}> Réseau de la maison seulement</label>
+<button type="submit" class="primary">Créer et afficher le QR code</button></div>
+<div class="muted small" style="margin-top:6px">Nom : 1 à 15 caractères (lettres, chiffres, - et _).
+« Tout le trafic » sécurise les Wi-Fi publics ; « Réseau de la maison » donne accès au NAS, au PC de jeu… le reste passe en direct.</div>
+</form></div>"""
     return page("Appareils", body, sess)
 
 
@@ -2308,24 +2317,25 @@ def device_page(sess, name, new=False):
     img = (f'<img class="qr" alt="QR code de configuration de {n}" src="data:image/png;base64,{qr}">'
            if qr else '<div class="msg err">QR code indisponible (qrencode).</div>')
     banner = '<div class="msg ok">Appareil créé : scannez le QR code avec l\'application WireGuard.</div>' if new else ""
-    body = f"""<p><a href="/">← Tous les appareils</a></p>{banner}
-<div class="card center"><h1>{n}</h1>{img}
+    body = f"""<p class="back"><a href="/">← Tous les appareils</a></p>{banner}
+<div class="card device">
+<div class="qrcol"><h1>{n}</h1>{img}
 <p class="muted small">Ce QR code contient la clé privée de l'appareil : ne le partagez pas.</p></div>
-<div class="cards">
-<div class="card"><h2>Téléphone ou tablette</h2><ol>
+<div class="howto">
+<h2>Téléphone ou tablette</h2><ol>
 <li>Installez l'application <b>WireGuard</b> (App Store / Google Play).</li>
-<li>Appuyez sur <b>+</b> › <b>Scanner un code QR</b>.</li>
-<li>Visez le QR code ci-dessus, puis activez le tunnel.</li></ol></div>
-<div class="card"><h2>Ordinateur</h2><ol>
-<li><a class="btn primary" href="/device/{n}/conf">Télécharger {n}.conf</a></li>
-<li>Application WireGuard › <b>Importer un tunnel depuis un fichier</b>.</li>
-<li>Supprimez ensuite le fichier téléchargé : il contient la clé privée.</li></ol></div>
-</div>
-<div class="card"><h2>Supprimer cet appareil</h2>
-<p class="muted">Il ne pourra plus se connecter. Les autres appareils ne sont pas touchés.</p>
+<li>Appuyez sur <b>+</b> › <b>Scanner un code QR</b> et visez le QR code.</li>
+<li>Activez le tunnel.</li></ol>
+<h2>Ordinateur</h2>
+<p><a class="btn primary" href="/device/{n}/conf">Télécharger {n}.conf</a></p>
+<p class="muted small">Puis dans l'application WireGuard : <b>Importer un tunnel depuis un fichier</b>.
+Supprimez ensuite le fichier téléchargé : il contient la clé privée.</p>
+<hr>
 <form method="post" action="/remove" data-confirm="Supprimer « {n} » ? Il ne pourra plus se connecter.">
 <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="name" value="{n}">
-<button type="submit" class="danger">Supprimer {n}</button></form></div>"""
+<button type="submit" class="danger">Supprimer {n}</button>
+<span class="muted small">Il ne pourra plus se connecter ; les autres appareils ne sont pas touchés.</span></form>
+</div></div>"""
     return page(name, body, sess)
 
 
