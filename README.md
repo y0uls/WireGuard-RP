@@ -57,8 +57,11 @@ curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | 
 - **DNS au choix** : box, Cloudflare, Quad9, ou Pi-hole / AdGuard Home s'il est détecté sur le Pi.
 - **Commande `wg-pi`** pour gérer les appareils, faire un diagnostic complet, sauvegarder,
   restaurer et se mettre à jour.
-- **Interface web** (optionnelle) pour tout gérer depuis un navigateur, téléphone compris :
-  appareils connectés, ajout avec QR code, téléchargement du fichier `.conf`, suppression.
+- **Interface web moderne** (optionnelle) pour tout gérer depuis un navigateur, téléphone compris :
+  débit en direct par appareil, ajout avec QR code, accès coupé ou rétabli d'un clic, renommage,
+  téléchargement du fichier `.conf`, suppression.
+- **Couper l'accès d'un appareil sans le supprimer** (téléphone perdu, accès prêté à un ami…), puis
+  le rétablir sans rien reconfigurer.
 - **Réglages sûrs par défaut** : clé pré-partagée par appareil, IPv6 sans fuite, compatibilité
   Docker et UFW, mises à jour de sécurité automatiques en option.
 
@@ -204,6 +207,9 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi` | menu interactif |
 | `sudo wg-pi add [nom] [--split\|--full]` | ajouter un appareil et afficher son QR code |
 | `sudo wg-pi remove [nom]` | supprimer un appareil |
+| `sudo wg-pi disable [nom]` | couper l'accès d'un appareil sans le supprimer |
+| `sudo wg-pi enable [nom]` | rétablir l'accès d'un appareil |
+| `sudo wg-pi rename [nom] [nouveau]` | renommer un appareil (rien à changer sur l'appareil) |
 | `sudo wg-pi list` | appareils, trafic et état des connexions |
 | `sudo wg-pi qr [nom]` | réafficher le QR code d'un appareil |
 | `sudo wg-pi check` | diagnostic complet |
@@ -211,7 +217,7 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi endpoint [adresse]` | changer l'adresse publique : sans adresse, menu (IP, DuckDNS, nom de domaine) ; avec une adresse, IP ou nom fixe |
 | `sudo wg-pi backup` | sauvegarder la configuration, clés comprises |
 | `sudo wg-pi restore <fichier>` | restaurer une sauvegarde |
-| `sudo wg-pi web [off\|password]` | activer, désactiver l'interface web ou changer son mot de passe |
+| `sudo wg-pi web [off\|password\|port N]` | activer ou désactiver l'interface web, changer son mot de passe ou son port |
 | `sudo wg-pi update` | mettre à jour wg-pi depuis ce dépôt |
 | `sudo wg-pi uninstall` | tout désinstaller |
 | `sudo wg-pi help` | aide complète |
@@ -234,10 +240,16 @@ sudo wg-pi add nas-acces --split  # seulement l'accès au réseau de la maison
 Tout ce que fait la commande `wg-pi` pour les appareils est aussi possible depuis un navigateur,
 sur un ordinateur ou sur le téléphone :
 
-- voir les appareils et qui est connecté (mise à jour automatique) ;
-- ajouter un appareil et afficher son **QR code** directement à l'écran ;
-- **télécharger le fichier `.conf`** d'un ordinateur, sans passer par `scp` ;
-- supprimer un appareil.
+- **chaque appareil sur une ligne** : qui est connecté (point vert), d'où, depuis quand,
+  **débit en direct** (↓ ↑) avec sa courbe, totaux échangés ;
+- **un interrupteur pour couper ou rétablir l'accès** d'un appareil, sans le supprimer ;
+- **nouvel appareil** en deux clics, avec son **QR code** affiché aussitôt ;
+- **téléchargement du fichier `.conf`** pour un ordinateur, sans passer par `scp` ;
+- renommer et supprimer un appareil ;
+- recherche et tri des appareils ;
+- **état du serveur** : adresse publique, réseau, nombre d'appareils connectés, et en détail
+  la clé publique (copiable), le DNS, l'IPv6 et le keepalive ;
+- thème clair, sombre ou automatique, affichage adapté au téléphone.
 
 Pour l'activer, y compris sur une installation existante après `sudo wg-pi update` :
 
@@ -245,9 +257,15 @@ Pour l'activer, y compris sur une installation existante après `sudo wg-pi upda
 sudo wg-pi web
 ```
 
-Choisissez un mot de passe (8 caractères minimum), puis ouvrez l'adresse affichée,
-`https://<adresse du Pi>:51821`. Depuis l'extérieur, passez par le VPN avec
-`https://10.8.0.1:51821`.
+Choisissez un mot de passe (8 caractères minimum), puis ouvrez l'adresse affichée :
+
+- `https://<adresse du Pi>`, ou `https://raspberrypi.local` avec le nom de votre Pi ;
+- depuis l'extérieur, en passant par le VPN : `https://10.8.0.1`.
+
+Le panneau utilise le port HTTPS standard (443) s'il est libre. Si un autre programme l'occupe
+déjà (Pi-hole v6, serveur web…), il prend automatiquement le port 51821, et l'adresse devient
+`https://<adresse du Pi>:51821`. Pour changer de port à tout moment, par exemple
+`sudo wg-pi web port 443`.
 
 > [!NOTE]
 > La première fois, le navigateur affiche un avertissement de sécurité. C'est normal : le
@@ -268,6 +286,7 @@ Choisissez un mot de passe (8 caractères minimum), puis ouvrez l'adresse affich
 |---|---|
 | `sudo wg-pi web` | activer (ou réafficher l'adresse) |
 | `sudo wg-pi web password` | changer le mot de passe (déconnecte les sessions ouvertes) |
+| `sudo wg-pi web port <numéro>` | changer de port (retour automatique à l'ancien en cas d'échec) |
 | `sudo wg-pi web off` | désactiver |
 
 ## Connecter un appareil
@@ -438,7 +457,7 @@ que le VPN est actif. C'est une limite commune à tous les VPN.
 | Appareils | `PersistentKeepalive = 25` pour garder la connexion à travers les NAT des réseaux mobiles |
 | Mises à jour | `unattended-upgrades` en option, dépôts Raspberry Pi OS inclus |
 | Sécurité des fichiers | clés et token DuckDNS en `600` (lisibles par root seulement) |
-| Interface web | Python (bibliothèque standard) en HTTPS sur le port 51821, réseau local et VPN uniquement, service `wg-pi-web` |
+| Interface web | Python (bibliothèque standard) en HTTPS sur le port 443 (51821 s'il est pris), réseau local et VPN uniquement, service `wg-pi-web` |
 
 Fichiers créés sur le Pi :
 
@@ -485,3 +504,7 @@ Les issues et les pull requests sont les bienvenues. Avant de proposer une modif
 ## Licence
 
 Distribué sous licence [MIT](LICENSE).
+
+« WireGuard » et le logo « WireGuard » sont des marques déposées de Jason A. Donenfeld. Ce projet
+n'est ni affilié ni approuvé par le projet WireGuard : il installe et configure le logiciel officiel
+disponible sur [wireguard.com](https://www.wireguard.com/).

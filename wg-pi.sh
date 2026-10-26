@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.2.1"
+readonly WGPI_VERSION="1.3.0"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -242,7 +242,7 @@ is_private_ipv4() { is_ipv4 "$1" && { in_cidr "$1" 10.0.0.0/8 || in_cidr "$1" 17
 is_cgnat()        { is_ipv4 "${1:-}" && in_cidr "$1" 100.64.0.0/10; }
 is_hostname()     { [[ ${#1} -le 253 && $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; }
 valid_port()      { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
-valid_name()      { [[ $1 =~ ^[A-Za-z0-9_-]{1,15}$ ]]; }
+valid_name()      { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,14}$ ]]; }   # pas de « - » en tête (pris pour une option)
 port_in_use()     { [[ -n $(ss -Hlun "sport = :$1" 2>/dev/null) ]]; }
 is_installed()    { [[ -f $SETTINGS_FILE && -f $WG_CONF ]]; }
 wg_running()      { systemctl is-active --quiet "wg-quick@$WG_IF"; }
@@ -737,18 +737,42 @@ duckdns_call() {
 # ----------------------------------------------------------------------------
 # Appareils (clients)
 # ----------------------------------------------------------------------------
-# Affiche « nom ip clé_publique » pour chaque appareil déclaré dans wg0.conf
+# Affiche « nom ip clé_publique état » (état : on, ou off si désactivé) pour chaque appareil de wg0.conf.
+# Un appareil désactivé garde son bloc, commenté par « #~ ».
 peers_table() {
   awk -v mark="$MARK" '
-    index($0, mark " ") == 1 { name = substr($0, length(mark) + 2); next }
-    name != "" && $1 == "PublicKey"  { pub = $3 }
-    name != "" && $1 == "AllowedIPs" { split($3, a, "/"); print name, a[1], pub; name = "" }
+    index($0, mark " ") == 1 { name = substr($0, length(mark) + 2); state = "on"; next }
+    name != "" {
+      line = $0
+      if (index(line, "#~ ") == 1) { line = substr(line, 4); state = "off" }
+      split(line, f, " ")
+      if (f[1] == "PublicKey") pub = f[3]
+      if (f[1] == "AllowedIPs") { split(f[3], a, "/"); print name, a[1], pub, state; name = "" }
+    }
   ' "$WG_CONF"
 }
 
 client_exists() { grep -qxF "$MARK $1" "$WG_CONF"; }
-client_pubkey() { peers_table | awk -v n="$1" '$1 == n { print $3 }'; }
+# (comparaisons forcées en texte : en awk, « 01 » et « 1 » seraient égaux en nombre)
+client_pubkey() { peers_table | awk -v n="$1" '$1 "" == n "" { print $3 }'; }
 client_names()  { peers_table | awk '{ print $1 }'; }
+client_state()  { peers_table | awk -v n="$1" '$1 "" == n "" { print $4 }'; }
+
+# set_client_state <nom> on|off : coupe ou rétablit l'accès d'un appareil sans le supprimer.
+# Désactivé, son bloc [Peer] reste dans wg0.conf (il garde son IP) mais commenté : wg-quick l'ignore.
+set_client_state() {
+  local tmp
+  tmp=$(mktemp) || return 1
+  awk -v m="$MARK $1" -v p="$MARK " -v st="$2" '
+    $0 == m { inblk = 1; print; next }
+    inblk && index($0, p) == 1 { inblk = 0 }
+    inblk && NF && st == "off" && index($0, "#~ ") != 1 { print "#~ " $0; next }
+    inblk && st == "on" && index($0, "#~ ") == 1 { print substr($0, 4); next }
+    { print }
+  ' "$WG_CONF" >"$tmp" && cat "$tmp" >"$WG_CONF"
+  rm -f "$tmp"
+  reload_wg
+}
 
 next_free_ip() {
   local n
@@ -866,10 +890,13 @@ remove_client() {
   local name=$1 tmp dir
   client_exists "$name" || { fail "Aucun appareil nommé « $name »."; return 1; }
   tmp=$(mktemp)
+  # Les lignes vides sont retenues puis écrites devant la ligne suivante : pas de ligne vide en trop
   awk -v m="$MARK $name" -v p="$MARK " '
     $0 == m { skip = 1; next }
     skip && index($0, p) == 1 { skip = 0 }
-    !skip { print }
+    skip { next }
+    /^[[:space:]]*$/ { blank = blank $0 "\n"; next }
+    { printf "%s", blank; blank = ""; print }
   ' "$WG_CONF" >"$tmp" && cat "$tmp" >"$WG_CONF"
   rm -f "$tmp" "$CLIENTS_DIR/$name.conf"
   dir=$(user_export_dir)
@@ -1440,6 +1467,57 @@ cmd_remove() {
   remove_client "$name"
 }
 
+# cmd_set_state on|off [nom] : rétablit ou coupe l'accès d'un appareil (sans le supprimer)
+cmd_set_state() {
+  load_settings
+  take_lock
+  local want=$1 name=${2:-}
+  [[ -n $name ]] || pick_client name "Quel appareil ?" || return 1
+  client_exists "$name" || die "Aucun appareil nommé « $name »."
+  if [[ $(client_state "$name") == "$want" ]]; then
+    ok "« $name » est déjà $([[ $want == on ]] && echo activé || echo désactivé)."
+    return 0
+  fi
+  set_client_state "$name" "$want" || die "Impossible de modifier « $name »."
+  if [[ $want == off ]]; then
+    ok "Accès de « $name » coupé : il ne peut plus se connecter (pour le rétablir : sudo wg-pi enable $name)."
+  else
+    ok "Accès de « $name » rétabli."
+  fi
+}
+
+# Menu : bascule l'état d'un appareil
+cmd_toggle() {
+  load_settings
+  local name
+  pick_client name "Quel appareil ?" || return 1
+  if [[ $(client_state "$name") == off ]]; then cmd_set_state on "$name"; else cmd_set_state off "$name"; fi
+}
+
+cmd_rename() {
+  load_settings
+  take_lock
+  local old=${1:-} new=${2:-} tmp dir
+  [[ -n $old ]] || pick_client old "Quel appareil renommer ?" || return 1
+  client_exists "$old" || die "Aucun appareil nommé « $old »."
+  [[ -n $new ]] || ask new "Nouveau nom pour « $old »" ""
+  if ! valid_name "$new"; then
+    die "Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _ (sans espace ni accent)."
+  fi
+  [[ $new == "$old" ]] && { info "Le nom ne change pas."; return 0; }
+  client_exists "$new" && die "Un appareil nommé « $new » existe déjà."
+  tmp=$(mktemp) || die "Impossible de créer un fichier temporaire."
+  awk -v o="$MARK $old" -v n="$MARK $new" '$0 == o { print n; next } { print }' "$WG_CONF" >"$tmp" &&
+    cat "$tmp" >"$WG_CONF"
+  rm -f "$tmp"
+  mv -f "$CLIENTS_DIR/$old.conf" "$CLIENTS_DIR/$new.conf"
+  for dir in /home/*/wireguard-clients; do
+    [[ -f $dir/$old.conf ]] && mv -f "$dir/$old.conf" "$dir/$new.conf"
+    [[ -f $dir/$old.png ]] && mv -f "$dir/$old.png" "$dir/$new.png"
+  done
+  ok "« $old » s'appelle maintenant « $new » (rien à changer sur l'appareil)."
+}
+
 cmd_qr() {
   load_settings
   local name=${1:-}
@@ -1452,7 +1530,7 @@ cmd_qr() {
 cmd_list() {
   load_settings
   local -A hs=() rx=() tx=() ep=()
-  local pub _psk endpoint _allowed latest r t _ka name ip state count=0 online=0 now
+  local pub _psk endpoint _allowed latest r t _ka name ip state shown count=0 online=0 now
   if wg show "$WG_IF" >/dev/null 2>&1; then
     while IFS=$'\t' read -r pub _psk endpoint _allowed latest r t _ka; do
       hs["$pub"]=$latest rx["$pub"]=$r tx["$pub"]=$t ep["$pub"]=$endpoint
@@ -1467,19 +1545,21 @@ cmd_list() {
   fi
   echo
   printf '  %s %s %s %s  %s\n' "$(pad APPAREIL 16)" "$(pad "IP VPN" 13)" "$(pad REÇU 9)" "$(pad ENVOYÉ 9)" "DERNIÈRE CONNEXION"
-  while read -r name ip pub; do
+  while read -r name ip pub state; do
     (( count++ ))
     latest=${hs["$pub"]:-0}
-    if (( latest == 0 )); then
-      state="${DIM}jamais${RESET}"
+    if [[ $state == off ]]; then
+      shown="${YELLOW}⏸ désactivé${RESET} ${DIM}(sudo wg-pi enable $name)${RESET}"
+    elif (( latest == 0 )); then
+      shown="${DIM}jamais${RESET}"
     elif (( now - latest < 180 )); then
-      state="${GREEN}● connecté${RESET} (${ep["$pub"]:-?})"
+      shown="${GREEN}● connecté${RESET} (${ep["$pub"]:-?})"
       (( online++ ))
     else
-      state=$(ago "$latest")
+      shown=$(ago "$latest")
     fi
     printf '  %s %s %s %s  %s\n' "$(pad "$name" 16)" "$(pad "$ip" 13)" \
-      "$(pad "$(human "${rx["$pub"]:-0}")" 9)" "$(pad "$(human "${tx["$pub"]:-0}")" 9)" "$state"
+      "$(pad "$(human "${rx["$pub"]:-0}")" 9)" "$(pad "$(human "${tx["$pub"]:-0}")" 9)" "$shown"
   done < <(peers_table)
   echo
   if (( count )); then
@@ -1551,24 +1631,28 @@ cmd_check() {
     local wport
     wport=$(web_conf_get port)
     if systemctl is-active --quiet "$WEB_UNIT" && tcp_port_in_use "$wport"; then
-      ok "Interface web active : https://$LAN_IP:$wport"
+      ok "Interface web active : $(web_url "$LAN_IP" "$wport")"
     else
       fail "Interface web arrêtée → sudo wg-pi web  (journal : journalctl -u $WEB_UNIT)"; (( problems++ ))
     fi
   fi
 
   now=$(date +%s)
-  while read -r _ _ pub; do
+  local name state off_names=""
+  while read -r name _ pub state; do
     (( total++ ))
+    if [[ $state == off ]]; then off_names+=" $name"; continue; fi
     ts=$(latest_handshake "$pub")
     [[ -n $ts ]] && (( ts > 0 && now - ts < 180 )) && (( online++ ))
   done < <(peers_table)
   info "$total appareil(s) configuré(s), $online connecté(s) en ce moment"
+  [[ -n $off_names ]] && warn "Accès coupé pour :$off_names (ils ne peuvent pas se connecter) → sudo wg-pi enable <nom>"
   [[ -f /run/reboot-required ]] && warn "Un redémarrage est demandé par les mises à jour : sudo reboot"
 
   echo
   if (( problems == 0 )); then
     ok "${BOLD}Tout est en ordre côté Pi.${RESET}"
+    [[ -n $off_names ]] && txt "   Un appareil désactivé ne peut pas se connecter : vérifiez d'abord la liste ci-dessus."
     txt "   Si un appareil n'arrive pas à se connecter, c'est presque toujours la redirection du port" \
         "   $WG_PORT/UDP sur la box (sudo wg-pi box). Testez en 4G, pas sur le Wi-Fi de la maison."
   else
@@ -1673,7 +1757,7 @@ cmd_restore() {
     wport=$(web_conf_get port)
     web_write_unit
     web_ufw allow "$wport"
-    if web_start "$wport"; then ok "Interface web réactivée : https://$LAN_IP:$wport"
+    if web_start "$wport"; then ok "Interface web réactivée : $(web_url "$LAN_IP" "$wport")"
     else warn "Interface web non redémarrée : sudo wg-pi web"
     fi
   fi
@@ -1872,17 +1956,32 @@ web_start() {
   return 1
 }
 
+# web_url <hôte> <port> : adresse du panneau (sans « :443 », le port par défaut du HTTPS)
+web_url() { if [[ $2 == 443 ]]; then echo "https://$1"; else echo "https://$1:$2"; fi; }
+
+# Port proposé : 443 (adresse sans numéro) s'il est libre, sinon 51821 ou le suivant libre
+web_pick_port() {
+  local p=443
+  if tcp_port_in_use "$p"; then
+    p=$WEB_DEFAULT_PORT
+    while tcp_port_in_use "$p"; do (( p++ )); done
+  fi
+  echo "$p"
+}
+
 web_print_access() {
   local port=$1
   echo
   txt "Ouvrez dans un navigateur (ordinateur ou téléphone) :"
-  kv "Depuis la maison" "https://$LAN_IP:$port"
-  kv "Depuis le VPN" "https://$WG_NET4.1:$port"
+  kv "Depuis la maison" "$(web_url "$LAN_IP" "$port")"
+  # Nom en .local : publié sur le réseau par avahi (présent sur Raspberry Pi OS)
+  systemctl is-active --quiet avahi-daemon 2>/dev/null && kv "ou par son nom" "$(web_url "$(hostname).local" "$port")"
+  kv "Depuis le VPN" "$(web_url "$WG_NET4.1" "$port")"
   echo
   txt "${DIM}La première fois, le navigateur affiche un avertissement de sécurité : c'est normal, le certificat${RESET}" \
       "${DIM}a été créé par le Pi lui-même. Choisissez « Paramètres avancés » puis « Continuer vers le site ».${RESET}" \
       "${DIM}Le panneau n'est joignable que depuis le réseau de la maison et le VPN : rien à ouvrir sur la box.${RESET}" "" \
-      "  Changer le mot de passe : ${BOLD}sudo wg-pi web password${RESET}   ·   Désactiver : ${BOLD}sudo wg-pi web off${RESET}"
+      "  Mot de passe : ${BOLD}sudo wg-pi web password${RESET}   ·   Port : ${BOLD}sudo wg-pi web port <numéro>${RESET}   ·   Désactiver : ${BOLD}sudo wg-pi web off${RESET}"
 }
 
 web_enable() {
@@ -1893,8 +1992,7 @@ web_enable() {
   port=$(web_conf_get port)
   # Pas de port enregistré, ou port repris entre-temps par un autre programme : on en choisit un libre
   if [[ ! $port =~ ^[0-9]+$ ]] || { ! systemctl is-active --quiet "$WEB_UNIT" && tcp_port_in_use "$port"; }; then
-    port=$WEB_DEFAULT_PORT
-    while tcp_port_in_use "$port"; do (( port++ )); done
+    port=$(web_pick_port)
     web_conf_set port "$port"
   fi
   # Le service lance la commande installée : elle doit connaître « web-serve »
@@ -1931,6 +2029,41 @@ web_disable() {
   ok "Interface web désactivée (mot de passe et certificat conservés pour une prochaine activation)."
 }
 
+# web_set_port [port] : change le port du panneau ; en cas d'échec, revient à l'ancien
+web_set_port() {
+  local new=${1:-} old
+  take_lock
+  [[ -n $new ]] || ask new "Nouveau port de l'interface web (443 = adresse sans numéro de port)" "443"
+  valid_port "$new" || die "Port invalide : un nombre entre 1 et 65535."
+  new=$((10#$new))
+  old=$(web_conf_get port)
+  if [[ $new == "$old" ]]; then
+    ok "L'interface web utilise déjà le port $new."
+    return 0
+  fi
+  if tcp_port_in_use "$new"; then
+    die "Le port $new est déjà utilisé par un autre programme sur le Pi (détail : sudo ss -ltnp 'sport = :$new')."
+  fi
+  web_conf_set port "$new"
+  if [[ ! -f $UNIT_DIR/$WEB_UNIT ]]; then
+    ok "Port $new enregistré : il sera utilisé à l'activation (sudo wg-pi web)."
+    return 0
+  fi
+  [[ -n $old ]] && web_ufw delete "$old"
+  web_ufw allow "$new"
+  if ! run "Redémarrage de l'interface web sur le port $new" web_start "$new"; then
+    web_ufw delete "$new"
+    if [[ -n $old ]]; then
+      web_conf_set port "$old"
+      web_ufw allow "$old"
+      web_start "$old"
+    fi
+    die "L'interface web ne démarre pas sur le port $new : retour au port ${old:-précédent}."
+  fi
+  ok "Interface web déplacée sur le port $new"
+  web_print_access "$new"
+}
+
 cmd_web() {
   load_settings
   case ${1:-on} in
@@ -1938,6 +2071,8 @@ cmd_web() {
       web_enable ;;
     off|desactiver)
       web_disable ;;
+    port)
+      web_set_port "${2:-}" ;;
     password|mot-de-passe)
       take_lock
       web_set_password || die "Le mot de passe n'a pas pu être enregistré."
@@ -1945,7 +2080,7 @@ cmd_web() {
       systemctl try-restart "$WEB_UNIT" >/dev/null 2>&1
       ok "Mot de passe de l'interface web changé (les sessions ouvertes ont été fermées)." ;;
     *)
-      die "Usage : sudo wg-pi web [on|off|password]" ;;
+      die "Usage : sudo wg-pi web [on|off|password|port <numéro>]" ;;
   esac
 }
 
@@ -1972,22 +2107,29 @@ cmd_web_serve() {
 cmd_json() {
   load_settings
   local -A hs=() rx=() tx=() ep=()
-  local pub _psk endpoint _allowed latest r t _ka name ip mode first=1 running=false
+  local pub _psk endpoint _allowed latest r t _ka name ip state mode ip6 enabled net6="" first=1 running=false
   if wg show "$WG_IF" >/dev/null 2>&1; then
     while IFS=$'\t' read -r pub _psk endpoint _allowed latest r t _ka; do
       hs["$pub"]=$latest rx["$pub"]=$r tx["$pub"]=$t ep["$pub"]=$endpoint
     done < <(wg show "$WG_IF" dump | tail -n +2)
   fi
   wg_running && running=true
-  printf '{"version":"%s","running":%s,"endpoint":"%s","net":"%s","lan_ip":"%s","default_route":"%s","now":%s,"peers":[' \
-    "$WGPI_VERSION" "$running" "$(endpoint_str)" "$WG_NET4.0/24" "$LAN_IP" "$DEFAULT_ROUTE" "$(date +%s)"
-  while read -r name ip pub; do
+  (( IPV6_ON )) && net6="${WG_NET6}/64"
+  printf '{"version":"%s","running":%s,"endpoint":"%s","port":%s,"net":"%s","net6":"%s","dns":"%s","keepalive":%s,' \
+    "$WGPI_VERSION" "$running" "$(endpoint_str)" "$WG_PORT" "$WG_NET4.0/24" "$net6" "$CLIENT_DNS" "$KEEPALIVE"
+  printf '"pubkey":"%s","lan_ip":"%s","lan_net":"%s","default_route":"%s","now":%s,"peers":[' \
+    "$SERVER_PUBKEY" "$LAN_IP" "$LAN_NET" "$DEFAULT_ROUTE" "$(date +%s)"
+  while read -r name ip pub state; do
     mode="split"
     grep -q '^AllowedIPs = 0\.0\.0\.0/0' "$CLIENTS_DIR/$name.conf" 2>/dev/null && mode="full"
+    ip6=""
+    (( IPV6_ON )) && ip6="${WG_NET6}${ip##*.}"
+    enabled=true
+    [[ $state == off ]] && enabled=false
     (( first )) || printf ','
     first=0
-    printf '{"name":"%s","ip":"%s","mode":"%s","handshake":%s,"rx":%s,"tx":%s,"endpoint":"%s"}' \
-      "$name" "$ip" "$mode" "${hs["$pub"]:-0}" "${rx["$pub"]:-0}" "${tx["$pub"]:-0}" "${ep["$pub"]:-}"
+    printf '{"name":"%s","ip":"%s","ip6":"%s","pub":"%s","enabled":%s,"mode":"%s","handshake":%s,"rx":%s,"tx":%s,"endpoint":"%s"}' \
+      "$name" "$ip" "$ip6" "$pub" "$enabled" "$mode" "${hs["$pub"]:-0}" "${rx["$pub"]:-0}" "${tx["$pub"]:-0}" "${ep["$pub"]:-}"
   done < <(peers_table)
   printf ']}\n'
 }
@@ -1997,8 +2139,8 @@ web_app_source() {
   cat <<'PYEOF'
 #!/usr/bin/env python3
 # Interface web de wg-pi, écrite et lancée par « wg-pi web-serve » (service wg-pi-web).
-# Bibliothèque standard uniquement. Toutes les modifications passent par la commande wg-pi.
-import base64
+# Bibliothèque standard uniquement. Toutes les modifications passent par la commande wg-pi :
+# le terminal et le navigateur voient donc toujours les mêmes appareils.
 import hashlib
 import hmac
 import html
@@ -2021,10 +2163,12 @@ WGPI = os.environ.get("WGPI_BIN", "/usr/local/sbin/wg-pi")
 CONF = os.environ.get("WGPI_WEB_CONF", "/etc/wg-pi/web.conf")
 WEB_DIR = os.environ.get("WGPI_WEB_DIR", "/etc/wg-pi/web")
 CLIENTS = os.environ.get("WGPI_CLIENTS", "/etc/wg-pi/clients")
+WG_IF = os.environ.get("WGPI_WG_IF", "wg0")
 COOKIE = "wgpi_session"
 SESSION_TTL = 12 * 3600
 MAX_FAILS = 5
 BLOCK_SECONDS = 300
+CACHE_SECONDS = 30
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,15}")
 NEW_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")  # pas de « - » en tête (pris pour une option)
 # Seuls le réseau local, le VPN et la machine elle-même peuvent joindre le panneau
@@ -2037,6 +2181,8 @@ sessions = {}   # jeton -> {"expires": horodatage, "csrf": jeton anti-CSRF}
 failures = {}   # ip -> (échecs, bloqué jusqu'à)
 lock = threading.Lock()
 login_lock = threading.Lock()   # une vérification de mot de passe à la fois (limite le débit des essais)
+cache = {"time": 0.0, "data": None}   # dernier « wg-pi json » (appareils, réglages)
+cache_lock = threading.Lock()
 esc = html.escape
 
 
@@ -2088,42 +2234,61 @@ def clean_message(text):
     return " ".join(lines)[:400] or "Erreur inconnue."
 
 
-def human_bytes(n):
-    n = float(n or 0)
-    for unit in ("o", "Ko", "Mo", "Go", "To"):
-        if n < 1024 or unit == "To":
-            text = f"{n:.0f} {unit}" if unit == "o" else f"{n:.1f} {unit}"
-            return text.replace(".", ",")
-        n /= 1024
+def load_base(force=False):
+    """Appareils et réglages (« wg-pi json »), relus toutes les 30 s ou après une modification."""
+    with cache_lock:
+        if force or cache["data"] is None or time.time() - cache["time"] > CACHE_SECONDS:
+            r = run_wgpi("json", timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError(clean_message(r.stderr or r.stdout))
+            cache["data"] = json.loads(r.stdout)
+            cache["time"] = time.time()
+        return cache["data"]
 
 
-def ago(ts, now):
-    s = max(0, int(now - ts))
-    if s < 60:
-        return f"il y a {s} s"
-    if s < 3600:
-        return f"il y a {s // 60} min"
-    if s < 86400:
-        return f"il y a {s // 3600} h"
-    return f"il y a {s // 86400} j"
+def invalidate():
+    with cache_lock:
+        cache["data"] = None
 
 
-def get_status():
-    r = run_wgpi("json", timeout=30)
+def wg_live():
+    """Compteurs en direct (rapide, appelé à chaque rafraîchissement) : clé publique -> état."""
+    try:
+        r = subprocess.run(["wg", "show", WG_IF, "dump"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if r.returncode != 0:
-        raise RuntimeError(clean_message(r.stderr or r.stdout))
-    data = json.loads(r.stdout)
-    now = data.get("now") or time.time()
-    online = 0
-    for p in data["peers"]:
-        hs = int(p.get("handshake") or 0)
-        p["connected"] = hs > 0 and now - hs < 180
-        online += 1 if p["connected"] else 0
-        p["state"] = "● connecté" if p["connected"] else (ago(hs, now) if hs else "jamais")
-        p["rx_h"] = human_bytes(p.get("rx"))
-        p["tx_h"] = human_bytes(p.get("tx"))
-    data["online"] = online
-    return data
+        return None
+    live = {}
+    for line in r.stdout.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) >= 7:
+            try:
+                live[f[0]] = (f[2], int(f[4]), int(f[5]), int(f[6]))
+            except ValueError:
+                pass
+    return live
+
+
+def get_state():
+    base = load_base()
+    live = wg_live()
+    now = int(time.time())
+    peers, online = [], 0
+    for p in base.get("peers", []):
+        endpoint, hs, rx, tx = (live or {}).get(p.get("pub"), ("", 0, 0, 0))
+        enabled = bool(p.get("enabled", True))
+        age = now - hs if hs else None
+        connected = enabled and age is not None and age < 180
+        online += 1 if connected else 0
+        peers.append({"name": p.get("name", ""), "ip": p.get("ip", ""), "ip6": p.get("ip6", ""),
+                      "mode": p.get("mode", "full"), "enabled": enabled, "connected": connected,
+                      "age": age, "rx": rx, "tx": tx,
+                      "endpoint": "" if endpoint in ("", "(none)") else endpoint})
+    server = {k: base.get(k, "") for k in ("version", "endpoint", "port", "net", "net6", "dns",
+                                            "keepalive", "pubkey", "lan_net", "default_route")}
+    server.update({"running": live is not None, "online": online, "total": len(peers)})
+    return {"server": server, "peers": peers, "time": time.time()}
 
 
 def client_conf_path(name):
@@ -2133,215 +2298,686 @@ def client_conf_path(name):
     return path if os.path.isfile(path) else None
 
 
-def qr_png_base64(path):
+def qr_png(path):
     with open(path, "rb") as f:
         data = f.read()
-    r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"], input=data,
-                       capture_output=True, timeout=20)
-    return base64.b64encode(r.stdout).decode("ascii") if r.returncode == 0 else ""
+    try:
+        r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"], input=data,
+                           capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return b""
+    return r.stdout if r.returncode == 0 else b""
 
 
+# Emblème officiel de WireGuard (tracés repris tels quels de https://www.wireguard.com/img/wireguard.svg).
+# Le dragon est une découpe : un disque blanc derrière le garde blanc sur fond sombre, sans toucher au logo.
+# « WireGuard » et le logo « WireGuard » sont des marques déposées de Jason A. Donenfeld.
+WG_PATHS = (
+    "m301.28 145.56s6.9396-145.56-153.04-145.56c-141.48 0-145.9 139.63-145.9 139.63s-20.811 160.37 149.16 160.37c163.02 0 149.78-154.44 149.78-154.44zm-197.8-50.863c30.017-18.364 68.366-7.1401 82.735 20.476 2.7233 5.2338 3.0694 13.291 1.3447 18.782-5.9546 18.956-20.014 29.587-39.312 34.103 5.6892-4.8707 10.218-10.394 11.659-18.025a26.402 26.402 0 0 0-4.5425-20.956 26.76 26.76 0 0 0-30.811-9.3892c-11.881 4.5111-18.389 15.354-17.216 28.683 1.0898 12.381 10.484 20.405 28.061 23.453-2.627 1.3904-4.6503 2.4144-6.6299 3.5172a63.918 63.918 0 0 0-20.544 17.868c-1.7839 2.4084-3.0104 2.6024-5.727 0.94116-35.338-21.61-37.609-75.844 0.98226-99.453zm-26.449 133.53c-5.6769 1.441-11.178 3.5742-16.981 5.4775 2.8385-19.151 25.265-36.788 44.23-34.776a48.881 48.881 0 0 0-9.242 25.893c-6.302 1.1606-12.241 1.9414-18.007 3.405zm120.79-186.98c5.6099 0.20612 11.23 0.12091 16.844 0.25378a29.052 29.052 0 0 1 4.1674 0.58069 40.607 40.607 0 0 1-4.2357 5.4332c-2.007 1.8701-4.2745 3.6986-7.1661 0.856-0.6955-0.68372-2.3386-0.52679-3.5487-0.54272-5.5823-0.07336-11.172-0.25177-16.746-0.04132a104.04 104.04 0 0 0-14.425 1.473c-0.89368 0.16046-2.2299 3.1315-1.8191 4.227 0.9693 2.5853 2.3833 5.4363 4.4779 7.0898 7.7403 6.11 15.972 11.596 23.748 17.664 7.556 5.8966 14.589 12.358 18.875 21.253 5.5843 11.59 5.747 23.743 3.3388 35.95-4.0203 20.378-14.333 37.261-31.032 49.524-6.7288 4.941-15.06 7.7451-22.767 11.295-6.778 3.1225-13.755 5.8115-20.549 8.9008-12.249 5.5695-19.133 18.865-17.108 32.688 1.8585 12.685 12.987 23.271 25.735 25.456 15.292 2.6216 31.071-7.3163 34.812-22.86 4.2067-17.478-5.2898-33.083-23.065-37.813-0.78271-0.20831-1.5684-0.40552-3.2012-0.8269 4.7549-2.1245 8.8614-3.6381 12.653-5.7244q9.9213-5.4594 19.481-11.562c1.8742-1.199 2.8868-1.1996 4.4852 0.18225 12.225 10.57 19.518 23.718 21.563 39.839 3.3845 26.684-9.2471 51.198-33.072 63.762-36.86 19.439-81.965-2.6864-90.106-43.552-6.9738-35.003 17.73-66.754 47.462-72.884 12.787-2.6364 24.48-7.9596 33.57-17.807 5.8652-6.3541 8.7084-11.806 9.6772-14.266a39.565 39.565 0 0 0 2.7211-14.469 33.867 33.867 0 0 0-2.9654-12.398c-3.104-7.075-14.995-18.33-17.939-20.704l-28-21.921c-0.98761-0.81256-2.0994-0.75366-4.5079-0.59045-2.8611 0.19391-10.175 0.59888-13.331-0.22815 2.553-1.9321 9.5132-4.7451 12.502-7.007-9.0734-6.1297-19.43-3.9158-28.941-5.7461 2.1992-4.0959 13.081-10.39 19.27-11.091a91.533 91.533 0 0 0-1.6876-10.281c-0.37781-1.3917-1.9312-2.7408-3.2864-3.5355-3.286-1.9267-6.7694-3.5167-10.549-5.4327a21.936 21.936 0 0 1 11.332-3.5055 42.316 42.316 0 0 1 11.348 1.1056c6.7422 1.5405 12.124 0.53491 17.488-4.048-4.222-1.7002-8.4435-3.2535-12.538-5.0907a123.04 123.04 0 0 1-11.779-6.1583c10.622 1.4755 20.896 5.4585 31.757 4.0034q0.1387-0.74048 0.27728-1.4809c-8.1194-1.8899-16.239-3.7798-25.229-5.8724 15.04-1.3769 29.042-1.604 42.301 4.8541 3.731 1.8173 7.6348 3.3215 11.211 5.3972 1.7443 1.0124 2.9186 3.0078 4.3496 4.5594 1.1366 1.2325 2.0495 2.8837 3.446 3.6264 5.3 2.8184 11.134 2.9291 17.078 2.7879 0.04443-0.67694 0.08606-1.3114 0.1308-1.9933 5.9821 1.8693 12.715 8.7679 12.704 13.806-9.6911 0-19.374-0.037-29.056 0.05389-1.0348 0.0097-2.0626 0.76563-3.0936 1.1754 0.97986 0.57067 1.9428 1.5994 2.9423 1.6362z",
+    "m185.32 26.906a1.4806 1.4806 0 0 0-0.18927 2.3686 2.2326 2.2326 0 0 0 3.0724 0.8219c0.9328-0.47052 1.8478-0.97137 2.975-1.5665-0.9079-0.775-1.6362-1.4148-2.3857-2.0324-1.318-1.086-2.411-0.40386-3.4724 0.40833z",
+)
+LOGO = ('<svg class="logo" viewBox="-2 -2 305 304" aria-hidden="true"><circle cx="150" cy="150" r="146" fill="#fff"/>'
+        + "".join(f'<path fill="#88171a" transform="translate(-1.5394)" d="{d}"/>' for d in WG_PATHS) + '</svg>')
+FAVICON = "data:image/svg+xml," + urllib.parse.quote(LOGO.replace('class="logo" ', 'xmlns="http://www.w3.org/2000/svg" '))
+TRADEMARK = ('« WireGuard » et le logo « WireGuard » sont des marques déposées de Jason A. Donenfeld · '
+             '<a href="https://www.wireguard.com/" target="_blank" rel="noopener noreferrer">wireguard.com</a>')
+
+DARK = ("--bg:#0d0f12;--card:#16191e;--soft:#1d2127;--text:#e7e9ec;--muted:#98a2b3;--line:#282d35;"
+        "--accent:#e5484d;--accent-2:#f05b60;--ok:#3ccb7f;--ok-soft:#10291c;--bad:#f97066;--bad-soft:#2c1412;"
+        "--shadow:none")
 CSS = """
-:root{--bg:#f3f5f7;--card:#fff;--text:#1d2329;--muted:#5f6b76;--line:#dde3e8;--accent:#88171a;--on-accent:#fff;
---ok:#1a7f37;--ok-bg:#e6f4ea;--err:#b42318;--err-bg:#fdecea}
-@media (prefers-color-scheme:dark){:root{--bg:#111417;--card:#1b2026;--text:#e6e9ec;--muted:#9aa5af;--line:#2c333b;
---accent:#e0484d;--on-accent:#fff;--ok:#4cc26a;--ok-bg:#16301e;--err:#ff7b72;--err-bg:#3a1714}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{background:var(--card);border-bottom:1px solid var(--line)}
-.wrap{max-width:980px;margin:0 auto;padding:10px 16px}
-header .wrap{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:7px;padding-bottom:7px}
-.brand{font-weight:700;font-size:18px;color:inherit;text-decoration:none}
-.brand small{color:var(--muted);font-weight:400;font-size:13px;margin-left:8px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:10px 0}
-h1{font-size:20px;margin:0 0 6px}h2{font-size:16px;margin:0 0 8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px}
-.kv span{display:block;color:var(--muted);font-size:13px}.kv b{font-size:15px;word-break:break-all}
-.scroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
-th{color:var(--muted);font-weight:600;font-size:13px}tr:last-child td{border-bottom:none}
-.state.on{color:var(--ok);font-weight:600}.muted{color:var(--muted)}.small{font-size:13px}.num{white-space:nowrap}
-.actions{display:flex;flex-wrap:wrap;gap:6px}
+:root{--bg:#f3f4f6;--card:#fff;--soft:#f7f8fa;--text:#14171a;--muted:#667085;--line:#e5e7eb;
+--accent:#88171a;--accent-2:#6f1215;--on-accent:#fff;--ok:#12a150;--ok-soft:#e8f7ee;--bad:#d92d20;--bad-soft:#fdeeec;
+--shadow:0 1px 2px rgba(16,24,40,.05),0 2px 8px rgba(16,24,40,.06);--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+:root[data-theme=dark]{%DARK%}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){%DARK%}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+-webkit-font-smoothing:antialiased}
 a{color:var(--accent)}
-.btn,button{display:inline-block;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;
-padding:7px 12px;font:inherit;font-size:14px;line-height:1.3;cursor:pointer;text-decoration:none}
-.btn.primary,button.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
-button.danger{color:var(--err);border-color:var(--err)}
-form.inline{display:inline;margin:0}
-input[type=text],input[type=password]{width:100%;max-width:360px;padding:9px 11px;border:1px solid var(--line);
-border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
-label{display:block;margin:12px 0 4px;font-weight:600}
-label.radio{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-weight:400}
-.msg{border-radius:8px;padding:10px 12px;margin:12px 0}.msg.ok{background:var(--ok-bg);color:var(--ok)}
-.msg.err{background:var(--err-bg);color:var(--err)}
-.qr{display:block;width:240px;max-width:100%;height:auto;image-rendering:pixelated;background:#fff;border-radius:8px;margin:6px auto}
-.center{text-align:center}
-.addrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px}
-.addrow input[type=text]{flex:1 1 180px;max-width:260px}
-.addrow label.radio{margin:0;align-items:center}
-.device{display:grid;grid-template-columns:260px 1fr;gap:8px 28px;align-items:start}
-.qrcol{text-align:center}.howto h2{margin:2px 0 6px}.howto ol{margin:0 0 10px;padding-left:20px}
-.howto p{margin:0 0 6px}
-hr{border:none;border-top:1px solid var(--line);margin:10px 0}
-.back{margin:2px 0}
-footer{color:var(--muted);font-size:13px;text-align:center;padding:2px 16px 14px}
-@media (max-width:720px){.device{grid-template-columns:1fr}}
-@media (max-width:640px){.hide-sm{display:none}
-#devices thead{display:none}#devices tr{display:block;padding:12px 0;border-bottom:1px solid var(--line)}
-#devices tr:last-child{border-bottom:none}#devices td{display:inline-block;border:none;padding:2px 12px 2px 0}
-#devices td:first-child{display:block;font-size:16px}#devices td:last-child{display:block;padding-top:8px}
-#devices td.rx,#devices td.tx{display:none}}
+.wrap{max-width:1040px;margin:0 auto;padding:0 18px}
+.mono{font-family:var(--mono);font-size:12.5px}
+.top{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line)}
+@supports (backdrop-filter:blur(1px)){.top{background:color-mix(in srgb,var(--card) 82%,transparent);backdrop-filter:saturate(1.4) blur(10px)}}
+.bar{display:flex;align-items:center;justify-content:space-between;height:56px}
+.brand{display:flex;align-items:center;gap:10px;color:inherit;text-decoration:none}
+.brand b{font-size:17px;letter-spacing:-.01em}.brand small{color:var(--muted);font-size:12.5px}
+.logo{width:32px;height:32px;flex:none}
+.tm{color:var(--muted);font-size:11.5px;text-align:center;margin-top:2px}.tm a{color:inherit}
+.tools{display:flex;align-items:center;gap:8px}
+.ico{display:inline-flex}
+.ico svg,.icon-btn svg,.btn svg,.search svg,.step h4 svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;
+stroke-linecap:round;stroke-linejoin:round;flex:none}
+svg .f{fill:currentColor;stroke:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:36px;padding:0 14px;border-radius:10px;
+border:1px solid var(--line);background:var(--card);color:var(--text);font:inherit;font-weight:600;cursor:pointer;
+text-decoration:none;white-space:nowrap;transition:background .15s,border-color .15s}
+.btn:hover{background:var(--soft)}.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}.btn.primary:hover{background:var(--accent-2)}
+.btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+.btn.ghost{background:transparent}.btn.block{width:100%}.btn[disabled]{opacity:.6;cursor:default}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:9px;
+border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;text-decoration:none;
+transition:background .15s,color .15s,border-color .15s}
+.icon-btn:hover{background:var(--soft)}.icon-btn.danger:hover{color:var(--bad);border-color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}
+main{padding-top:16px;padding-bottom:4px}
+.alert{margin-bottom:12px;padding:10px 14px;border-radius:12px;background:var(--bad-soft);color:var(--bad);font-weight:600}
+.server{padding:12px 16px;margin-bottom:14px}
+.srv-main{display:flex;flex-wrap:wrap;align-items:center;gap:10px 28px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;font-weight:700;font-size:13px}
+.pill::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
+.pill.ok{background:var(--ok-soft);color:var(--ok)}.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.kv{display:flex;flex-direction:column;min-width:0}.kv>span{color:var(--muted);font-size:12px}.kv b{font-weight:600;overflow-wrap:anywhere}
+.push{margin-left:auto}
+.srv-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px 24px;margin-top:12px;
+padding-top:12px;border-top:1px dashed var(--line)}
+.srv-details .wide{grid-column:1/-1}.key{display:flex;align-items:center;gap:8px}
+#srv-toggle[aria-expanded=true] .ico{transform:rotate(180deg)}
+.clients{overflow:hidden}
+.clients-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;
+border-bottom:1px solid var(--line)}
+.clients-head h2{margin:0;font-size:17px;display:flex;align-items:center;gap:8px}
+.count{font-size:12px;font-weight:700;color:var(--muted);background:var(--soft);border:1px solid var(--line);border-radius:999px;padding:0 8px}
+.clients-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.search{display:flex;align-items:center;gap:6px;height:36px;padding:0 10px;border:1px solid var(--line);border-radius:10px;
+background:var(--soft);color:var(--muted)}
+.search input{border:none;background:transparent;color:var(--text);font:inherit;width:170px;outline:none}
+select{height:36px;padding:0 8px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--text);font:inherit}
+.row{position:relative;display:grid;grid-template-columns:42px minmax(0,1fr) 200px auto;align-items:center;gap:14px;
+padding:11px 16px;border-bottom:1px solid var(--line);overflow:hidden}
+.row:last-child{border-bottom:none}.row:hover{background:var(--soft)}
+.spark{position:absolute;left:0;bottom:0;width:100%;height:100%;pointer-events:none}
+.spark path{fill:var(--accent);opacity:.1}
+.row>:not(.spark){position:relative}
+.avatar{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+.avatar .dot{position:absolute;right:-1px;bottom:-1px;width:13px;height:13px;border-radius:50%;background:var(--muted);
+border:2px solid var(--card)}
+.row.online .avatar .dot{background:var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(18,161,80,.55)}70%{box-shadow:0 0 0 7px rgba(18,161,80,0)}100%{box-shadow:0 0 0 0 rgba(18,161,80,0)}}
+.row.disabled .avatar{filter:grayscale(1);opacity:.45}.row.disabled .name{color:var(--muted)}
+.l1{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px}
+.name{font-weight:700;font-size:15px}
+.badge{font-size:11.5px;font-weight:600;padding:0 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted)}
+.badge.off{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.ips{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status{font-size:12.5px;color:var(--muted)}.status.on{color:var(--ok);font-weight:600}
+.traffic{text-align:right;min-width:0}.traffic[hidden]{display:block!important;visibility:hidden}
+.rates{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.totals{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.actions{display:flex;align-items:center;gap:6px}
+.switch{position:relative;display:inline-block;width:38px;height:22px;margin-right:4px;flex:none}
+.switch input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;z-index:1}
+.slider{position:absolute;inset:0;border-radius:999px;background:var(--line);transition:background .2s}
+.slider::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;
+box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .2s}
+.switch input:checked+.slider{background:var(--ok)}.switch input:checked+.slider::after{transform:translateX(16px)}
+.switch input:focus-visible+.slider{outline:2px solid var(--accent);outline-offset:2px}
+.switch input:disabled+.slider{opacity:.6}
+.empty{padding:30px 16px;text-align:center;color:var(--muted)}.empty .btn{margin-top:10px}
+footer{color:var(--muted);font-size:12.5px;text-align:center;padding:12px 16px 16px}
+dialog{border:none;border-radius:18px;padding:0;width:min(580px,calc(100vw - 24px));max-height:calc(100vh - 24px);
+background:var(--card);color:var(--text);box-shadow:0 24px 64px rgba(0,0,0,.35)}
+dialog::backdrop{background:rgba(10,12,16,.55)}
+.dlg{padding:16px 20px 20px}
+.dlg-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.dlg-head h3{margin:0;font-size:18px;overflow-wrap:anywhere}
+.dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.note{padding:9px 12px;border-radius:10px;font-weight:600;margin-bottom:12px}
+.note.ok{background:var(--ok-soft);color:var(--ok)}.note.bad{background:var(--bad-soft);color:var(--bad)}
+.qr-wrap{display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:start}
+.qr{display:block;width:220px;height:220px;image-rendering:pixelated;background:#fff;border-radius:12px;padding:4px;border:1px solid var(--line)}
+.steps{display:flex;flex-direction:column;gap:12px}
+.step h4{display:flex;align-items:center;gap:8px;margin:0 0 4px;font-size:14px}
+.step ol{margin:0 0 8px;padding-left:20px;color:var(--muted)}
+.hint{color:var(--muted);font-size:12.5px;margin:10px 0 0}
+.field{display:block;font-weight:600;margin:0 0 6px}
+input[type=text],input[type=password]{width:100%;height:40px;padding:0 12px;border:1px solid var(--line);border-radius:10px;
+background:var(--soft);color:var(--text);font:inherit}
+input[type=text]:focus,input[type=password]:focus,select:focus,.search:focus-within{outline:2px solid var(--accent);outline-offset:1px}
+.form .hint{margin:6px 0 14px}
+.choices{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.choice{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid var(--line);border-radius:12px;cursor:pointer}
+.choice.on{border-color:var(--accent);background:var(--soft)}
+.choice input{margin-top:3px;accent-color:var(--accent)}
+.choice-text{display:flex;flex-direction:column}.choice-text span{color:var(--muted);font-size:12.5px}
+code{font-family:var(--mono);font-size:12px;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 5px}
+.login{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px}
+.login-card{width:min(380px,100%);padding:26px 24px}
+.login-logo{display:flex;align-items:center;gap:12px;margin-bottom:20px}.login-logo .logo{width:42px;height:42px}
+.login-logo b{display:block;font-size:20px}.login-logo span{color:var(--muted);font-size:13px}
+.login .btn{margin-top:14px;height:42px}
+.login .foot{color:var(--muted);font-size:12.5px;margin-top:16px;text-align:center}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:50;max-width:calc(100vw - 32px);padding:10px 16px;
+border-radius:12px;background:#111827;color:#fff;font-weight:600;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.toast.bad{background:var(--bad)}
+@media (max-width:760px){
+.row{grid-template-columns:42px minmax(0,1fr);gap:8px 12px}
+.traffic{grid-column:2;text-align:left;min-width:0}.traffic[hidden]{display:none!important}
+.actions{grid-column:1/-1;justify-content:flex-end}
+.search input{width:110px}.brand small,.hide-sm{display:none}
+.qr-wrap{grid-template-columns:1fr;justify-items:center}.choices{grid-template-columns:1fr}
+}
+""".replace("%DARK%", DARK)
+
+THEME_JS = r"""
+try { var t = localStorage.getItem("wgpi-theme"); if (t === "light" || t === "dark") { document.documentElement.setAttribute("data-theme", t); } } catch (e) {}
 """
 
 APP_JS = r"""
 "use strict";
-document.addEventListener("submit", function (e) {
-  var f = e.target, msg = f.getAttribute("data-confirm");
-  if (msg && !window.confirm(msg)) { e.preventDefault(); return; }
-  if (f.getAttribute("data-sent")) { e.preventDefault(); return; }  /* pas de double envoi */
-  f.setAttribute("data-sent", "1");
-});
-window.addEventListener("pageshow", function () {
-  document.querySelectorAll("form[data-sent]").forEach(function (f) { f.removeAttribute("data-sent"); });
-});
-function refresh() {
-  fetch("/api/status", {credentials: "same-origin", cache: "no-store"}).then(function (r) {
-    if (r.status === 401) { window.location.href = "/login"; return null; }
-    return r.ok ? r.json() : null;
-  }).then(function (d) {
-    if (!d) { return; }
-    d.peers.forEach(function (p) {
-      var row = document.querySelector('tr[data-name="' + p.name + '"]');
-      if (!row) { return; }
-      var st = row.querySelector(".state");
-      st.textContent = p.state;
-      st.className = "state" + (p.connected ? " on" : "");
-      row.querySelector(".rx").textContent = p.rx_h;
-      row.querySelector(".tx").textContent = p.tx_h;
+(function () {
+  var ICONS = {
+    plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+    search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
+    qr: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path class="f" d="M14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 18h2v2h-2zM18 14h2v2h-2z"/></svg>',
+    edit: '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="m13.5 6.5 4 4"/></svg>',
+    download: '<svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>',
+    trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>',
+    logout: '<svg viewBox="0 0 24 24"><path d="M14 4h5v16h-5"/><path d="m10 8-4 4 4 4"/><path d="M6 12h10"/></svg>',
+    sun: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+    moon: '<svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg>',
+    auto: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path class="f" d="M12 4a8 8 0 0 1 0 16z"/></svg>',
+    chevron: '<svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>',
+    copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a1 1 0 0 1 1-1h10"/></svg>',
+    close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+    phone: '<svg viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 17h2"/></svg>',
+    laptop: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/></svg>'
+  };
+  var root = document.documentElement;
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) { e.className = cls; } if (text != null) { e.textContent = text; } return e; }
+
+  /* Icônes et thème (aussi sur la page de connexion) */
+  document.querySelectorAll("[data-icon]").forEach(function (e) { e.insertAdjacentHTML("afterbegin", ICONS[e.getAttribute("data-icon")] || ""); });
+  var THEMES = ["auto", "light", "dark"], THEME_NAMES = {auto: "automatique", light: "clair", dark: "sombre"};
+  function getTheme() { try { return localStorage.getItem("wgpi-theme") || "auto"; } catch (e) { return "auto"; } }
+  function applyTheme(t) {
+    if (t === "auto") { root.removeAttribute("data-theme"); } else { root.setAttribute("data-theme", t); }
+    var b = $("theme");
+    if (b) { b.innerHTML = ICONS[t === "auto" ? "auto" : (t === "light" ? "sun" : "moon")]; b.title = "Thème : " + THEME_NAMES[t]; }
+  }
+  applyTheme(getTheme());
+  if ($("theme")) {
+    $("theme").addEventListener("click", function () {
+      var t = THEMES[(THEMES.indexOf(getTheme()) + 1) % THEMES.length];
+      try { localStorage.setItem("wgpi-theme", t); } catch (e) {}
+      applyTheme(t);
     });
-    var c = document.getElementById("online-count");
-    if (c) { c.textContent = d.online + " / " + d.peers.length; }
-  }).catch(function () {});
-}
-if (document.getElementById("devices")) { window.setInterval(refresh, 10000); }
+  }
+  if (!$("list")) { return; }   /* page de connexion : rien d'autre à faire */
+
+  var csrf = (document.querySelector('meta[name="csrf"]') || {}).content || "";
+  /* Object.create(null) : un appareil nommé « constructor » ou « __proto__ » ne doit rien casser */
+  var state = null, rows = Object.create(null), history = Object.create(null), query = "", sortKey = "name", toastTimer = null;
+  var inflight = false, again = false;
+  var nf = new Intl.NumberFormat("fr-FR", {maximumFractionDigits: 1});
+  var NBSP = " ";
+
+  function bytes(n) {
+    var u = ["o", "Ko", "Mo", "Go", "To"], i = 0;
+    n = Number(n) || 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? nf.format(n) : String(Math.round(n))) + NBSP + u[i];
+  }
+  function rate(n) { return bytes(n) + "/s"; }
+  function ago(s) {
+    if (s < 60) { return "il y a " + s + " s"; }
+    if (s < 3600) { return "il y a " + Math.floor(s / 60) + " min"; }
+    if (s < 86400) { return "il y a " + Math.floor(s / 3600) + " h"; }
+    return "il y a " + Math.floor(s / 86400) + " j";
+  }
+  function hostOf(ep) { var m = /^\[(.*)\]:\d+$/.exec(ep) || /^(.*):\d+$/.exec(ep); return m ? m[1] : ep; }
+  function initials(name) {
+    var parts = name.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    var s = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || name).slice(0, 2);
+    return s.toUpperCase();
+  }
+  function color(name) {
+    var h = 0;
+    for (var i = 0; i < name.length; i++) { h = (h * 31 + name.charCodeAt(i)) % 360; }
+    return "hsl(" + h + " 52% 46%)";
+  }
+  function iconBtn(name, title, cls) {
+    var b = el("button", "icon-btn" + (cls ? " " + cls : ""));
+    b.type = "button"; b.title = title; b.setAttribute("aria-label", title); b.innerHTML = ICONS[name];
+    return b;
+  }
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    return e;
+  }
+  function toast(msg, bad) {
+    var t = $("toast");
+    t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.hidden = true; }, 3500);
+  }
+  function api(method, url, body) {
+    var opts = {method: method, credentials: "same-origin", cache: "no-store", headers: {"X-CSRF-Token": csrf}};
+    if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    return fetch(url, opts).then(function (r) {
+      if (r.status === 401) { window.location.href = "/login"; throw new Error("session"); }
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) { throw new Error(d.error || ("Erreur " + r.status)); }
+        return d;
+      });
+    });
+  }
+  function peerUrl(name, suffix) { return "/api/peers/" + encodeURIComponent(name) + "/" + suffix; }
+
+  /* ---- Rafraîchissement ---- */
+  /* Une seule requête à la fois ; une demande arrivée entre-temps est rejouée ensuite */
+  function poll() {
+    if (document.hidden) { return; }
+    if (inflight) { again = true; return; }
+    inflight = true;
+    api("GET", "/api/state").then(function (d) {
+      $("alert").hidden = true;
+      if (!state || d.time > state.time) { update(d); }
+    }).catch(function (e) {
+      if (e.message === "session") { return; }
+      $("alert").textContent = "Impossible de joindre le Pi : " + e.message;
+      $("alert").hidden = false;
+    }).then(function () {
+      inflight = false;
+      if (again) { again = false; poll(); }
+    });
+  }
+  function update(d) {
+    d.peers.forEach(function (p) {
+      var h = history[p.name] || (history[p.name] = {samples: []});
+      if (h.t != null && d.time - h.t < 1) {   /* deux mesures trop proches : on garde le débit précédent */
+        p.down = h.down || 0; p.up = h.up || 0;
+        return;
+      }
+      var down = 0, up = 0;
+      if (h.t != null) {
+        /* vu depuis l'appareil : il reçoit ce que le serveur envoie (tx) et envoie ce que le serveur reçoit (rx) */
+        down = Math.max(0, (p.tx - h.tx) / (d.time - h.t));
+        up = Math.max(0, (p.rx - h.rx) / (d.time - h.t));
+      }
+      h.t = d.time; h.rx = p.rx; h.tx = p.tx; h.down = down; h.up = up;
+      h.samples.push(down + up);
+      if (h.samples.length > 40) { h.samples.shift(); }
+      p.down = down; p.up = up;
+    });
+    state = d;
+    renderServer();
+    renderList();
+  }
+
+  /* ---- Serveur ---- */
+  function renderServer() {
+    var s = state.server;
+    var pill = $("srv-state");
+    pill.textContent = s.running ? "Serveur actif" : "Serveur arrêté";
+    pill.className = "pill " + (s.running ? "ok" : "bad");
+    $("srv-endpoint").textContent = s.endpoint;
+    $("srv-net").textContent = s.net;
+    $("srv-online").textContent = s.online + " / " + s.total;
+    $("d-pubkey").textContent = s.pubkey || "—";
+    $("d-port").textContent = s.port + " (UDP)";
+    $("d-net6").textContent = s.net6 || "désactivé";
+    $("d-dns").textContent = s.dns || "—";
+    $("d-keepalive").textContent = s.keepalive + " s";
+    $("d-lan").textContent = s.lan_net || "—";
+    $("d-mode").textContent = s.default_route === "split" ? "Réseau de la maison" : "Tout le trafic";
+    $("d-version").textContent = "wg-pi " + s.version;
+  }
+
+  /* ---- Appareils ---- */
+  function makeRow(name) {
+    var r = {name: name, el: el("div", "row")};
+    r.spark = svgEl("svg", {"class": "spark", viewBox: "0 0 100 30", preserveAspectRatio: "none", "aria-hidden": "true"});
+    r.area = svgEl("path", {d: ""});
+    r.spark.appendChild(r.area);
+    r.avatar = el("div", "avatar");
+    r.ini = el("span");
+    r.avatar.append(r.ini, el("span", "dot"));
+    var info = el("div", "info"), l1 = el("div", "l1");
+    r.nameEl = el("span", "name"); r.mode = el("span", "badge"); r.off = el("span", "badge off", "Désactivé");
+    l1.append(r.nameEl, r.mode, r.off);
+    r.ips = el("div", "ips mono"); r.status = el("div", "status");
+    info.append(l1, r.ips, r.status);
+    r.traffic = el("div", "traffic"); r.rates = el("div", "rates"); r.totals = el("div", "totals");
+    r.traffic.append(r.rates, r.totals);
+    var act = el("div", "actions"), sw = el("label", "switch");
+    r.toggle = el("input"); r.toggle.type = "checkbox";
+    sw.append(r.toggle, el("span", "slider"));
+    r.qr = iconBtn("qr", "QR code"); r.ren = iconBtn("edit", "Renommer");
+    r.dl = el("a", "icon-btn"); r.dl.innerHTML = ICONS.download;
+    r.dl.title = "Télécharger le fichier .conf"; r.dl.setAttribute("aria-label", r.dl.title);
+    r.del = iconBtn("trash", "Supprimer", "danger");
+    act.append(sw, r.qr, r.ren, r.dl, r.del);
+    r.el.append(r.spark, r.avatar, info, r.traffic, act);
+    r.toggle.addEventListener("change", function () { setEnabled(r, r.toggle.checked); });
+    r.qr.addEventListener("click", function () { openQR(r.name, false); });
+    r.ren.addEventListener("click", function () { openRename(r.name); });
+    r.del.addEventListener("click", function () { openDelete(r.name); });
+    return r;
+  }
+  function fillRow(r, p) {
+    r.nameEl.textContent = p.name;
+    r.ini.textContent = initials(p.name);
+    r.avatar.style.background = color(p.name);
+    r.el.classList.toggle("disabled", !p.enabled);
+    r.el.classList.toggle("online", p.connected);
+    r.mode.textContent = p.mode === "full" ? "Tout le trafic" : "Réseau maison";
+    r.mode.title = p.mode === "full" ? "Tout le trafic de l'appareil passe par la maison" : "Seul l'accès au réseau de la maison passe par le VPN";
+    r.off.hidden = p.enabled;
+    r.ips.textContent = p.ip + (p.ip6 ? "  ·  " + p.ip6 : "");
+    var st;
+    if (!p.enabled) { st = "Accès coupé : l'appareil ne peut plus se connecter"; }
+    else if (p.connected) { st = "Connecté" + (p.endpoint ? " depuis " + hostOf(p.endpoint) : ""); }
+    else if (p.age != null) { st = "Vu " + ago(p.age); }
+    else { st = "Jamais connecté"; }
+    r.status.textContent = st;
+    r.status.className = "status" + (p.connected ? " on" : "");
+    r.rates.textContent = (p.connected || p.down || p.up) ? "↓ " + rate(p.down) + "   ↑ " + rate(p.up) : "";
+    r.totals.textContent = (p.rx || p.tx) ? "Total ↓ " + bytes(p.tx) + " · ↑ " + bytes(p.rx) : "";
+    r.totals.title = "Reçu (↓) et envoyé (↑) par l'appareil depuis le démarrage du VPN";
+    r.traffic.hidden = !r.rates.textContent && !r.totals.textContent;
+    if (!r.busy) { r.toggle.checked = p.enabled; }
+    r.toggle.title = p.enabled ? "Accès autorisé : cliquez pour le couper" : "Accès coupé : cliquez pour le rétablir";
+    r.toggle.setAttribute("aria-label", r.toggle.title);
+    r.dl.href = "/device/" + encodeURIComponent(p.name) + "/conf";
+    r.dl.setAttribute("download", p.name + ".conf");
+    drawSpark(r, (history[p.name] || {samples: []}).samples);
+  }
+  function drawSpark(r, s) {
+    var max = Math.max.apply(null, s.concat([0]));
+    if (max < 2048) { r.area.setAttribute("d", ""); return; }
+    var n = 40, off = n - s.length, d = "M0,30";
+    for (var i = 0; i < s.length; i++) {
+      d += " L" + ((off + i) * 100 / (n - 1)).toFixed(1) + "," + (30 - s[i] / max * 26).toFixed(1);
+    }
+    r.area.setAttribute("d", d + " L100,30 Z");
+  }
+  function compare(a, b) {
+    if (sortKey === "seen") {
+      var ka = a.connected ? -1 : (a.age == null ? 1e12 : a.age), kb = b.connected ? -1 : (b.age == null ? 1e12 : b.age);
+      if (ka !== kb) { return ka - kb; }
+    } else if (sortKey === "traffic") {
+      var ta = a.rx + a.tx, tb = b.rx + b.tx;
+      if (ta !== tb) { return tb - ta; }
+    }
+    return a.name.localeCompare(b.name, "fr");
+  }
+  function renderList() {
+    var list = $("list"), q = query.trim().toLowerCase();
+    var peers = state.peers.filter(function (p) { return !q || (p.name + " " + p.ip + " " + p.ip6).toLowerCase().indexOf(q) >= 0; });
+    peers.sort(compare);
+    var names = Object.create(null), wanted = [];
+    peers.forEach(function (p) {
+      var r = rows[p.name] || (rows[p.name] = makeRow(p.name));
+      fillRow(r, p);
+      names[p.name] = true;
+      wanted.push(r.el);
+    });
+    Object.keys(rows).forEach(function (n) {
+      if (!names[n]) { rows[n].el.remove(); if (!state.peers.some(function (p) { return p.name === n; })) { delete rows[n]; } }
+    });
+    var empty = $("empty");
+    if (!wanted.length) {
+      if (!empty) { empty = el("div", "empty"); empty.id = "empty"; }
+      var kind = state.peers.length ? "q:" + query.trim() : "none";
+      if (empty.getAttribute("data-kind") !== kind) {   /* reconstruit seulement si le message change */
+        empty.setAttribute("data-kind", kind);
+        empty.textContent = "";
+        if (state.peers.length) { empty.append(el("div", null, "Aucun appareil ne correspond à « " + query.trim() + " ».")); }
+        else {
+          empty.append(el("div", null, "Aucun appareil pour l'instant."));
+          var b = el("button", "btn primary"); b.type = "button"; b.innerHTML = ICONS.plus; b.append(el("span", null, "Ajouter le premier"));
+          b.addEventListener("click", openNew); empty.append(b);
+        }
+      }
+      if (empty.parentNode !== list) { list.appendChild(empty); }
+    } else if (empty) { empty.remove(); }
+    /* ne réordonne le DOM que si l'ordre a changé (évite de perdre le focus) */
+    var current = Array.prototype.filter.call(list.children, function (c) { return c.id !== "empty"; });
+    var same = current.length === wanted.length && wanted.every(function (e, i) { return current[i] === e; });
+    if (!same) { wanted.forEach(function (e) { list.appendChild(e); }); }
+    var c = $("count"); c.textContent = String(state.peers.length); c.hidden = !state.peers.length;
+  }
+
+  /* ---- Actions ---- */
+  function setEnabled(r, on) {
+    r.busy = true; r.toggle.disabled = true;
+    api("POST", peerUrl(r.name, on ? "enable" : "disable"), {}).then(function () {
+      toast(on ? "Accès de « " + r.name + " » rétabli" : "Accès de « " + r.name + " » coupé");
+      poll();
+    }).catch(function (e) {
+      r.toggle.checked = !on;
+      if (e.message !== "session") { toast(e.message, true); }
+    }).then(function () { r.busy = false; r.toggle.disabled = false; });
+  }
+  var dlg = $("dlg"), dbody = $("dlg-body");
+  function openDialog(title, build) {
+    dbody.textContent = "";
+    var head = el("div", "dlg-head"), h = el("h3", null, title);
+    h.id = "dlg-title";
+    var x = iconBtn("close", "Fermer");
+    x.addEventListener("click", closeDialog);
+    head.append(h, x);
+    dbody.append(head);
+    build(dbody);
+    if (!dlg.open) { if (dlg.showModal) { dlg.showModal(); } else { dlg.setAttribute("open", ""); } }
+  }
+  function closeDialog() { if (dlg.open) { if (dlg.close) { dlg.close(); } else { dlg.removeAttribute("open"); } } }
+  /* Fermeture par clic sur le fond, seulement si le clic a aussi commencé sur le fond
+     (une sélection de texte relâchée à l'extérieur ne doit pas fermer la fenêtre) */
+  var downOnBackdrop = false;
+  dlg.addEventListener("pointerdown", function (e) { downOnBackdrop = e.target === dlg; });
+  dlg.addEventListener("click", function (e) { if (e.target === dlg && downOnBackdrop) { closeDialog(); } downOnBackdrop = false; });
+  /* Erreur d'une fenêtre déjà fermée : affichée en notification plutôt que perdue */
+  function showError(f, err, ok, x) {
+    if (f.isConnected && dlg.open) { err.textContent = x.message; err.hidden = false; ok.disabled = false; }
+    else if (x.message !== "session") { toast(x.message, true); }
+  }
+  function actionsBar(cancelText, okText, okClass) {
+    var bar = el("div", "dlg-actions"), cancel = el("button", "btn ghost", cancelText), ok = el("button", "btn " + okClass, okText);
+    cancel.type = "button"; ok.type = "submit";
+    cancel.addEventListener("click", closeDialog);
+    bar.append(cancel, ok);
+    return {bar: bar, ok: ok};
+  }
+  function errorBox() { var e = el("div", "note bad"); e.hidden = true; return e; }
+  function nameInput(id, value) {
+    var inp = el("input"); inp.id = id; inp.type = "text"; inp.required = true; inp.maxLength = 15;
+    inp.pattern = "[A-Za-z0-9_][A-Za-z0-9_\\-]{0,14}"; inp.placeholder = "ex. telephone, pc-salon";
+    inp.autocomplete = "off"; inp.spellcheck = false; inp.setAttribute("autocapitalize", "off");
+    inp.value = value || "";
+    return inp;
+  }
+  function step(iconName, title, items) {
+    var s = el("div", "step"), h = el("h4"), ol = el("ol");
+    h.innerHTML = ICONS[iconName]; h.append(document.createTextNode(title));
+    items.forEach(function (t) { ol.append(el("li", null, t)); });
+    s.append(h, ol);
+    return s;
+  }
+  function openQR(name, isNew) {
+    openDialog(name, function (b) {
+      if (isNew) { b.append(el("div", "note ok", "Appareil créé : scannez ce QR code avec l'application WireGuard.")); }
+      var wrap = el("div", "qr-wrap"), img = el("img", "qr");
+      img.alt = "QR code de configuration de " + name;
+      img.src = "/device/" + encodeURIComponent(name) + "/qr?v=" + Date.now();
+      var steps = el("div", "steps");
+      steps.append(step("phone", "Téléphone ou tablette", ["Installez l'application WireGuard.", "Touchez + › Scanner un code QR.", "Visez ce QR code, puis activez le tunnel."]));
+      var pc = step("laptop", "Ordinateur", ["Téléchargez le fichier de configuration.", "WireGuard › Importer un tunnel depuis un fichier."]);
+      var a = el("a", "btn primary"); a.innerHTML = ICONS.download; a.append(el("span", null, "Télécharger " + name + ".conf"));
+      a.href = "/device/" + encodeURIComponent(name) + "/conf"; a.setAttribute("download", name + ".conf");
+      pc.append(a);
+      steps.append(pc);
+      wrap.append(img, steps);
+      b.append(wrap, el("p", "hint", "Ce QR code et ce fichier contiennent la clé privée de l'appareil : ne les partagez pas."));
+    });
+  }
+  function choice(value, title, desc, checked) {
+    var l = el("label", "choice" + (checked ? " on" : "")), r = el("input"), t = el("span", "choice-text");
+    r.type = "radio"; r.name = "mode"; r.value = value; r.checked = checked;
+    t.append(el("b", null, title), el("span", null, desc));
+    l.append(r, t);
+    return l;
+  }
+  function openNew() {
+    var def = state && state.server.default_route === "split" ? "split" : "full";
+    openDialog("Nouvel appareil", function (b) {
+      var f = el("form", "form"), lab = el("label", "field", "Nom de l'appareil"), inp = nameInput("new-name");
+      lab.htmlFor = "new-name";
+      var modes = el("div", "choices");
+      modes.append(choice("full", "Tout le trafic", "Wi-Fi publics sécurisés, Internet « depuis la maison ».", def === "full"),
+                   choice("split", "Réseau de la maison", "NAS, PC de jeu, imprimante… le reste passe en direct.", def === "split"));
+      modes.addEventListener("change", function () {
+        modes.querySelectorAll(".choice").forEach(function (c) { c.classList.toggle("on", c.querySelector("input").checked); });
+      });
+      var err = errorBox(), act = actionsBar("Annuler", "Créer l'appareil", "primary");
+      f.append(lab, inp, el("div", "hint", "1 à 15 caractères : lettres, chiffres, - et _ (sans espace ni accent)."),
+               el("div", "field", "Ce que l'appareil fait passer par la maison"), modes, err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        var mode = (f.querySelector("input[name=mode]:checked") || {}).value || "full";
+        api("POST", "/api/peers", {name: inp.value.trim(), mode: mode}).then(function (d) {
+          poll();
+          if (f.isConnected && dlg.open) { openQR(d.name, true); } else { toast("Appareil « " + d.name + " » créé"); }
+        }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+      setTimeout(function () { inp.focus(); }, 30);
+    });
+  }
+  function openRename(name) {
+    openDialog("Renommer « " + name + " »", function (b) {
+      var f = el("form", "form"), lab = el("label", "field", "Nouveau nom"), inp = nameInput("ren-name", name);
+      lab.htmlFor = "ren-name";
+      var err = errorBox(), act = actionsBar("Annuler", "Renommer", "primary");
+      f.append(lab, inp, el("div", "hint", "Rien à changer sur l'appareil : son accès continue de fonctionner."), err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        var to = inp.value.trim();
+        api("POST", peerUrl(name, "rename"), {name: to}).then(function () {
+          if (f.isConnected) { closeDialog(); }
+          toast("« " + name + " » s'appelle maintenant « " + to + " »");
+          history[to] = history[name]; delete history[name];
+          poll();
+        }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+      setTimeout(function () { inp.focus(); inp.select(); }, 30);
+    });
+  }
+  function openDelete(name) {
+    openDialog("Supprimer « " + name + " » ?", function (b) {
+      var f = el("form", "form"), err = errorBox(), act = actionsBar("Annuler", "Supprimer définitivement", "danger");
+      f.append(el("p", null, "L'appareil ne pourra plus se connecter et sa configuration sera effacée. Pour couper l'accès temporairement, utilisez plutôt l'interrupteur."), err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true;
+        api("POST", peerUrl(name, "delete"), {}).then(function () {
+          if (f.isConnected) { closeDialog(); }
+          toast("« " + name + " » supprimé"); delete history[name]; poll();
+        }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+    });
+  }
+
+  /* ---- Barre d'outils ---- */
+  $("new").addEventListener("click", openNew);
+  $("search").addEventListener("input", function (e) { query = e.target.value; if (state) { renderList(); } });
+  $("sort").addEventListener("change", function (e) { sortKey = e.target.value; if (state) { renderList(); } });
+  $("srv-toggle").addEventListener("click", function () {
+    var open = $("srv-details").hidden;
+    $("srv-details").hidden = !open;
+    $("srv-toggle").setAttribute("aria-expanded", String(open));
+  });
+  $("copy-key").addEventListener("click", function () {
+    if (!state || !navigator.clipboard) { return; }
+    navigator.clipboard.writeText(state.server.pubkey).then(function () { toast("Clé publique copiée"); });
+  });
+  $("logout").addEventListener("click", function () {
+    api("POST", "/api/logout", {}).catch(function () {}).then(function () { window.location.href = "/login"; });
+  });
+  document.addEventListener("visibilitychange", poll);
+  poll();
+  setInterval(poll, 2000);
+})();
 """
 
 
-def page(title, body, sess=None):
-    logout = ""
-    if sess:
-        logout = (f'<form method="post" action="/logout" class="inline">'
-                  f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
-                  f'<button type="submit">Déconnexion</button></form>')
+def head(title, csrf=""):
+    meta = f'<meta name="csrf" content="{esc(csrf)}">' if csrf else ""
     return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<meta name="robots" content="noindex"><title>{esc(title)} · wg-pi</title>'
-            f'<style>{CSS}</style></head><body>'
-            f'<header><div class="wrap"><a class="brand" href="/">wg-pi<small>VPN WireGuard · v{esc(VERSION)}</small></a>'
-            f'{logout}</div></header><main class="wrap">{body}</main>'
-            f'<footer>Panneau accessible uniquement depuis le réseau de la maison et le VPN.</footer>'
-            f'<script src="/static/app.js"></script></body></html>')
+            f'<meta name="robots" content="noindex">{meta}<title>{esc(title)} · wg-pi</title>'
+            f'<link rel="icon" href="{FAVICON}"><style>{CSS}</style>'
+            f'<script src="/static/theme.js"></script></head>')
 
 
 def login_page(error=""):
-    err = f'<div class="msg err">{esc(error)}</div>' if error else ""
-    body = f"""<div class="card" style="max-width:400px;margin:40px auto"><h1>Connexion</h1>{err}
-<form method="post" action="/login"><label for="password">Mot de passe</label>
+    err = f'<div class="note bad">{esc(error)}</div>' if error else ""
+    return head("Connexion") + f"""<body><main class="login">
+<div class="card login-card">
+<div class="login-logo">{LOGO}<div><b>wg-pi</b><span>VPN WireGuard®</span></div></div>{err}
+<form method="post" action="/login"><label class="field" for="password">Mot de passe</label>
 <input type="password" id="password" name="password" required autofocus autocomplete="current-password">
-<p><button type="submit" class="primary">Se connecter</button></p></form>
-<p class="muted small">Mot de passe oublié ? Sur le Pi : <code>sudo wg-pi web password</code></p></div>"""
-    return page("Connexion", body)
+<button type="submit" class="btn primary block">Se connecter</button></form>
+<p class="hint">Mot de passe oublié ? Sur le Pi : <code>sudo wg-pi web password</code></p></div>
+<p class="foot">Accessible uniquement depuis le réseau de la maison et le VPN</p>
+<p class="tm">{TRADEMARK}</p>
+</main><script src="/static/app.js"></script></body></html>"""
 
 
-def dashboard(sess, msg="", err=""):
-    try:
-        st = get_status()
-    except Exception as e:  # état illisible : on l'affiche plutôt que de planter
-        return page("Appareils", f'<div class="msg err">Impossible de lire l\'état du VPN : {esc(str(e))}</div>', sess)
-    csrf = esc(sess["csrf"])
-    flash = (f'<div class="msg ok">{esc(msg)}</div>' if msg else "") + (f'<div class="msg err">{esc(err)}</div>' if err else "")
-    if st.get("running"):
-        server = '<b class="state on">● actif</b>'
-    else:
-        server = '<b style="color:var(--err)">● arrêté</b> <span class="muted small">(sudo wg-pi check)</span>'
-    rows = []
-    for p in st["peers"]:
-        n = esc(p["name"])
-        mode = "Tout le trafic" if p["mode"] == "full" else "Réseau maison"
-        on = " on" if p["connected"] else ""
-        rows.append(f"""<tr data-name="{n}"><td><a href="/device/{n}"><b>{n}</b></a></td>
-<td class="num">{esc(p['ip'])}</td><td class="hide-sm">{mode}</td><td class="state{on}">{esc(p['state'])}</td>
-<td class="num hide-sm rx">{esc(p['rx_h'])}</td><td class="num hide-sm tx">{esc(p['tx_h'])}</td>
-<td><div class="actions"><a class="btn" href="/device/{n}">QR code</a><a class="btn" href="/device/{n}/conf">Fichier</a>
-<form method="post" action="/remove" class="inline" data-confirm="Supprimer « {n} » ? Il ne pourra plus se connecter.">
-<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="name" value="{n}">
-<button type="submit" class="danger">Supprimer</button></form></div></td></tr>""")
-    if rows:
-        table = (f'<div class="scroll"><table id="devices"><thead><tr><th>Appareil</th><th>IP VPN</th>'
-                 f'<th class="hide-sm">Mode</th><th>Dernière connexion</th><th class="hide-sm">Reçu</th>'
-                 f'<th class="hide-sm">Envoyé</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
-    else:
-        table = '<p class="muted">Aucun appareil pour l\'instant : ajoutez-en un ci-dessous.</p>'
-    split = st.get("default_route") == "split"
-    body = f"""{flash}<div class="card"><div class="grid">
-<div class="kv"><span>Serveur</span>{server}</div>
-<div class="kv"><span>Adresse publique</span><b>{esc(st['endpoint'])}</b></div>
-<div class="kv"><span>Réseau du VPN</span><b>{esc(st['net'])}</b></div>
-<div class="kv"><span>Connectés en ce moment</span><b id="online-count">{st['online']} / {len(st['peers'])}</b></div>
+def app_page(sess):
+    return head("Appareils", sess["csrf"]) + f"""<body>
+<header class="top"><div class="wrap bar">
+<a class="brand" href="/">{LOGO}<b>wg-pi</b><small>VPN WireGuard®</small></a>
+<div class="tools">
+<button type="button" class="icon-btn" id="theme" aria-label="Changer de thème"></button>
+<button type="button" class="btn ghost" id="logout" data-icon="logout"><span class="hide-sm">Déconnexion</span></button>
+</div></div></header>
+<main class="wrap">
+<div class="alert" id="alert" role="alert" hidden></div>
+<section class="card server" aria-label="Serveur">
+<div class="srv-main">
+<span class="pill ok" id="srv-state">Chargement…</span>
+<div class="kv"><span>Adresse publique</span><b class="mono" id="srv-endpoint">…</b></div>
+<div class="kv"><span>Réseau du VPN</span><b class="mono" id="srv-net">…</b></div>
+<div class="kv"><span>Connectés</span><b id="srv-online">…</b></div>
+<button type="button" class="btn ghost push" id="srv-toggle" aria-expanded="false" aria-controls="srv-details">Détails<span class="ico" data-icon="chevron"></span></button>
+</div>
+<div class="srv-details" id="srv-details" hidden>
+<div class="kv wide"><span>Clé publique du serveur</span><div class="key"><b class="mono" id="d-pubkey"></b>
+<button type="button" class="icon-btn" id="copy-key" data-icon="copy" title="Copier la clé publique" aria-label="Copier la clé publique"></button></div></div>
+<div class="kv"><span>Port</span><b id="d-port"></b></div>
+<div class="kv"><span>Réseau IPv6 du VPN</span><b class="mono" id="d-net6"></b></div>
+<div class="kv"><span>DNS des appareils</span><b class="mono" id="d-dns"></b></div>
+<div class="kv"><span>Keepalive</span><b id="d-keepalive"></b></div>
+<div class="kv"><span>Réseau de la maison</span><b class="mono" id="d-lan"></b></div>
+<div class="kv"><span>Mode par défaut</span><b id="d-mode"></b></div>
+<div class="kv"><span>Version</span><b id="d-version"></b></div>
+</div></section>
+<section class="card clients" aria-label="Appareils">
+<div class="clients-head"><h2>Appareils <span class="count" id="count" hidden></span></h2>
+<div class="clients-tools">
+<label class="search" data-icon="search"><input type="search" id="search" placeholder="Rechercher…" aria-label="Rechercher un appareil" autocomplete="off"></label>
+<select id="sort" aria-label="Trier les appareils"><option value="name">Nom</option><option value="seen">Dernière connexion</option><option value="traffic">Trafic</option></select>
+<button type="button" class="btn primary" id="new" data-icon="plus"><span>Nouvel appareil</span></button>
 </div></div>
-<div class="card"><h2>Appareils</h2>{table}</div>
-<div class="card"><h2>Ajouter un appareil</h2><form method="post" action="/add">
-<input type="hidden" name="csrf" value="{csrf}"><div class="addrow">
-<input type="text" id="name" name="name" aria-label="Nom de l'appareil" required maxlength="15"
- pattern="[A-Za-z0-9_][A-Za-z0-9_\\-]{{0,14}}" placeholder="Nom (ex. telephone, pc-salon)"
- autocomplete="off" autocapitalize="off" spellcheck="false">
-<label class="radio" title="Sécurité sur les Wi-Fi publics, Internet « depuis la maison »">
-<input type="radio" name="mode" value="full"{"" if split else " checked"}> Tout le trafic</label>
-<label class="radio" title="NAS, PC de jeu, imprimante… le reste passe en direct">
-<input type="radio" name="mode" value="split"{" checked" if split else ""}> Réseau de la maison seulement</label>
-<button type="submit" class="primary">Créer et afficher le QR code</button></div>
-<div class="muted small" style="margin-top:6px">Nom : 1 à 15 caractères (lettres, chiffres, - et _).
-« Tout le trafic » sécurise les Wi-Fi publics ; « Réseau de la maison » donne accès au NAS, au PC de jeu… le reste passe en direct.</div>
-</form></div>"""
-    return page("Appareils", body, sess)
-
-
-def device_page(sess, name, new=False):
-    path = client_conf_path(name)
-    if not path:
-        return None
-    n = esc(name)
-    csrf = esc(sess["csrf"])
-    qr = qr_png_base64(path)
-    img = (f'<img class="qr" alt="QR code de configuration de {n}" src="data:image/png;base64,{qr}">'
-           if qr else '<div class="msg err">QR code indisponible (qrencode).</div>')
-    banner = '<div class="msg ok">Appareil créé : scannez le QR code avec l\'application WireGuard.</div>' if new else ""
-    body = f"""<p class="back"><a href="/">← Tous les appareils</a></p>{banner}
-<div class="card device">
-<div class="qrcol"><h1>{n}</h1>{img}
-<p class="muted small">Ce QR code contient la clé privée de l'appareil : ne le partagez pas.</p></div>
-<div class="howto">
-<h2>Téléphone ou tablette</h2><ol>
-<li>Installez l'application <b>WireGuard</b> (App Store / Google Play).</li>
-<li>Appuyez sur <b>+</b> › <b>Scanner un code QR</b> et visez le QR code.</li>
-<li>Activez le tunnel.</li></ol>
-<h2>Ordinateur</h2>
-<p><a class="btn primary" href="/device/{n}/conf">Télécharger {n}.conf</a></p>
-<p class="muted small">Puis dans l'application WireGuard : <b>Importer un tunnel depuis un fichier</b>.
-Supprimez ensuite le fichier téléchargé : il contient la clé privée.</p>
-<hr>
-<form method="post" action="/remove" data-confirm="Supprimer « {n} » ? Il ne pourra plus se connecter.">
-<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="name" value="{n}">
-<button type="submit" class="danger">Supprimer {n}</button>
-<span class="muted small">Il ne pourra plus se connecter ; les autres appareils ne sont pas touchés.</span></form>
-</div></div>"""
-    return page(name, body, sess)
-
-
-def not_found(sess):
-    return page("Introuvable", '<div class="msg err">Cet appareil n\'existe pas (ou plus).</div>'
-                '<p><a href="/">← Tous les appareils</a></p>', sess)
+<div id="list"></div>
+</section>
+</main>
+<footer>Accessible uniquement depuis le réseau de la maison et le VPN · wg-pi {esc(VERSION)}<div class="tm">{TRADEMARK}</div></footer>
+<dialog id="dlg" aria-labelledby="dlg-title"><div class="dlg" id="dlg-body"></div></dialog>
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="/static/app.js"></script></body></html>"""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -2380,6 +3016,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json(self, code, obj, headers=None):
+        self.send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", headers)
+
     def redirect(self, location, headers=None):
         self.send(303, "", headers=dict({"Location": location}, **(headers or {})))
 
@@ -2405,41 +3044,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.is_allowed():
             return self.forbidden()
-        url = urllib.parse.urlsplit(self.path)
-        path = url.path
+        path = urllib.parse.urlsplit(self.path).path
         if path == "/static/app.js":
             return self.send(200, APP_JS, "application/javascript; charset=utf-8")
+        if path == "/static/theme.js":
+            return self.send(200, THEME_JS, "application/javascript; charset=utf-8")
         if path == "/login":
             return self.send(200, login_page())
         sess = self.get_session()
         if not sess:
             if path.startswith("/api/"):
-                return self.send(401, '{"error":"session"}', "application/json")
+                return self.send_json(401, {"error": "Session expirée : reconnectez-vous."})
             return self.redirect("/login")
-        query = urllib.parse.parse_qs(url.query)
         if path == "/":
-            removed = (query.get("removed") or [""])[0]
-            msg = f"Appareil « {removed} » supprimé." if NAME_RE.fullmatch(removed) else ""
-            return self.send(200, dashboard(sess, msg=msg))
-        if path == "/api/status":
+            return self.send(200, app_page(sess))
+        if path == "/api/state":
             try:
-                return self.send(200, json.dumps(get_status()), "application/json")
-            except Exception as e:
-                return self.send(500, json.dumps({"error": str(e)}), "application/json")
-        m = re.fullmatch(r"/device/([A-Za-z0-9_-]{1,15})(/conf)?", path)
+                return self.send_json(200, get_state())
+            except Exception as e:  # état illisible : on le signale à la page plutôt que de planter
+                return self.send_json(500, {"error": str(e)})
+        m = re.fullmatch(r"/device/([A-Za-z0-9_-]{1,15})/(conf|qr)", path)
         if m:
-            name = m.group(1)
+            name, kind = m.groups()
             conf = client_conf_path(name)
             if not conf:
-                return self.send(404, not_found(sess))
-            if m.group(2):
-                with open(conf, "rb") as f:
-                    data = f.read()
-                log(f"{self.client_address[0]} : téléchargement de {name}.conf")
-                return self.send(200, data, "application/octet-stream",
-                                 {"Content-Disposition": f'attachment; filename="{name}.conf"'})
-            return self.send(200, device_page(sess, name, new="new" in query))
-        return self.send(404, not_found(sess))
+                return self.send(404, "Appareil introuvable.\n", "text/plain; charset=utf-8")
+            if kind == "qr":
+                png = qr_png(conf)
+                if not png:
+                    return self.send(500, "QR code indisponible (qrencode).\n", "text/plain; charset=utf-8")
+                return self.send(200, png, "image/png")
+            with open(conf, "rb") as f:
+                data = f.read()
+            log(f"{self.client_address[0]} : téléchargement de {name}.conf")
+            return self.send(200, data, "application/octet-stream",
+                             {"Content-Disposition": f'attachment; filename="{name}.conf"'})
+        if path.startswith("/device/"):
+            return self.redirect("/")
+        return self.send(404, "Page introuvable.\n", "text/plain; charset=utf-8")
 
     def do_POST(self):
         if not self.is_allowed():
@@ -2450,44 +3092,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = -1
         if not 0 <= length <= 4096:
             return self.send(413, "Requête refusée.\n", "text/plain; charset=utf-8")
-        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
-
-        def field(key):
-            return (form.get(key) or [""])[0]
-
+        raw = self.rfile.read(length).decode("utf-8", "replace")
         path = urllib.parse.urlsplit(self.path).path
         if path == "/login":
-            return self.handle_login(field("password"))
+            form = urllib.parse.parse_qs(raw)
+            return self.handle_login((form.get("password") or [""])[0])
         sess = self.get_session()
         if not sess:
-            return self.redirect("/login")
-        if not same(field("csrf"), sess["csrf"]):
-            return self.send(403, page("Refusé", '<div class="msg err">Formulaire expiré : rechargez la page et '
-                                       'recommencez.</div><p><a href="/">← Tous les appareils</a></p>', sess))
-        if path == "/logout":
+            return self.send_json(401, {"error": "Session expirée : reconnectez-vous."})
+        # Jeton anti-CSRF dans un en-tête : impossible à poser depuis un autre site
+        if not same(self.headers.get("X-CSRF-Token", ""), sess["csrf"]):
+            return self.send_json(403, {"error": "Jeton de sécurité invalide : rechargez la page."})
+        try:
+            body = json.loads(raw) if raw else {}
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        if path == "/api/logout":
             with lock:
                 sessions.pop(sess["token"], None)
-            return self.redirect("/login", {"Set-Cookie": f"{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"})
-        if path == "/add":
-            name = field("name").strip()
+            return self.send_json(200, {"ok": True},
+                                  {"Set-Cookie": f"{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"})
+        if path == "/api/peers":
+            name = str(body.get("name", "")).strip()
             if not NEW_NAME_RE.fullmatch(name):
-                return self.send(400, dashboard(sess, err="Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _ "
-                                                          "(sans tiret au début)."))
-            r = run_wgpi("add", name, "--split" if field("mode") == "split" else "--full")
-            if r.returncode != 0:
-                return self.send(400, dashboard(sess, err=clean_message(r.stderr or r.stdout)))
-            log(f"{self.client_address[0]} : appareil « {name} » ajouté")
-            return self.redirect(f"/device/{name}?new=1")
-        if path == "/remove":
-            name = field("name")
-            if not NEW_NAME_RE.fullmatch(name):
-                return self.redirect("/")
-            r = run_wgpi("remove", name, "--yes")
-            if r.returncode != 0:
-                return self.send(400, dashboard(sess, err=clean_message(r.stderr or r.stdout)))
-            log(f"{self.client_address[0]} : appareil « {name} » supprimé")
-            return self.redirect(f"/?removed={name}")
-        return self.send(404, not_found(sess))
+                return self.send_json(400, {"error": "Nom invalide : 1 à 15 caractères parmi lettres, chiffres, - et _ "
+                                                     "(sans espace, sans accent, sans tiret au début)."})
+            mode = "--split" if body.get("mode") == "split" else "--full"
+            return self.mutate(("add", name, mode), f"appareil « {name} » ajouté", {"ok": True, "name": name})
+        m = re.fullmatch(r"/api/peers/([A-Za-z0-9_-]{1,15})/(delete|enable|disable|rename)", path)
+        if m:
+            name, action = m.groups()
+            # Un ancien appareil peut commencer par « - » : seules les options de wg-pi sont refusées
+            if name in ("-y", "--yes", "--auto"):
+                return self.send_json(404, {"error": "Appareil introuvable."})
+            if action == "rename":
+                new = str(body.get("name", "")).strip()
+                if not NEW_NAME_RE.fullmatch(new):
+                    return self.send_json(400, {"error": "Nouveau nom invalide : 1 à 15 caractères parmi lettres, "
+                                                         "chiffres, - et _ (sans tiret au début)."})
+                return self.mutate(("rename", name, new), f"« {name} » renommé en « {new} »", {"ok": True, "name": new})
+            args = ("remove", name, "--yes") if action == "delete" else (action, name)
+            labels = {"delete": "supprimé", "enable": "réactivé", "disable": "désactivé"}
+            return self.mutate(args, f"appareil « {name} » {labels[action]}", {"ok": True})
+        return self.send_json(404, {"error": "Action inconnue."})
+
+    def mutate(self, args, what, result):
+        r = run_wgpi(*args)
+        invalidate()
+        if r.returncode != 0:
+            return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+        log(f"{self.client_address[0]} : {what}")
+        return self.send_json(200, result)
 
     def handle_login(self, password):
         ip = self.client_address[0]
@@ -2551,29 +3208,33 @@ cmd_menu() {
     title "wg-pi — menu"
     txt "   1) Ajouter un appareil" \
         "   2) Supprimer un appareil" \
-        "   3) Voir les appareils (qui est connecté ?)" \
-        "   4) Afficher le QR code d'un appareil" \
-        "   5) Diagnostic : ça ne marche pas ?" \
-        "   6) Aide pour configurer la box" \
-        "   7) Changer l'adresse publique (IP, DuckDNS…)" \
-        "   8) Sauvegarder la configuration" \
-        "   9) Interface web (gérer depuis le navigateur)" \
-        "  10) Mettre à jour wg-pi" \
-        "  11) Désinstaller" \
+        "   3) Couper / rétablir l'accès d'un appareil" \
+        "   4) Renommer un appareil" \
+        "   5) Voir les appareils (qui est connecté ?)" \
+        "   6) Afficher le QR code d'un appareil" \
+        "   7) Diagnostic : ça ne marche pas ?" \
+        "   8) Aide pour configurer la box" \
+        "   9) Changer l'adresse publique (IP, DuckDNS…)" \
+        "  10) Sauvegarder la configuration" \
+        "  11) Interface web (gérer depuis le navigateur)" \
+        "  12) Mettre à jour wg-pi" \
+        "  13) Désinstaller" \
         "   0) Quitter" ""
     ask c "Votre choix" "0"
     case $c in
       1) (cmd_add) ;;
       2) (cmd_remove) ;;
-      3) (cmd_list) ;;
-      4) (cmd_qr) ;;
-      5) (cmd_check) ;;
-      6) (cmd_box) ;;
-      7) (cmd_endpoint) ;;
-      8) (cmd_backup) ;;
-      9) (cmd_web) ;;
-      10) (cmd_update) ;;
-      11) (cmd_uninstall); is_installed || return 0 ;;
+      3) (cmd_toggle) ;;
+      4) (cmd_rename) ;;
+      5) (cmd_list) ;;
+      6) (cmd_qr) ;;
+      7) (cmd_check) ;;
+      8) (cmd_box) ;;
+      9) (cmd_endpoint) ;;
+      10) (cmd_backup) ;;
+      11) (cmd_web) ;;
+      12) (cmd_update) ;;
+      13) (cmd_uninstall); is_installed || return 0 ;;
       0|q|Q) return 0 ;;
       *) warn "Choix inconnu." ;;
     esac
@@ -2615,6 +3276,9 @@ Utilisation : sudo wg-pi [commande]
                         (--split : seulement l'accès au réseau de la maison,
                          --full : tout le trafic ; sinon le mode choisi à l'installation)
   remove [nom]          supprimer un appareil
+  disable [nom]         couper l'accès d'un appareil sans le supprimer
+  enable [nom]          rétablir l'accès d'un appareil
+  rename [nom] [nouveau] renommer un appareil (rien à changer sur l'appareil)
   list                  appareils et état des connexions
   qr [nom]              réafficher le QR code / exporter la config d'un appareil
   check                 diagnostic complet
@@ -2622,7 +3286,8 @@ Utilisation : sudo wg-pi [commande]
   endpoint [adresse]    changer l'adresse publique (IP, nom de domaine, DuckDNS)
   backup                sauvegarder la configuration (clés comprises)
   restore <fichier>     restaurer une sauvegarde (ex. sur une nouvelle carte SD)
-  web [off|password]    interface web d'administration (navigateur, réseau local et VPN)
+  web [off|password|port N]
+                        interface web d'administration (navigateur, réseau local et VPN)
   update                mettre à jour wg-pi depuis le dépôt GitHub
   uninstall             tout désinstaller
   help | version
@@ -2694,6 +3359,9 @@ main() {
     backup|sauvegarde)       cmd_backup ;;
     restore)                 cmd_restore "$@" ;;
     update|mise-a-jour)      cmd_update ;;
+    disable|desactiver)      cmd_set_state off "$@" ;;
+    enable|activer)          cmd_set_state on "$@" ;;
+    rename|renommer)         cmd_rename "$@" ;;
     web)                     cmd_web "$@" ;;
     web-serve)               cmd_web_serve ;;
     json)                    cmd_json ;;
