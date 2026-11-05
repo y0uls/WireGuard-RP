@@ -246,8 +246,32 @@ MODE|ouvert
 GROUP|g|G
 POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert
 ACC
-eq "IPv6 routee : activation refusee" "$(load; IPV6_NAT=1; cmd_access_on >/dev/null 2>&1 || echo refuse)" "refuse"
-eq "le refus parle de contournement en IPv6" "$(load; IPV6_NAT=1; cmd_access_on 2>&1 | grep -c 'contournables en IPv6')" "1"
+# Le moteur ne filtre que l IPv4. Refuser d activer rendait le cloisonnement inaccessible
+# a tout Pi ayant une IPv6 publique — c est-a-dire beaucoup. On coupe desormais l IPv6 du
+# tunnel pendant le filtrage : les regles redeviennent incontournables, au prix annonce de
+# l IPv6 a travers le VPN.
+# Chaque appel repart d un mode « ouvert » : une activation reussie bascule le fichier en
+# « filtre », et l appel suivant prendrait la branche « deja actif » sans jamais atteindre
+# le code teste.
+ouvert() {
+  { echo "V|1"; echo "MODE|ouvert"; echo "GROUP|g|G"
+    echo "POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert"; } > "$TMP/etc/access.conf"
+  reset
+}
+ouvert
+eq "IPv6 presente : l activation n est plus refusee" \
+   "$(load; IPV6_ON=1; IPV6_NAT=1; cmd_access_on >/dev/null 2>&1 && echo ok || echo refuse)" "ok"
+ouvert
+eq "et elle annonce que l IPv6 ne passera pas" \
+   "$(load; IPV6_ON=1; IPV6_NAT=1; cmd_access_on 2>&1 | grep -c 'ne traversera pas le VPN')" "1"
+ouvert
+eq "elle dit aussi comment revenir en arriere" \
+   "$(load; IPV6_ON=1; IPV6_NAT=1; cmd_access_on 2>&1 | grep -c 'rétablit l.IPv6')" "1"
+# Sans IPv6 dans le tunnel, rien a annoncer.
+ouvert
+eq "sans IPv6, aucun avertissement" \
+   "$(load; IPV6_ON=0; IPV6_NAT=0; cmd_access_on 2>&1 | grep -c 'ne traversera pas le VPN')" "0"
+ouvert
 
 # Port SSH indeterminable : on refuse de filtrer plutot que de poser un secours sur le
 # mauvais port.

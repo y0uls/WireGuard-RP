@@ -45,7 +45,7 @@ readonly MARK="### Client:"
 readonly KEEPALIVE=25
 # Génération du pare-feu généré. À incrémenter dès que write_firewall_script change :
 # c'est ce qui déclenche la migration d'une installation existante par « wg-pi update ».
-readonly FW_GEN=4
+readonly FW_GEN=5
 # Groupes, ressources et règles d'accès (sudo wg-pi group / resource / access)
 readonly ACCESS_FILE="$STATE_DIR/access.conf"
 readonly ACCESS_VER=1
@@ -628,6 +628,7 @@ write_firewall_script() {
     echo "NET4='$WG_NET4.0/24'"
     echo "NET6='${WG_NET6}/64'"
     echo "IPV6_NAT='$IPV6_NAT'"
+    echo "IPV6_ON='$IPV6_ON'"
     cat <<'EOF'
 
 # Le filtrage est-il demandé ? Lu dans le fichier d'accès, pas dans les réglages : c'est
@@ -682,9 +683,38 @@ blanket_del() {
   return 0
 }
 
+# Le moteur d'accès ne filtre que l'IPv4. Laisser passer l'IPv6 rendrait ses règles
+# contournables : deux appareils se joindraient par leur adresse IPv6 du tunnel sans que
+# rien ne l'examine, et le panneau afficherait un cloisonnement qui n'en est pas un.
+# Tant que le filtrage est demandé, l'IPv6 ne traverse donc pas le VPN. Une promesse
+# tenue vaut mieux qu'une promesse complète et fausse.
+#
+# Le RETRAIT est inconditionnel, comme pour l'acceptation générale : la pose dépend du
+# mode, le retrait non. Sans cela la règle survivrait à une désinstallation faite pendant
+# que le filtrage était actif, et couperait l'IPv6 d'un Pi qui n'a plus de VPN.
+v6_block_del() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  for d in -i -o; do
+    i=0
+    while [ "$i" -lt 10 ]; do
+      ip6tables -w -D FORWARD "$d" "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || break
+      i=$((i + 1))
+    done
+  done
+  return 0
+}
+
+v6_block_add() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -w -I FORWARD 1 -i "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true
+  ip6tables -w -I FORWARD 1 -o "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true
+  return 0
+}
+
 base_down() {
   legacy_down
   blanket_del
+  v6_block_del
   rules -D iptables "$NET4" 2>/dev/null
   [ "$IPV6_NAT" = 1 ] && rules -D ip6tables "$NET6" 2>/dev/null
   return 0
@@ -703,6 +733,8 @@ base_up() {
   if ! filtering; then
     iptables -w -I FORWARD 1 -i "$WG_IF" -j ACCEPT || return 1
     [ "$IPV6_NAT" = 1 ] && { ip6tables -w -I FORWARD 1 -i "$WG_IF" -j ACCEPT || true; }
+  elif [ "$IPV6_ON" = 1 ]; then
+    v6_block_add
   fi
   return 0
 }
@@ -985,7 +1017,51 @@ upnp_external_ip() {
   printf '%s' "$ip"
 }
 
+# Trois etats, et non deux. « La box ne repond pas en UPnP » etait trompeur dans le cas
+# le plus frequent : des appareils UPnP repondent bien sur le reseau — une imprimante,
+# une TV, un NAS — mais aucun n'est une PASSERELLE. Sur Livebox, cela veut dire que
+# l'option « UPnP IGD » est desactivee, alors que le partage multimedia UPnP/DLNA, lui,
+# peut etre coche : l'utilisateur voit « UPnP » actif dans sa box et ne comprend pas.
+upnp_etat() {   # ecrit : ok | sans-passerelle | absent
+  local out
+  command -v upnpc >/dev/null 2>&1 || { echo absent; return 0; }
+  out=$(timeout 8 upnpc -m "$LAN_IF" -s 2>&1) || true
+  if grep -q '^ExternalIPAddress = ' <<<"$out"; then echo ok; return 0; fi
+  if grep -q 'UPnP device found' <<<"$out"; then echo sans-passerelle; return 0; fi
+  echo absent
+}
+
+# Le conseil qui correspond a l'etat observe, et rien de plus.
+upnp_conseil() {
+  case $(upnp_etat) in
+    sans-passerelle)
+      warn "Des appareils UPnP répondent sur votre réseau, mais aucun n'est une passerelle Internet."
+      txt "   Sur Livebox, c'est l'option ${BOLD}UPnP IGD${RESET} qu'il faut activer : elle est distincte" \
+          "   du partage multimédia UPnP/DLNA, qui peut être coché sans elle." \
+          "   Sinon, ouvrez le port à la main : ${BOLD}sudo wg-pi box${RESET}" \
+          "   puis cessez d'être averti : ${BOLD}sudo wg-pi upnp off${RESET}"
+      ;;
+    *)
+      warn "La box ne répond pas en UPnP (option désactivée ?)."
+      txt "   Ouvrez le port à la main : ${BOLD}sudo wg-pi box${RESET}" \
+          "   puis cessez d'être averti : ${BOLD}sudo wg-pi upnp off${RESET}"
+      ;;
+  esac
+}
+
 upnp_has_mapping() { upnpc -m "$LAN_IF" -l 2>/dev/null | grep -Eq "UDP +$WG_PORT->$LAN_IP:$WG_PORT( |$)"; }
+
+# Adresse vers laquelle la box redirige CE port, quelle qu'elle soit. Sert à distinguer
+# deux situations que « redirection introuvable » confondait : la box n'en a aucune, ou
+# elle en a une qui pointe ailleurs — typiquement l'ancienne adresse du Pi après un
+# changement de bail DHCP. Le remède n'est pas le même, et le second cas est invisible
+# depuis l'interface de la box, où la ligne a l'air parfaitement normale.
+upnp_mapping_target() {
+  upnpc -m "$LAN_IF" -l 2>/dev/null |
+    awk -v p="$WG_PORT" '$2 == "UDP" && $3 ~ ("^" p "->") {
+      split($3, a, "->"); split(a[2], b, ":"); print b[1]; exit
+    }'
+}
 
 upnp_map() {
   upnp_has_mapping && return 0
@@ -1002,7 +1078,7 @@ upnp_open() {
   local ext
   info "Ouverture automatique du port $WG_PORT/UDP sur la box (UPnP)…"
   if ! ext=$(upnp_external_ip); then
-    warn "La box ne répond pas en UPnP (option désactivée ?) : ouvrez le port à la main (guide pas à pas : sudo wg-pi box)."
+    upnp_conseil
     return 1
   fi
   if is_private_ipv4 "$ext" || is_cgnat "$ext"; then
@@ -2313,8 +2389,29 @@ cmd_check() {
     fi
   fi
   if (( UPNP )); then
-    if command -v upnpc >/dev/null 2>&1 && upnp_has_mapping; then ok "Port $WG_PORT/UDP ouvert sur la box (vérifié via UPnP)"
-    else warn "Redirection UPnP introuvable sur la box (si vous l'avez faite à la main, ignorez ceci)"
+    # Le minuteur était activé à l'installation puis plus jamais vérifié. Or une box qui
+    # redémarre efface ses redirections UPnP, et c'est lui qui les repose : sans lui, le
+    # VPN cesse d'être joignable de l'extérieur au premier redémarrage de la box, sans
+    # qu'aucun diagnostic ne le signale.
+    if systemctl is-active --quiet wg-pi-upnp.timer; then
+      ok "Maintien de l'ouverture du port actif (toutes les 30 min)"
+    else
+      fail "Maintien UPnP inactif : la redirection disparaîtra au prochain redémarrage de la box"
+      txt "   ${BOLD}sudo systemctl enable --now wg-pi-upnp.timer${RESET}"
+      (( problems++ ))
+    fi
+    local cible=""
+    command -v upnpc >/dev/null 2>&1 && cible=$(upnp_mapping_target)
+    if [[ $cible == "$LAN_IP" && -n $cible ]]; then
+      ok "Port $WG_PORT/UDP ouvert sur la box (vérifié via UPnP)"
+    elif [[ -n $cible ]]; then
+      fail "La box redirige bien $WG_PORT/UDP, mais vers $cible — le Pi est en $LAN_IP"
+      txt "   L'adresse du Pi a changé. Pour la corriger :" \
+          "   ${BOLD}sudo wg-pi upnp-refresh${RESET}" \
+          "   Puis réservez son adresse dans la box (bail DHCP statique) : ${BOLD}sudo wg-pi box${RESET}"
+      (( problems++ ))
+    else
+      upnp_conseil
     fi
   fi
 
@@ -2375,6 +2472,62 @@ cmd_box() {
   fi
   print_box_guide 1 1
   echo
+}
+
+# wg-pi upnp [etat|on|off]
+#
+# Sans cette commande, UPNP n'etait fixe qu'a l'installation : une box qui ne sait pas
+# faire d'IGD laissait un avertissement permanent que rien ne pouvait eteindre, et la
+# seule issue etait d'editer settings.conf a la main.
+cmd_upnp() {
+  load_settings
+  local action=${1-} etat
+  case $action in
+    ""|etat|status)
+      title "Ouverture du port sur la box"
+      kv "Mode" "$( (( UPNP )) && echo "automatique (UPnP)" || echo "manuelle")"
+      etat=$(upnp_etat)
+      case $etat in
+        ok)              kv "Passerelle UPnP" "trouvée" ;;
+        sans-passerelle) kv "Passerelle UPnP" "aucune (des appareils UPnP répondent, mais pas de passerelle)" ;;
+        *)               kv "Passerelle UPnP" "aucune réponse" ;;
+      esac
+      if command -v upnpc >/dev/null 2>&1; then
+        kv "Redirection du port $WG_PORT" "$(upnp_mapping_target || true)"
+      fi
+      (( UPNP )) && kv "Maintien automatique" "$(systemctl is-active wg-pi-upnp.timer 2>/dev/null || echo inactif)"
+      echo
+      txt "   ${BOLD}sudo wg-pi upnp off${RESET}  ouvrir le port à la main, sans plus être averti" \
+          "   ${BOLD}sudo wg-pi upnp on${RESET}   réessayer l'ouverture automatique" ""
+      ;;
+    off|manuel|manuelle)
+      take_lock
+      (( UPNP )) || { info "L'ouverture est déjà manuelle : rien à changer."; return 0; }
+      command -v upnpc >/dev/null 2>&1 && upnpc -m "$LAN_IF" -d "$WG_PORT" UDP >/dev/null 2>&1
+      systemctl disable --now wg-pi-upnp.timer >>"$LOG_FILE" 2>&1
+      UPNP=0
+      save_settings
+      ok "Ouverture automatique désactivée."
+      txt "   Le port $WG_PORT/UDP se gère maintenant à la main sur la box :" \
+          "   ${BOLD}sudo wg-pi box${RESET}" ""
+      ;;
+    on|auto|automatique)
+      take_lock
+      ensure_packages miniupnpc || die "miniupnpc est nécessaire pour l'ouverture automatique."
+      # On n'enregistre le mode qu'APRES une ouverture reussie : annoncer « automatique »
+      # sur une box qui refuse laisserait croire le port ouvert alors qu'il ne l'est pas.
+      if ! upnp_map; then
+        upnp_conseil
+        die "La box n'a pas accepté l'ouverture automatique : rien n'a été changé."
+      fi
+      UPNP=1
+      save_settings
+      setup_timers
+      ok "Port $WG_PORT/UDP ouvert sur la box, et maintenu automatiquement."
+      ;;
+    *) die "Action inconnue : upnp $action (etat, on, off)" ;;
+  esac
+  return 0
 }
 
 cmd_endpoint() {
@@ -3475,6 +3628,37 @@ access_run_plan() {
 # d'instant où aucune règle ne s'applique. L'acceptation générale du trafic venant du VPN
 # est retirée en dernier, et en boucle, parce qu'un rechargement antérieur a pu la poser
 # plusieurs fois.
+# Le moteur d'accès ne filtre que l'IPv4. Laisser passer l'IPv6 rendrait ses règles
+# contournables : deux appareils se joindraient par leur adresse IPv6 du tunnel sans que
+# rien ne l'examine. Ces deux fonctions doublent celles du pare-feu généré, parce que la
+# bascule À CHAUD ne repasse pas par base_up — c'est ici que l'acceptation générale IPv4
+# est retirée, et c'est donc ici que l'IPv6 doit être coupée.
+access_v6_block_add() {
+  (( IPV6_ON )) || return 0
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local d
+  for d in -i -o; do
+    ip6tables -w -C FORWARD "$d" "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null ||
+      ip6tables -w -I FORWARD 1 "$d" "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true
+  done
+  return 0
+}
+
+# Retrait INCONDITIONNEL, sans regarder IPV6_ON : la pose dépend de l'état du tunnel, le
+# retrait non. Sans cela la coupure survivrait à une désinstallation faite pendant que le
+# filtrage était actif, et couperait l'IPv6 d'un Pi qui n'a plus de VPN du tout.
+access_v6_block_del() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local d i
+  for d in -i -o; do
+    i=0
+    while (( i < 10 )) && ip6tables -w -D FORWARD "$d" "$WG_IF" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null; do
+      i=$(( i + 1 ))
+    done
+  done
+  return 0
+}
+
 access_switch() {   # <nouveau tampon> [ancien tampon]
   local new=$1 old=${2-} i
   iptables -w -I FORWARD 1 -i "$WG_IF" -j "$(access_chain_fwd "$new")" || return 1
@@ -3486,6 +3670,7 @@ access_switch() {   # <nouveau tampon> [ancien tampon]
   while (( i < 10 )) && iptables -w -D FORWARD -i "$WG_IF" -j ACCEPT 2>/dev/null; do
     i=$(( i + 1 ))
   done
+  access_v6_block_add
   if [[ -n $old && $old != "$new" ]]; then
     iptables -w -D FORWARD -i "$WG_IF" -j "$(access_chain_fwd "$old")" 2>/dev/null
     iptables -w -D INPUT -i "$WG_IF" -j "$(access_chain_in "$old")" 2>/dev/null
@@ -3501,6 +3686,7 @@ access_unswitch() {
     iptables -w -D FORWARD -i "$WG_IF" -j "$(access_chain_fwd "$b")" 2>/dev/null
     iptables -w -D INPUT -i "$WG_IF" -j "$(access_chain_in "$b")" 2>/dev/null
   done
+  access_v6_block_del
   iptables -w -C FORWARD -i "$WG_IF" -j ACCEPT 2>/dev/null ||
     iptables -w -I FORWARD 1 -i "$WG_IF" -j ACCEPT
   for b in A B; do
@@ -3755,13 +3941,15 @@ cmd_access_on() {
   # une règle du type « invités : Internet seulement » serait contournable en IPv6 : la
   # promesse serait fausse, et une promesse de cloisonnement fausse est pire que pas de
   # cloisonnement du tout.
-  if (( IPV6_NAT )); then
-    fail "Votre Pi route l'IPv6 vers Internet : le filtrage ne couvrirait que l'IPv4."
-    txt "" "Vos règles seraient contournables en IPv6, donc wg-pi refuse de les annoncer" \
-        "comme appliquées. Deux issues :" \
-        "  • désactiver l'IPv6 dans le tunnel, puis relancer l'activation ;" \
-        "  • attendre la prise en charge de l'IPv6 par le moteur d'accès." ""
-    return 1
+  # Le moteur ne filtre que l'IPv4. Plutôt que de refuser — ce qui rendait le
+  # cloisonnement inaccessible à tout Pi ayant une IPv6 publique — on coupe l'IPv6 du
+  # tunnel pendant le filtrage : les règles redeviennent incontournables, au prix de
+  # l'IPv6 à travers le VPN. C'est annoncé, et c'est réversible en coupant le filtrage.
+  if (( IPV6_ON )); then
+    warn "L'IPv6 ne traversera pas le VPN tant que le filtrage est actif."
+    txt "   Le moteur d'accès ne sait filtrer que l'IPv4. La laisser passer rendrait vos" \
+        "   règles contournables : deux appareils se joindraient par leur adresse IPv6." \
+        "   Tout l'IPv4 continue de fonctionner, et « sudo wg-pi access off » rétablit l'IPv6." ""
   fi
 
   # Le pare-feu doit être de la génération qui sait omettre l'acceptation générale.
@@ -4445,6 +4633,18 @@ def run_wgpi(*args, timeout=90):
         return subprocess.CompletedProcess(args, 1, "", "wg-pi ne répond pas (délai dépassé).")
 
 
+def message_erreur(r):
+    """Le refus du CLI et son EXPLICATION ne sortent pas au même endroit.
+
+    « fail » écrit sur la sortie d'erreur, « txt » sur la sortie standard. Ne lire que la
+    première laissait le panneau afficher le « non » sans le « pourquoi » ni le « comment
+    faire » — précisément ce qui manque quand on est bloqué devant une fenêtre de
+    confirmation. chr(10) plutôt qu'un littéral : ce fichier traverse un heredoc, et les
+    séquences d'échappement y ont déjà été une source d'ennuis."""
+    morceaux = [m for m in (r.stderr, r.stdout) if m and m.strip()]
+    return clean_message(chr(10).join(morceaux))
+
+
 def clean_message(text):
     text = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
     lines = [line.strip().lstrip("✖⚠✔➜").strip() for line in text.splitlines() if line.strip()]
@@ -4457,7 +4657,7 @@ def load_base(force=False):
         if force or cache["data"] is None or time.time() - cache["time"] > CACHE_SECONDS:
             r = run_wgpi("json", timeout=30)
             if r.returncode != 0:
-                raise RuntimeError(clean_message(r.stderr or r.stdout))
+                raise RuntimeError(message_erreur(r))
             cache["data"] = json.loads(r.stdout)
             cache["time"] = time.time()
         return cache["data"]
@@ -6752,7 +6952,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             r = run_wgpi("access", action, timeout=180)
             invalidate()
             if r.returncode != 0:
-                return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+                return self.send_json(400, {"error": message_erreur(r)})
             log(f"{self.client_address[0]} : {libelles[action]}")
             return self.send_json(200, {"ok": True, "aconfirmer": action == "on"})
         return self.send_json(404, {"error": "Action inconnue."})
@@ -6767,7 +6967,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         r = run_wgpi(*args)
         invalidate()
         if r.returncode != 0:
-            return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+            return self.send_json(400, {"error": message_erreur(r)})
         log(f"{self.client_address[0]} : {what}")
         avert = avertissements(r.stdout)
         if not acces_actif():
@@ -6783,7 +6983,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # à l'écran ; un message passager, non.
             return self.send_json(409, {
                 "error": "Enregistré, mais le pare-feu a refusé de l'appliquer : "
-                         + clean_message(a.stderr or a.stdout)
+                         + message_erreur(a)
                          + " Le cloisonnement en vigueur est toujours le précédent."})
         return self.send_json(200, {"ok": True, "applique": True, "aconfirmer": True,
                                     "avertissement": avert})
@@ -6792,7 +6992,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         r = run_wgpi(*args)
         invalidate()
         if r.returncode != 0:
-            return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+            return self.send_json(400, {"error": message_erreur(r)})
         log(f"{self.client_address[0]} : {what}")
         return self.send_json(200, result)
 
@@ -6935,6 +7135,7 @@ Utilisation : sudo wg-pi [commande]
   qr [nom]              réafficher le QR code / exporter la config d'un appareil
   check                 diagnostic complet
   box                   rappel : comment configurer la box
+  upnp [on|off]         ouverture du port : automatique (UPnP) ou à la main
   endpoint [adresse]    changer l'adresse publique (IP, nom de domaine, DuckDNS)
   backup                sauvegarder la configuration (clés comprises)
   restore <fichier>     restaurer une sauvegarde (ex. sur une nouvelle carte SD)
@@ -7035,6 +7236,7 @@ main() {
     qr|show)                 cmd_qr "$@" ;;
     check|doctor|diagnostic) cmd_check ;;
     box)                     cmd_box ;;
+    upnp)                    cmd_upnp "$@" ;;
     endpoint)                cmd_endpoint "$@" ;;
     backup|sauvegarde)       cmd_backup ;;
     restore)                 cmd_restore "$@" ;;

@@ -53,7 +53,7 @@ eq "le service est actif" "$(systemctl is-active wg-quick@wg0)" "active"
 eq "wg0 porte l adresse du serveur" "$(ip -4 -br addr show wg0 | awk '{ print $3 }')" "10.8.0.1/24"
 eq "un pair est configure" "$(wg show wg0 peers | wc -l)" "1"
 eq "cle pre-partagee presente" "$(wg show wg0 preshared-keys | awk '{ print ($2 != "(none)") }')" "1"
-eq "generation du pare-feu" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "4"
+eq "generation du pare-feu" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "5"
 # La fuite corrigee : sans « ! -i wg0 », un flux etabli entre deux appareils du VPN
 # contourne tout filtrage a venir.
 eq "la regle conntrack porte ! -i wg0" "$(iptables -S FORWARD | grep -c '! -i wg0')" "1"
@@ -114,6 +114,11 @@ eq "etat lu dans le noyau" "$(bash -c "$LOAD; access_kernel_state")" "actif"
 # donc SANS aucune contrainte, ce qui est exactement le sens voulu.
 eq "la regle tout est posee, sans restriction" \
    "$(iptables -S | grep -cE '^-A WGPI-S-admin-[AB] -m comment --comment "?wgpi:pol:[A-Za-z0-9]+"? -j ACCEPT')" "1"
+# Le moteur d acces ne filtre que l IPv4. Laisser passer l IPv6 rendrait ses regles
+# contournables : deux appareils se joindraient par leur adresse IPv6 du tunnel sans que
+# rien ne l examine. Tant que le filtrage est actif, l IPv6 ne traverse donc pas le VPN.
+eq "IPv6 coupee dans les deux sens pendant le filtrage" \
+   "$(ip6tables -S FORWARD | grep -cE '^-A FORWARD -[io] wg0 -j REJECT')" "2"
 eq "le saut est en premiere position" "$(bash -c "$LOAD; access_jump_first && echo oui || echo non")" "oui"
 eq "l acceptation generale a disparu" "$(iptables -S FORWARD | grep -c '^-A FORWARD -i wg0 -j ACCEPT')" "0"
 ge "les chaines du moteur sont posees" "$(iptables -S | grep -c '^-N WGPI')" "6"
@@ -225,6 +230,10 @@ eq "le dossier d etat a disparu" "$([[ -d /etc/wg-pi ]] && echo present || echo 
 eq "aucune chaine du moteur ne subsiste" "$(iptables -S | grep -c 'WGPI')" "0"
 eq "aucune regle FORWARD ne subsiste" "$(iptables -S FORWARD | grep -c 'wg0')" "0"
 eq "aucune regle INPUT ne subsiste" "$(iptables -S INPUT | grep -c '51820')" "0"
+# Le retrait est inconditionnel : sans cela la coupure survivrait a une desinstallation
+# faite pendant que le filtrage etait actif, et couperait l IPv6 d un Pi sans VPN.
+eq "aucune coupure IPv6 ne subsiste" \
+   "$(ip6tables -S FORWARD | grep -cE '^-A FORWARD -[io] wg0 -j REJECT')" "0"
 eq "aucune regle NAT ne subsiste" "$(iptables -t nat -S POSTROUTING | grep -c 'MASQUERADE')" "0"
 eq "aucune unite systemd ne subsiste" "$(ls /etc/systemd/system/ 2>/dev/null | grep -c 'wg-pi')" "0"
 

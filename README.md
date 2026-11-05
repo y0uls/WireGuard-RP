@@ -251,6 +251,7 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi qr [nom]` | réafficher le QR code d'un appareil |
 | `sudo wg-pi check` | diagnostic complet |
 | `sudo wg-pi box` | rappel de la configuration de la box |
+| `sudo wg-pi upnp` · `on` · `off` | ouverture du port : automatique (UPnP) ou à la main |
 | `sudo wg-pi endpoint [adresse]` | changer l'adresse publique : sans adresse, menu (IP, DuckDNS, nom de domaine) ; avec une adresse, IP ou nom fixe |
 | `sudo wg-pi backup` | sauvegarder la configuration, clés comprises |
 | `sudo wg-pi restore <fichier>` | restaurer une sauvegarde |
@@ -581,9 +582,14 @@ interfaces. Tous vos appareils du VPN les atteignent, même ceux qui n'ont aucun
 on parle. Si l'un de ces services doit rester privé, réglez-le dans le service lui-même, ou
 avec UFW.
 
-**L'IPv6.** Si votre Pi relaie l'IPv6 vers Internet, `access on` **refuse** de s'activer :
-le filtrage ne couvrirait que l'IPv4, et vos règles seraient contournables en IPv6. Mieux
-vaut un refus franc qu'une promesse de cloisonnement fausse.
+**L'IPv6.** Le moteur ne sait filtrer que l'IPv4. Tant que le filtrage est actif, **l'IPv6
+ne traverse donc pas le VPN** : elle est refusée dans les deux sens sur `wg0`. Sans cela vos
+règles seraient contournables — deux appareils se joindraient par leur adresse IPv6 du
+tunnel sans que rien ne l'examine.
+
+Tout l'IPv4 continue de fonctionner normalement, et `sudo wg-pi access off` rétablit l'IPv6
+immédiatement. En pratique, chez un particulier, à peu près tout reste joignable en IPv4 ;
+une promesse de cloisonnement tenue vaut mieux qu'une promesse complète et fausse.
 
 </details>
 
@@ -653,6 +659,35 @@ DuckDNS, UPnP et UFW. Si tout est vert et que ça ne marche pas, c'est presque t
 - Vérifiez que l'adresse publique est à jour : `sudo wg-pi check` compare l'adresse utilisée par
   les appareils à votre IP publique actuelle.
 
+</details>
+
+<details>
+<summary><b>« Redirection UPnP introuvable » alors que l UPnP est activé sur ma box</b></summary>
+
+Les box distinguent deux options que leur interface appelle toutes les deux « UPnP » :
+le **partage multimédia UPnP/DLNA**, qui diffuse vos photos et vos vidéos, et l **UPnP IGD**,
+le seul qui autorise un appareil à ouvrir un port. Sur Livebox, voir le premier coché ne dit
+rien du second.
+
+Pour savoir lequel vous avez :
+
+```bash
+sudo wg-pi upnp
+```
+
+- **« aucune réponse »** : aucun appareil UPnP sur le réseau, ou le Pi interroge la mauvaise
+  interface.
+- **« des appareils UPnP répondent, mais pas de passerelle »** : c est le cas ci-dessus.
+  Activez l UPnP IGD dans la box, ou ouvrez le port à la main.
+
+Si votre box ne sait pas faire d UPnP IGD — ou si vous préférez garder la main — ouvrez le
+port vous-même avec `sudo wg-pi box`, puis dites-le à wg-pi pour qu il cesse de vous avertir :
+
+```bash
+sudo wg-pi upnp off
+```
+
+Le port reste ouvert : seule l ouverture **automatique** est désactivée.
 </details>
 
 <details>
@@ -762,7 +797,7 @@ depuis le terminal.
 | VPN | WireGuard du noyau, service `wg-quick@wg0` démarré automatiquement |
 | Clés | Curve25519, plus une **clé pré-partagée** par appareil |
 | Réseau du VPN | `10.8.0.0/24` par défaut (une autre plage si celle-ci est déjà utilisée), jusqu'à 253 appareils |
-| IPv6 | réseau privé aléatoire (ULA) dans le tunnel, relayé vers Internet si le Pi a une IPv6 publique ; `::/0` toujours routé en mode « tout le trafic » pour éviter les fuites |
+| IPv6 | réseau privé aléatoire (ULA) dans le tunnel, relayé vers Internet si le Pi a une IPv6 publique ; `::/0` toujours routé en mode « tout le trafic » pour éviter les fuites ; coupée sur `wg0` tant que le filtrage des accès est actif |
 | Pare-feu / NAT | règles `iptables` insérées en tête de chaîne par `PostUp`/`PostDown`, compatibles Docker et UFW |
 | Ajout / suppression | à chaud (`wg syncconf`), sans couper les autres appareils |
 | Appareils | `PersistentKeepalive = 25` pour garder la connexion à travers les NAT des réseaux mobiles |

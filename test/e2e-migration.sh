@@ -60,8 +60,8 @@ eq "le diagnostic nomme la reparation" "$(grep -c 'wg-pi fw-sync' /tmp/m-check.l
 
 echo "-- reparation du pare-feu"
 wg-pi fw-sync >/tmp/m-sync.log 2>&1
-eq "la migration annonce la generation" "$(grep -c 'génération 0 → 4' /tmp/m-sync.log)" "1"
-eq "le marqueur est pose" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "4"
+eq "la migration annonce la generation" "$(grep -c 'génération 0 → 5' /tmp/m-sync.log)" "1"
+eq "le marqueur est pose" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "5"
 eq "la fuite pair-a-pair est fermee" "$(iptables -S FORWARD | grep -c '! -i wg0')" "1"
 eq "le diagnostic est satisfait" "$(wg-pi check 2>&1 | grep -c 'Règles du pare-feu à jour')" "1"
 eq "les appareils sont toujours intacts" "$(wg show wg0 peers | wc -l)" "2"

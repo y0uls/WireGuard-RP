@@ -115,5 +115,49 @@ grep -v '^# wg-pi-fw-gen: ' "$TMP/garde" > "$FW"
 check "pare-feu sans marqueur => generation 0" "$(source "$SRC"; fw_installed_gen)" "0"
 
 echo
+echo "-- IPv6 : coupee pendant le filtrage"
+# Le moteur d acces ne filtre que l IPv4. Laisser passer l IPv6 rendrait ses regles
+# contournables : deux appareils se joindraient par leur adresse IPv6 du tunnel sans que
+# rien ne l examine. Tant que le filtrage est demande, l IPv6 ne traverse donc pas le VPN.
+if grep -q "IPV6_ON=" "$FW"; then
+  ok "le script genere connait l etat IPv6 du tunnel"
+else
+  ko "IPV6_ON absent : le script ne peut pas savoir si le tunnel porte de l IPv6"
+fi
+if grep -q "^v6_block_add()" "$FW" && grep -q "^v6_block_del()" "$FW"; then
+  ok "pose et retrait de la coupure IPv6 definis"
+else
+  ko "la coupure IPv6 n est pas definie"
+fi
+# Posee SOUS condition du mode...
+if grep -A16 "^base_up()" "$FW" | grep -q "elif.*IPV6_ON"; then
+  ok "coupure posee seulement quand le filtrage est demande"
+else
+  ko "la coupure IPv6 est posee sans condition de mode"
+fi
+# ...et retiree SANS condition, comme l acceptation generale : sinon elle survivrait a une
+# desinstallation faite pendant que le filtrage etait actif, et couperait l IPv6 d un Pi
+# qui n a plus de VPN du tout.
+if grep -A4 "^base_down()" "$FW" | grep -q "v6_block_del"; then
+  ok "coupure IPv6 retiree sans condition de mode"
+else
+  ko "le retrait de la coupure IPv6 depend du mode : elle survivrait a une desinstallation"
+fi
+if grep -q -- "-j REJECT --reject-with icmp6-adm-prohibited" "$FW"; then
+  ok "le refus IPv6 est un REJECT, pas un DROP"
+else
+  ko "le refus IPv6 n est pas un REJECT"
+fi
+# Les deux sens : un paquet entre deux appareils entre ET sort par wg0, mais un paquet
+# venu de la maison vers un appareil ne fait que sortir.
+for sens in -i -o; do
+  if grep -q -- "ip6tables -w -I FORWARD 1 $sens" "$FW"; then
+    ok "IPv6 coupee dans le sens $sens"
+  else
+    ko "IPv6 non coupee dans le sens $sens"
+  fi
+done
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))
