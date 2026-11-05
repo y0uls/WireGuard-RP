@@ -30,6 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | 
 - [Utilisation](#utilisation)
 - [Interface web](#interface-web)
 - [Connecter un appareil](#connecter-un-appareil)
+- [Qui peut joindre quoi](#qui-peut-joindre-quoi)
 - [Mise à jour](#mise-à-jour)
 - [Sauvegarde et restauration](#sauvegarde-et-restauration)
 - [Désinstallation](#désinstallation)
@@ -62,6 +63,11 @@ curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | 
   téléchargement du fichier `.conf`, suppression.
 - **Couper l'accès d'un appareil sans le supprimer** (téléphone perdu, accès prêté à un ami…), puis
   le rétablir sans rien reconfigurer.
+- **Groupes et règles d'accès** pour décider qui peut joindre quoi : « les invités n'ont
+  qu'Internet », « seule la famille atteint le NAS ». Essai à blanc avant d'appliquer, et
+  retour en arrière automatique si vous ne confirmez pas.
+- **Compte de consultation** pour l'interface web : un second mot de passe qui permet de
+  regarder, pas de modifier.
 - **Réglages sûrs par défaut** : clé pré-partagée par appareil, IPv6 sans fuite, compatibilité
   Docker et UFW, mises à jour de sécurité automatiques en option.
 
@@ -198,6 +204,32 @@ $ sudo wg-pi list
 ➜ 2 appareil(s), dont 1 connecté(s) en ce moment.
 ```
 
+```text
+$ sudo wg-pi access show
+
+━━━━ Accès ━━━━
+
+✔ Filtrage actif : seul ce qui est autorisé ci-dessous passe.
+
+Groupe « Ma famille » (famille)
+   appareils       pc-portable telephone
+   peut joindre    Internet (tous protocoles)
+                   Le réseau de la maison (192.168.1.0/24) (tous protocoles)
+                   Le NAS (192.168.1.20) (tcp 445, 5000-5001)
+
+Groupe « Invités » (invites)
+   appareils       tablette-amis
+   peut joindre    Internet (tous protocoles)
+
+Groupe « Tous les appareils » (tous, automatique)
+   appareils       telephone pc-portable tablette-amis
+   peut joindre    rien : aucune règle ne concerne ce groupe
+
+Ports en écoute sur le Pi (joignables depuis le VPN) : 22 443 51820
+   Un service publié sur toutes les interfaces, par exemple un conteneur Docker,
+   est atteignable par chacun de vos appareils du VPN.
+```
+
 ## Utilisation
 
 Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
@@ -210,7 +242,7 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi disable [nom]` | couper l'accès d'un appareil sans le supprimer |
 | `sudo wg-pi enable [nom]` | rétablir l'accès d'un appareil |
 | `sudo wg-pi rename [nom] [nouveau]` | renommer un appareil (rien à changer sur l'appareil) |
-| `sudo wg-pi list` | appareils, trafic et état des connexions |
+| `sudo wg-pi list` | appareils, trafic, groupes et état des connexions |
 | `sudo wg-pi qr [nom]` | réafficher le QR code d'un appareil |
 | `sudo wg-pi check` | diagnostic complet |
 | `sudo wg-pi box` | rappel de la configuration de la box |
@@ -218,6 +250,10 @@ Une fois l'installation terminée, tout se gère avec la commande `wg-pi` :
 | `sudo wg-pi backup` | sauvegarder la configuration, clés comprises |
 | `sudo wg-pi restore <fichier>` | restaurer une sauvegarde |
 | `sudo wg-pi web [off\|password\|port N]` | activer ou désactiver l'interface web, changer son mot de passe ou son port |
+| `sudo wg-pi web lecture-seule [off]` | second mot de passe qui permet de regarder, pas de modifier |
+| `sudo wg-pi group …` | groupes d'appareils — voir [Qui peut joindre quoi](#qui-peut-joindre-quoi) |
+| `sudo wg-pi resource …` | appareils de la maison que vos règles peuvent citer |
+| `sudo wg-pi access …` | règles d'accès : qui peut joindre quoi, sur quels ports |
 | `sudo wg-pi update` | mettre à jour wg-pi depuis ce dépôt |
 | `sudo wg-pi uninstall` | tout désinstaller |
 | `sudo wg-pi help` | aide complète |
@@ -249,6 +285,14 @@ sur un ordinateur ou sur le téléphone :
 - recherche et tri des appareils ;
 - **état du serveur** : adresse publique, réseau, nombre d'appareils connectés, et en détail
   la clé publique (copiable), le DNS, l'IPv6 et le keepalive ;
+- une vue **« Accès »** : un tableau qui montre, pour chaque groupe d'appareils, ce qu'il
+  peut joindre et sur quels ports, les cases hachurées signalant ce qui n'est pas autorisé ;
+- le **groupe de chaque appareil** sur sa ligne, et un bouton qui ouvre sa **fiche d'accès** :
+  ce qu'il peut joindre, ce qui peut le joindre, et sur quels ports — la réponse directe à
+  « qu'est-ce que la tablette des enfants peut atteindre ? » ;
+- une **carte** à trois colonnes — vos appareils, le Pi, ce qu'ils peuvent joindre — où le
+  trait reliant chaque appareil au Pi **s'anime au rythme de son débit réel**. Un clic sur un
+  appareil ou une destination n'affiche plus que ce qui le concerne ;
 - thème clair, sombre ou automatique, affichage adapté au téléphone.
 
 Pour l'activer, y compris sur une installation existante après `sudo wg-pi update` :
@@ -287,7 +331,20 @@ déjà (Pi-hole v6, serveur web…), il prend automatiquement le port 51821, et 
 | `sudo wg-pi web` | activer (ou réafficher l'adresse) |
 | `sudo wg-pi web password` | changer le mot de passe (déconnecte les sessions ouvertes) |
 | `sudo wg-pi web port <numéro>` | changer de port (retour automatique à l'ancien en cas d'échec) |
+| `sudo wg-pi web lecture-seule` | créer un compte de consultation (voir ci-dessous) |
+| `sudo wg-pi web lecture-seule off` | le supprimer |
 | `sudo wg-pi web off` | désactiver |
+
+**Un compte pour regarder sans toucher**
+
+`sudo wg-pi web lecture-seule` crée un **second mot de passe**. Qui s'en sert voit tout —
+les appareils, les débits, les accès — mais ne peut rien modifier : ni ajouter ou supprimer
+un appareil, ni couper un accès. Les fichiers `.conf` et les QR codes ne sont pas non plus
+téléchargeables, car ils contiennent la clé privée de l'appareil. Pratique pour montrer
+l'installation, ou pour que quelqu'un vérifie que le VPN tourne sans pouvoir y toucher.
+
+Le mot de passe doit être différent de celui de l'administrateur : wg-pi refuse de
+l'enregistrer sinon, car il donnerait l'accès complet sans le dire.
 
 ## Connecter un appareil
 
@@ -319,6 +376,166 @@ supprimez-le de l'ordinateur une fois importé : il contient la clé privée de 
 > [!IMPORTANT]
 > Pour tester, utilisez la **4G/5G** et non le Wi-Fi de la maison : beaucoup de box ne savent pas
 > renvoyer vers elles-mêmes une connexion qui part de chez vous.
+
+## Qui peut joindre quoi
+
+Par défaut, un appareil connecté au VPN atteint **tout** : le réseau de la maison, le Pi
+lui-même et Internet. C'est simple, et c'est souvent ce qu'on veut. Mais si vous prêtez un
+accès à un ami, ou si la tablette des enfants est sur le VPN, vous préférerez sans doute
+qu'ils n'atteignent pas le NAS.
+
+L'idée tient en trois mots : des **groupes** d'appareils, des **ressources** de la maison,
+et des **règles** qui disent qui peut joindre quoi.
+
+Les règles portent sur ce qui **traverse** le Pi : le réseau de la maison, Internet, les
+autres appareils du VPN. Ce qui tourne **sur** le Pi — SSH, le panneau web, Pi-hole, un
+conteneur Docker — reste joignable par tous vos appareils du VPN, quelles que soient vos
+règles.
+
+### Un exemple complet
+
+```bash
+sudo wg-pi group add invites --libelle="Invités"
+sudo wg-pi group add famille --libelle="Ma famille"
+sudo wg-pi group join tablette-amis invites
+sudo wg-pi group join telephone famille
+
+sudo wg-pi resource add nas 192.168.1.20 --libelle="Le NAS"
+
+sudo wg-pi access allow invites internet                        # les invités : Internet seulement
+sudo wg-pi access allow famille maison                          # la famille : tout le réseau
+sudo wg-pi access allow famille res:nas --proto=tcp --ports=445 # et les partages du NAS
+```
+
+> [!IMPORTANT]
+> Si vos appareils utilisent le **DNS de votre box** — c'est ce qui est proposé par défaut à
+> l'installation — la règle « Internet seulement » le refuse aussi, car la box fait partie du
+> réseau de la maison. Les invités auraient Internet, mais plus aucun nom de site ne se
+> résoudrait. Autorisez-leur le DNS :
+>
+> ```bash
+> sudo wg-pi resource add dns 192.168.1.1 --libelle="Le DNS de la box"
+> sudo wg-pi access allow invites res:dns --proto=udp --ports=53
+> sudo wg-pi access allow invites res:dns --proto=tcp --ports=53
+> ```
+>
+> en remplaçant `192.168.1.1` par l'adresse de votre box. Avec un DNS public (Cloudflare,
+> Quad9) ou un Pi-hole sur le Pi, il n'y a rien à faire. `wg-pi access on` vous prévient de
+> toute façon si une de vos règles tombe dans ce piège.
+
+Puis, pour voir le résultat avant d'y toucher :
+
+```bash
+sudo wg-pi access show
+```
+
+Rien n'est encore appliqué à ce stade : les groupes et les règles sont enregistrés, mais le
+trafic n'est pas filtré. C'est volontaire, vous pouvez tout préparer tranquillement.
+
+### Activer, et le filet de sécurité
+
+`access plan` affiche les autorisations telles qu'elles seront posées, et ne change rien :
+
+```bash
+sudo wg-pi access plan
+```
+
+Relisez la liste. Si un appareil qui vous sert tous les jours n'y apparaît nulle part, c'est
+qu'il n'est dans aucun groupe autorisé : corrigez avant d'aller plus loin.
+
+> [!NOTE]
+> `access on` refuse de s'activer tant qu'aucune règle n'est enregistrée : le filtrage ne
+> laisse passer que ce qui est autorisé, il couperait donc tout. Posez d'abord une base
+> large, puis resserrez :
+>
+> ```bash
+> sudo wg-pi access allow tous internet
+> sudo wg-pi access allow tous maison
+> ```
+
+Quand la liste vous convient, activez — de préférence avec le Pi à portée de main, pas à
+distance pendant les vacances :
+
+```bash
+sudo wg-pi access on
+```
+
+> [!IMPORTANT]
+> Après `access on`, vous avez **deux minutes** pour confirmer. Sans confirmation, tout
+> revient automatiquement à l'état précédent. Vérifiez donc tout de suite que vos appareils
+> fonctionnent encore, puis lancez `sudo wg-pi access confirm`. Si quelque chose ne va plus,
+> `sudo wg-pi access off` — ou ne faites rien et attendez.
+
+Le SSH **vers le Pi** est accepté quoi qu'il arrive, et aucune règle ne peut le retirer :
+vous ne pouvez pas vous enfermer dehors avec une règle maladroite. Le SSH vers un autre
+appareil de la maison, lui, dépend de vos règles comme le reste.
+
+Tant que vous n'avez pas confirmé, le filet reste tendu : il se remet en place même après un
+redémarrage du Pi, parce que le premier réflexe quand on se coupe l'accès est justement de
+redémarrer. Une fois `access confirm` passé, c'est réglé pour de bon et vous n'avez plus à y
+penser.
+
+### Les commandes
+
+| Commande | Rôle |
+|---|---|
+| `sudo wg-pi group list` | les groupes et ce qu'ils contiennent |
+| `sudo wg-pi group add <nom> [--libelle="…"]` | créer un groupe |
+| `sudo wg-pi group rm <nom>` | supprimer un groupe |
+| `sudo wg-pi group join <appareil> <groupe>` | mettre un appareil dans un groupe |
+| `sudo wg-pi group leave <appareil> <groupe>` | l'en retirer |
+| `sudo wg-pi group set <appareil> <g1,g2,…>` | fixer d'un coup la liste de ses groupes |
+| `sudo wg-pi resource add <nom> <ip\|réseau> [--libelle="…"]` | déclarer un appareil de la maison |
+| `sudo wg-pi resource list` · `resource rm <nom>` | lister, supprimer |
+| `sudo wg-pi access show` | ce que chaque groupe peut joindre |
+| `sudo wg-pi access list` | les règles, une par une |
+| `sudo wg-pi access allow <groupe> <destination> [options]` | autoriser un accès |
+| `sudo wg-pi access rm <id>` | supprimer une règle |
+| `sudo wg-pi access plan` | essai à blanc, sans rien appliquer |
+| `sudo wg-pi access on` · `confirm` · `off` | activer, confirmer, désactiver |
+| `sudo wg-pi access check` | vérifier la cohérence |
+
+Les destinations possibles sont `internet`, `maison`, `pi` (les services du Pi lui-même),
+`res:<ressource>`, et `grp:<groupe>` pour laisser des appareils se joindre entre eux.
+
+| Option de `access allow` | Rôle |
+|---|---|
+| `--proto=tcp` · `udp` · `icmp` · `any` | le protocole ; `any` par défaut, c'est-à-dire tous |
+| `--ports=445,5000-5001` | les ports, uniquement avec `--proto=tcp` ou `--proto=udp` ; au plus 15 ports, une plage en comptant deux |
+| `--sens=deux` | les deux appareils peuvent engager la connexion — **uniquement** vers un `grp:`, voir ci-dessous |
+| `--libelle="…"` | un intitulé lisible, affiché dans les listes et le panneau web |
+
+Par défaut, seule la source engage la connexion : les réponses reviennent, mais la
+destination ne peut rien initier. `--sens=deux` lève cette restriction, et n'est accepté
+que vers un groupe : vers Internet, la maison ou une ressource, le trafic qui revient ne
+passe pas par le VPN et dépend de votre box, donc wg-pi ne peut rien en promettre.
+
+Le groupe **`tous`** existe toujours et contient automatiquement tous vos appareils, y
+compris ceux que vous ajouterez demain. Une règle **autorise**, jamais n'interdit : il n'y
+a donc ni ordre, ni priorité, rien à déboguer en cascade.
+
+> [!NOTE]
+> À retenir : vos appareils continuent de **voir** toute la plage du VPN, c'est normal. Ils
+> peuvent *essayer* de joindre ce qui est interdit, et le Pi refuse immédiatement —
+> « connexion refusée », sans attente. Modifier le fichier de configuration sur l'appareil
+> ne donne aucun accès supplémentaire.
+
+<details>
+<summary><b>Deux limites à connaître</b></summary>
+
+**Le Pi lui-même reste joignable.** Vos règles ne protègent pas les services qui tournent
+sur le Pi : SSH, le panneau web, Pi-hole, un conteneur Docker publié sur toutes les
+interfaces. Tous vos appareils du VPN les atteignent, même ceux qui n'ont aucune règle vers
+`pi` — une règle `access allow <groupe> pi` **ouvre** un accès, elle n'en ferme aucun.
+`sudo wg-pi access show` liste les ports en écoute sur le Pi pour que vous sachiez de quoi
+on parle. Si l'un de ces services doit rester privé, réglez-le dans le service lui-même, ou
+avec UFW.
+
+**L'IPv6.** Si votre Pi relaie l'IPv6 vers Internet, `access on` **refuse** de s'activer :
+le filtrage ne couvrirait que l'IPv4, et vos règles seraient contournables en IPv6. Mieux
+vaut un refus franc qu'une promesse de cloisonnement fausse.
+
+</details>
 
 ## Mise à jour
 
@@ -436,6 +653,50 @@ que le VPN est actif. C'est une limite commune à tous les VPN.
 </details>
 
 <details>
+<summary><b>J'ai activé le filtrage et un appareil ne passe plus</b></summary>
+
+Le plus simple, et sans risque :
+
+```bash
+sudo wg-pi access off
+```
+
+Vos groupes et vos règles sont conservés, seul le filtrage s'arrête. Regardez ensuite ce
+qui manquait avec `sudo wg-pi access show` : un appareil n'atteint que ce que ses groupes
+autorisent, et un appareil dans aucun groupe nommé ne dépend que des règles portant sur
+`tous`.
+
+Si vous veniez d'activer et que vous n'avez pas confirmé, il n'y a rien à faire : tout
+revient de lui-même au bout de deux minutes.
+
+Pour voir ce que le Pi a refusé :
+
+```bash
+sudo journalctl -k | grep wg-pi-refus
+```
+
+</details>
+
+<details>
+<summary><b>Le panneau web affiche « Règles non appliquées » en rouge</b></summary>
+
+Vos règles sont enregistrées, mais le pare-feu ne les applique pas en ce moment : tous vos
+appareils peuvent donc se joindre. Ça arrive quand un autre outil a touché au pare-feu —
+un `ufw reload`, ou un redémarrage de Docker.
+
+```bash
+sudo wg-pi access on
+```
+
+La commande voit que le filtrage est demandé sans être appliqué, et repose les règles.
+
+Quand le panneau affiche « Filtrage actif », vous pouvez le croire : il va vérifier l'état
+réel du pare-feu, et non un fichier de réglages. `sudo wg-pi access check` le vérifie aussi
+depuis le terminal.
+
+</details>
+
+<details>
 <summary><b>Journaux</b></summary>
 
 - Installation : `/var/log/wg-pi.log`
@@ -458,6 +719,8 @@ que le VPN est actif. C'est une limite commune à tous les VPN.
 | Mises à jour | `unattended-upgrades` en option, dépôts Raspberry Pi OS inclus |
 | Sécurité des fichiers | clés et token DuckDNS en `600` (lisibles par root seulement) |
 | Interface web | Python (bibliothèque standard) en HTTPS sur le port 443 (51821 s'il est pris), réseau local et VPN uniquement, service `wg-pi-web` |
+| Règles d'accès | chaînes `iptables` dédiées, construites à froid puis basculées d'un coup ; un accès refusé répond `REJECT`, donc « connexion refusée » tout de suite au lieu d'une longue attente |
+| Garde-fous | SSH accepté quoi qu'il arrive et qu'aucune règle ne peut retirer ; annulation automatique en 2 minutes sans confirmation, réarmée au redémarrage |
 
 Fichiers créés sur le Pi :
 
@@ -467,6 +730,7 @@ Fichiers créés sur le Pi :
 | `/etc/wg-pi/settings.conf` | réglages choisis à l'installation |
 | `/etc/wg-pi/clients/*.conf` | configuration de chaque appareil |
 | `/etc/wg-pi/firewall.sh` | règles pare-feu et NAT |
+| `/etc/wg-pi/access.conf` | groupes, ressources et règles d'accès (lisible, modifiable à la main) |
 | `/etc/sysctl.d/99-wg-pi.conf` | activation du routage |
 | `/usr/local/sbin/wg-pi` | la commande de gestion |
 | `/etc/wg-pi/web.conf`, `/etc/wg-pi/web/` | interface web : port, mot de passe haché, certificat HTTPS |
