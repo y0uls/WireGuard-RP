@@ -432,6 +432,13 @@ sudo wg-pi resource add nas 192.168.1.20 --libelle="Le NAS"
 sudo wg-pi access allow invites internet                        # les invités : Internet seulement
 sudo wg-pi access allow famille maison                          # la famille : tout le réseau
 sudo wg-pi access allow famille res:nas --proto=tcp --ports=445 # et les partages du NAS
+
+# Ajouter un port à une règle existante, sans retaper la liste.
+# « sudo wg-pi access list » donne les identifiants.
+sudo wg-pi access set p3 --ports=445,139
+
+# Une machine a changé d adresse : toutes les règles qui la citent suivent.
+sudo wg-pi resource add nas 192.168.1.25
 ```
 
 > [!IMPORTANT]
@@ -512,11 +519,12 @@ penser.
 | `sudo wg-pi group join <appareil> <groupe>` | mettre un appareil dans un groupe |
 | `sudo wg-pi group leave <appareil> <groupe>` | l'en retirer |
 | `sudo wg-pi group set <appareil> <g1,g2,…>` | fixer d'un coup la liste de ses groupes |
-| `sudo wg-pi resource add <nom> <ip\|réseau> [--libelle="…"]` | déclarer un appareil de la maison |
+| `sudo wg-pi resource add <nom> <ip\|réseau> [--libelle="…"]` | déclarer un appareil de la maison, ou changer son adresse |
 | `sudo wg-pi resource list` · `resource rm <nom>` | lister, supprimer |
 | `sudo wg-pi access show` | ce que chaque groupe peut joindre |
 | `sudo wg-pi access list` | les règles, une par une |
 | `sudo wg-pi access allow <groupe> <destination> [options]` | autoriser un accès |
+| `sudo wg-pi access set <id> [options]` | modifier une règle sans la ressaisir |
 | `sudo wg-pi access rm <id>` | supprimer une règle |
 | `sudo wg-pi access plan` | essai à blanc, sans rien appliquer |
 | `sudo wg-pi access on` · `confirm` · `off` | activer, confirmer, désactiver |

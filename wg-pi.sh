@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.5.1"
+readonly WGPI_VERSION="1.6.0"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -4345,9 +4345,21 @@ cmd_resource() {
       access_valid_label "$libelle" ||
         die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle=$id
+      local existait=0
+      access_res_exists "$id" && existait=1
       { access_cat | access_drop RES "$id"; echo "RES|$id|$libelle|$target"; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
-      ok "Ressource « $libelle » ($target) enregistrée sous le nom « $id »."
+      if (( existait )); then
+        # Toutes les règles « res:<nom> » suivent la nouvelle adresse sans changer d'un
+        # caractère à l'écran : le dire est le seul moyen que ce ne soit pas une surprise.
+        ok "Ressource « $id » modifiée : $libelle ($target)."
+        local citee
+        citee=$(access_rows POLICY | awk -F'|' -v r="res:$id" '$4 == r { printf " %s", $1 }')
+        [[ -n $citee ]] &&
+          txt "   ${DIM}Les règles suivantes visent désormais $target :$citee${RESET}"
+      else
+        ok "Ressource « $libelle » ($target) enregistrée sous le nom « $id »."
+      fi
       txt "   Pour y donner accès : ${BOLD}sudo wg-pi access allow <groupe> res:$id${RESET}"
       ;;
     rm|remove|supprimer)
@@ -4371,6 +4383,34 @@ cmd_resource() {
 # Une règle AUTORISE, jamais n'interdit : il n'y a donc ni ordre, ni priorité, ni règle à
 # déboguer en cascade. C'est la simplification la plus importante pour un non-technicien,
 # et c'est aussi le modèle de NetBird.
+# Les contrôles communs à la création et à la modification d'une règle. Les deux chemins
+# DOIVENT refuser exactement la même chose : si « access set » acceptait ce que
+# « access allow » refuse, il suffirait de créer une règle anodine puis de la modifier
+# pour contourner la validation. Une seule copie, donc, appelée par les deux.
+#
+# Se termine par « return 0 » : la dernière instruction est un test, et sa valeur
+# deviendrait sinon le code de retour de la fonction.
+access_valider_regle() {   # <groupe> <destination> <proto> <ports> <sens>
+  local src=$1 dest=$2 proto=$3 ports=$4 sens=$5
+  access_is_all "$src" || access_group_exists "$src" || die "Aucun groupe « $src »."
+  access_valid_dest "$dest" || die "Destination invalide : « $dest » (tout, internet, maison, pi, res:<nom>, grp:<nom>)."
+  case $dest in
+    res:*) access_res_exists "${dest#res:}" || die "Aucune ressource « ${dest#res:} »." ;;
+    grp:*) access_is_all "${dest#grp:}" || access_group_exists "${dest#grp:}" || die "Aucun groupe « ${dest#grp:} »." ;;
+  esac
+  access_valid_proto "$proto" || die "Protocole invalide : « $proto » (any, tcp, udp, icmp)."
+  access_valid_dir "$sens" || die "Sens invalide : « $sens » (aller, deux)."
+  access_valid_two_way "$sens" "$dest" ||
+    die "« --sens=deux » n'a de sens que vers un groupe (grp:<nom>).
+Vers Internet, la maison ou une ressource, le trafic qui revient ne passe pas par le VPN :
+il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
+  access_valid_ports "$ports" ||
+    die "Liste de ports invalide : « $ports ». Exemples : 445 ou 445,5000-5001. Au plus 15 ports, une plage en comptant deux."
+  [[ -n $ports && $proto != tcp && $proto != udp ]] &&
+    die "Des ports n'ont de sens qu'avec --proto=tcp ou --proto=udp."
+  return 0
+}
+
 cmd_access() {
   load_settings
   local action=${1-} src dst proto=any ports="" sens=aller libelle="" id a v
@@ -4406,22 +4446,7 @@ Destinations : tout, internet, maison, pi, res:<ressource>, grp:<groupe>"
         v=$(opt_value "$a" sens);    [[ -n $v ]] && sens=$v
         v=$(opt_value "$a" libelle); [[ -n $v ]] && libelle=$v
       done
-      access_is_all "$src" || access_group_exists "$src" || die "Aucun groupe « $src »."
-      access_valid_dest "$dst" || die "Destination invalide : « $dst » (internet, maison, pi, res:<nom>, grp:<nom>)."
-      case $dst in
-        res:*) access_res_exists "${dst#res:}" || die "Aucune ressource « ${dst#res:} »." ;;
-        grp:*) access_is_all "${dst#grp:}" || access_group_exists "${dst#grp:}" || die "Aucun groupe « ${dst#grp:} »." ;;
-      esac
-      access_valid_proto "$proto" || die "Protocole invalide : « $proto » (any, tcp, udp, icmp)."
-      access_valid_dir "$sens" || die "Sens invalide : « $sens » (aller, deux)."
-      access_valid_two_way "$sens" "$dst" ||
-        die "« --sens=deux » n'a de sens que vers un groupe (grp:<nom>).
-Vers Internet, la maison ou une ressource, le trafic qui revient ne passe pas par le VPN :
-il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
-      access_valid_ports "$ports" ||
-        die "Liste de ports invalide : « $ports ». Exemples : 445 ou 445,5000-5001. Au plus 15 ports, une plage en comptant deux."
-      [[ -n $ports && $proto != tcp && $proto != udp ]] &&
-        die "Des ports n'ont de sens qu'avec --proto=tcp ou --proto=udp."
+      access_valider_regle "$src" "$dst" "$proto" "$ports" "$sens"
       access_valid_label "$libelle" ||
         die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle="$(access_group_label "$src") → $(access_dest_label "$dst")"
@@ -4435,6 +4460,53 @@ il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
       # Le panneau web se fie à ce code : il affichait le message de succès dans le bandeau
       # rouge, gardait la fenêtre ouverte, et surtout n'appelait jamais « access-apply ».
       # La règle apparaissait dans la liste sans exister dans le noyau.
+      if [[ $(access_mode) == ouvert ]]; then
+        txt "   ${DIM}Le filtrage n'est pas encore actif : cette règle est enregistrée mais ne change rien pour l'instant.${RESET}"
+      fi
+      ;;
+    set|modifier|edit)
+      # Sans ceci, changer un seul port obligeait à supprimer la règle puis à la ressaisir
+      # entièrement — liste de ports comprise. L'identifiant et le groupe source ne bougent
+      # pas : changer « qui » fait une autre règle, pas une modification de celle-ci.
+      take_lock
+      id=${1-}; [[ -n $id ]] && shift
+      [[ -n $id ]] ||
+        die "Usage : wg-pi access set <identifiant> [--dest=...] [--proto=tcp] [--ports=...] [--sens=aller|deux] [--libelle=\"...\"]
+Les identifiants sont donnés par : sudo wg-pi access list"
+      local ligne pact psrc
+      ligne=$(access_rows POLICY | awk -F'|' -v i="$id" '$1 == i { print; exit }')
+      [[ -n $ligne ]] || die "Aucune règle « $id ». Liste : sudo wg-pi access list"
+      IFS="|" read -r _ pact psrc dst proto ports sens libelle <<<"$ligne"
+      # On distingue « option absente » de « option vide » : « --ports= » doit pouvoir
+      # REMETTRE tous les ports, ce qu'un simple test de non-vacuité rendrait impossible.
+      for a in "$@"; do
+        case $a in
+          --dest=*|--destination=*) dst=${a#*=} ;;
+          --proto=*)                proto=${a#*=} ;;
+          --ports=*)                ports=${a#*=} ;;
+          --sens=*)                 sens=${a#*=} ;;
+          --libelle=*)              libelle=${a#*=} ;;
+          *) die "Option inconnue : « $a » (--dest, --proto, --ports, --sens, --libelle)." ;;
+        esac
+      done
+      [[ -n $proto ]] || proto=any
+      [[ -n $sens ]] || sens=aller
+      access_valider_regle "${psrc#grp:}" "$dst" "$proto" "$ports" "$sens"
+      access_valid_label "$libelle" ||
+        die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
+      [[ -n $libelle ]] || libelle="$(access_group_label "${psrc#grp:}") → $(access_dest_label "$dst")"
+      # Réécriture EN PLACE, et non suppression puis ajout : la règle garderait son
+      # identifiant mais sauterait en bas de la liste, et l'utilisateur qui vient de
+      # corriger un port la chercherait là où elle n'est plus.
+      {
+        while IFS= read -r l; do
+          case $l in
+            "POLICY|$id|"*) printf '%s\n' "POLICY|$id|$pact|$psrc|$dst|$proto|$ports|$sens|$libelle" ;;
+            *)              printf '%s\n' "$l" ;;
+          esac
+        done < <(access_cat)
+      } | access_save || die "Écriture de $ACCESS_FILE impossible."
+      ok "Règle $id modifiée : $libelle"
       if [[ $(access_mode) == ouvert ]]; then
         txt "   ${DIM}Le filtrage n'est pas encore actif : cette règle est enregistrée mais ne change rien pour l'instant.${RESET}"
       fi
@@ -4464,7 +4536,7 @@ il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
       cmd_access_confirm
       ;;
     *)
-      die "Action inconnue : access $action (show, list, allow, rm, check, plan, on, off, confirm)"
+      die "Action inconnue : access $action (show, list, allow, set, rm, check, plan, on, off, confirm)"
       ;;
   esac
 }
@@ -5646,6 +5718,7 @@ APP_JS = r"""
       majBascule: majBascule,
       ouvrirAjoutMembre: ouvrirAjoutMembre,
       ouvrirNouvelleRegle: ouvrirNouvelleRegle,
+      ouvrirNouvelleRessource: ouvrirNouvelleRessource,
       renderMap: renderMap,
       openAcces: openAcces,
       fluxSortants: fluxSortants,
@@ -6196,7 +6269,8 @@ APP_JS = r"""
       var tuile = el("div", "tile"), tete = el("div");
       tete.append(el("b", null, r.libelle), el("div", "sub mono", r.cible + " · " + r.id));
       var fin = el("div", "push");
-      fin.append(boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRessource(r); }));
+      fin.append(boutonTexte("Modifier", "ghost", function () { ouvrirNouvelleRessource(r); }),
+                 boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRessource(r); }));
       tuile.append(tete, fin);
       rbox.append(tuile);
     });
@@ -6218,7 +6292,8 @@ APP_JS = r"""
                el("b", null, x.flux.label), el("span", "chip plain", libelleProto(x.flux)));
       if (x.flux.sens === "deux") { l.append(el("span", "chip plain", "les deux sens")); }
       var fin = el("div", "push");
-      fin.append(boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRegle(x); }));
+      fin.append(boutonTexte("Modifier", "ghost", function () { ouvrirNouvelleRegle(x); }),
+                 boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRegle(x); }));
       l.append(fin);
       box.append(l);
     });
@@ -6279,31 +6354,49 @@ APP_JS = r"""
     });
   }
 
-  function ouvrirNouvelleRessource() {
-    openDialog("Nouvelle ressource", function (b) {
+  /* « r » absent : création. « r » présent : modification de cette ressource-là. Un seul
+     formulaire pour les deux, sinon les deux copies divergent au premier champ ajouté. */
+  function ouvrirNouvelleRessource(r) {
+    openDialog(r ? "Modifier la ressource" : "Nouvelle ressource", function (b) {
       var f = el("form", "form");
-      var nom = champ("res-id", "Nom court", "1 à 15 caractères : lettres, chiffres, - et _.", "",
+      var nom = champ("res-id", "Nom court", "1 à 15 caractères : lettres, chiffres, - et _.", r ? r.id : "",
                       "[A-Za-z0-9_][A-Za-z0-9_-]{0,14}");
       nom.input.required = true; nom.input.maxLength = 15; nom.input.placeholder = "ex. nas, imprimante";
-      var cible = champ("res-ip", "Adresse ou réseau", "Exemples : 192.168.1.20 ou 192.168.1.64/28.", "");
+      /* Le nom est la clé citée par les règles : le renommer en ferait une autre ressource
+         et laisserait les règles pointer dans le vide. On le montre, on l interdit. */
+      if (r) { nom.input.disabled = true; nom.input.required = false; nom.aide.textContent = "Le nom ne peut pas changer : les règles le citent."; }
+      var cible = champ("res-ip", "Adresse ou réseau", "Exemples : 192.168.1.20 ou 192.168.1.64/28.", r ? r.cible : "");
       cible.input.required = true; cible.input.placeholder = "192.168.1.20";
-      var lib = champ("res-lib", "Libellé affiché", "Facultatif.", "");
+      var lib = champ("res-lib", "Libellé affiché", "Facultatif.", r ? r.libelle : "");
       lib.input.maxLength = 60; lib.input.placeholder = "ex. Le NAS";
-      var err = errorBox(), act = actionsBar("Annuler", "Créer la ressource", "primary");
+      var err = errorBox(), act = actionsBar("Annuler", r ? "Enregistrer" : "Créer la ressource", "primary");
+      /* Combien de règles suivront l adresse sans que leur ligne change d un caractère. */
+      var cites = 0;
+      if (r) {
+        groupesTous().forEach(function (g) {
+          (g.flux || []).forEach(function (fl) { if (fl.dest === "res:" + r.id) { cites += 1; } });
+        });
+      }
+      if (cites) {
+        f.append(el("p", "sub", cites > 1
+          ? cites + " règles visent cette ressource : elles pointeront toutes vers la nouvelle adresse."
+          : "Une règle vise cette ressource : elle pointera vers la nouvelle adresse."));
+      }
       f.append(nom.bloc, cible.bloc, lib.bloc, err, act.bar);
       f.addEventListener("submit", function (e) {
         e.preventDefault();
         if (act.ok.disabled) { return; }
         act.ok.disabled = true; err.hidden = true;
-        api("POST", "/api/ressources", {id: nom.input.value.trim(), cible: cible.input.value.trim(),
-                                        libelle: lib.input.value.trim()})
+        api("POST", r ? "/api/ressources/" + encodeURIComponent(r.id) + "/edit" : "/api/ressources",
+            {id: nom.input.value.trim(), cible: cible.input.value.trim(),
+             libelle: lib.input.value.trim()})
           .then(function (d) {
             if (f.isConnected) { closeDialog(); }
-            apresEcriture(d, "Ressource créée");
+            apresEcriture(d, r ? "Ressource modifiée" : "Ressource créée");
           }).catch(function (x) { showError(f, err, act.ok, x); });
       });
       b.append(f);
-      setTimeout(function () { nom.input.focus(); }, 30);
+      setTimeout(function () { (r ? cible.input : nom.input).focus(); }, 30);
     });
   }
 
@@ -6323,28 +6416,35 @@ APP_JS = r"""
     return out;
   }
 
-  function ouvrirNouvelleRegle() {
-    openDialog("Nouvelle règle d accès", function (b) {
+  /* « x » absent : création. « x » présent — {groupe, flux} tel que le rendu des règles le
+     manipule — : modification de cette règle-là. Ajouter un port obligeait sinon à supprimer
+     la règle et à ressaisir toute la liste de ports de mémoire. */
+  function ouvrirNouvelleRegle(x) {
+    var r = (x && x.flux) || null;
+    openDialog(r ? "Modifier la règle d accès" : "Nouvelle règle d accès", function (b) {
       var f = el("form", "form");
       var sources = groupesTous().map(function (g) { return {valeur: g.id, texte: g.libelle}; });
       if (!sources.length) {
         b.append(el("p", null, "Créez d abord un groupe : une règle part toujours d un groupe d appareils."));
         return;
       }
-      var src = liste("reg-src", "Qui ?", sources, sources[0].valeur);
-      var dst = liste("reg-dst", "Peut joindre quoi ?", destinationsPossibles(), "internet");
+      var src = liste("reg-src", "Qui ?", sources, r ? x.groupe.id : sources[0].valeur);
+      /* Changer « qui » ne modifie pas une règle : cela en fait une autre. On verrouille,
+         pour que la fenêtre ne promette pas un changement que le serveur ignorerait. */
+      if (r) { src.select.disabled = true; }
+      var dst = liste("reg-dst", "Peut joindre quoi ?", destinationsPossibles(), r ? r.dest : "internet");
       var proto = liste("reg-proto", "Protocole", [
         {valeur: "any", texte: "Tous (et tous les ports)"},
         {valeur: "tcp", texte: "TCP"}, {valeur: "udp", texte: "UDP"}, {valeur: "icmp", texte: "ICMP (ping)"}
-      ], "any");
-      var ports = champ("reg-ports", "Ports", "Avec TCP ou UDP. Exemples : 445 ou 445,5000-5001. Vide = tous.", "");
+      ], r ? r.proto : "any");
+      var ports = champ("reg-ports", "Ports", "Avec TCP ou UDP. Exemples : 445 ou 445,5000-5001. Vide = tous.", r ? r.ports : "");
       ports.input.placeholder = "445,5000-5001";
       ports.input.maxLength = 120;   /* le corps des requêtes est borné à 4096 octets */
       var sens = liste("reg-sens", "Sens", [
         {valeur: "aller", texte: "Aller simple : la source appelle"},
         {valeur: "deux", texte: "Les deux sens"}
-      ], "aller", "");
-      var lib = champ("reg-lib", "Libellé affiché", "Facultatif.", "");
+      ], r ? r.sens : "aller", "");
+      var lib = champ("reg-lib", "Libellé affiché", "Facultatif.", r ? r.titre : "");
       lib.input.maxLength = 60;
       var grille = el("div", "grid-form");
       grille.append(src.bloc, dst.bloc, proto.bloc, ports.bloc, sens.bloc);
@@ -6369,18 +6469,19 @@ APP_JS = r"""
       dst.select.addEventListener("change", majSens);
       proto.select.addEventListener("change", majSens);
       majSens();
-      var err = errorBox(), act = actionsBar("Annuler", "Créer la règle", "primary");
+      var err = errorBox(), act = actionsBar("Annuler", r ? "Enregistrer" : "Créer la règle", "primary");
       f.append(grille, lib.bloc, err, act.bar);
       f.addEventListener("submit", function (e) {
         e.preventDefault();
         if (act.ok.disabled) { return; }
         act.ok.disabled = true; err.hidden = true;
-        api("POST", "/api/regles", {source: src.select.value, destination: dst.select.value,
-                                    proto: proto.select.value, ports: ports.input.value.trim(),
-                                    sens: sens.select.value, libelle: lib.input.value.trim()})
+        api("POST", r ? "/api/regles/" + encodeURIComponent(r.id) + "/edit" : "/api/regles",
+            {source: src.select.value, destination: dst.select.value,
+             proto: proto.select.value, ports: ports.input.value.trim(),
+             sens: sens.select.value, libelle: lib.input.value.trim()})
           .then(function (d) {
             if (f.isConnected) { closeDialog(); }
-            apresEcriture(d, "Règle créée");
+            apresEcriture(d, r ? "Règle modifiée" : "Règle créée");
           }).catch(function (x) { showError(f, err, act.ok, x); });
       });
       b.append(f);
@@ -6918,6 +7019,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/ressources/([A-Za-z0-9_][A-Za-z0-9_-]{0,14})/delete", path)
         if m:
             return self.mutate_acces(("resource", "rm", m.group(1)), f"ressource « {m.group(1)} » supprimée")
+        # Changer l'adresse d'une ressource est REFUSÉ sur /api/ressources (409), parce que
+        # réutiliser un nom par inadvertance repointerait toutes les règles « res:<nom> » vers
+        # une autre machine. Ici c'est demandé explicitement, sur une ressource qui existe :
+        # l'intention est claire, donc on l'accepte. Le CLI « resource add » remplace en place.
+        m = re.fullmatch(r"/api/ressources/([A-Za-z0-9_][A-Za-z0-9_-]{0,14})/edit", path)
+        if m:
+            rid = m.group(1)
+            cible = str(body.get("cible", "")).strip()
+            lib = str(body.get("libelle", "")).strip()
+            if not any(r.get("id") == rid for r in acces_vue().get("ressources", [])):
+                return self.send_json(404, {"error": f"Aucune ressource « {rid} »."})
+            if not CIBLE_RE.fullmatch(cible):
+                return self.send_json(400, {"error": "Adresse invalide (exemples : 192.168.1.20 ou 192.168.1.64/28)."})
+            if not libelle_ok(lib):
+                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            args = ["resource", "add", rid, cible] + (["--libelle=" + lib] if lib else [])
+            return self.mutate_acces(args, f"ressource « {rid} » modifiée")
         if path == "/api/regles":
             src = str(body.get("source", "")).strip()
             dst = str(body.get("destination", "")).strip()
@@ -6943,6 +7061,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if lib:
                 args.append("--libelle=" + lib)
             return self.mutate_acces(args, f"règle « {src} vers {dst} » créée")
+        # Modifier plutôt que supprimer-recréer : ajouter un port à une règle obligeait
+        # sinon à ressaisir toute la liste. Le formulaire renvoie TOUS les champs, y compris
+        # ceux qui n'ont pas bougé — « ports » vide remet donc bien tous les ports, qui est
+        # le seul moyen d'annuler une restriction depuis le panneau.
+        m = re.fullmatch(r"/api/regles/([A-Za-z0-9_-]{1,16})/edit", path)
+        if m:
+            rid = m.group(1)
+            if rid.startswith("-"):
+                return self.send_json(404, {"error": "Règle introuvable."})
+            dst = str(body.get("destination", "")).strip()
+            proto = str(body.get("proto", "any")).strip() or "any"
+            ports = str(body.get("ports", "")).strip()
+            sens = str(body.get("sens", "aller")).strip() or "aller"
+            lib = str(body.get("libelle", "")).strip()
+            if not DEST_RE.fullmatch(dst):
+                return self.send_json(400, {"error": "Destination invalide."})
+            if proto not in ("any", "tcp", "udp", "icmp"):
+                return self.send_json(400, {"error": "Protocole invalide."})
+            if sens not in ("aller", "deux"):
+                return self.send_json(400, {"error": "Sens invalide."})
+            if ports and not PORTS_RE.fullmatch(ports):
+                return self.send_json(400, {"error": "Liste de ports invalide. Exemples : 445 ou 445,5000-5001."})
+            if not libelle_ok(lib):
+                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            args = ["access", "set", rid, "--dest=" + dst, "--proto=" + proto,
+                    "--sens=" + sens, "--ports=" + ports, "--libelle=" + lib]
+            return self.mutate_acces(args, f"règle « {rid} » modifiée")
         m = re.fullmatch(r"/api/regles/([A-Za-z0-9_-]{1,16})/delete", path)
         if m:
             rid = m.group(1)
@@ -7168,6 +7313,9 @@ Utilisation : sudo wg-pi [commande]
   access allow <groupe> <destination> [--proto=] [--ports=] [--sens=] [--libelle=]
                         autoriser un accès. Destinations : internet, maison, pi,
                         res:<ressource>, grp:<groupe>
+  access set <id> [--dest=] [--proto=] [--ports=] [--sens=] [--libelle=]
+                        modifier une règle sans la ressaisir (seul ce qui est
+                        donné change ; --ports= vide remet tous les ports)
   access rm <id>        supprimer une règle
   access check          vérifier la cohérence du fichier d'accès
   access plan           essai à blanc : les règles qui seraient posées

@@ -544,6 +544,49 @@ const ports = stub.findAll(corps, "INPUT").filter(function (i) { return i.id ===
 eq("les ports sont inopérants sans TCP ni UDP", ports.disabled, true);
 contient("et le disent aussi", stub.textOf(ports.parentNode.children[2]), "TCP");
 
+/* --- modifier plutot que ressaisir ----------------------------------------- */
+/* Ajouter un seul port a une regle obligeait a la supprimer puis a retaper toute la
+   liste de memoire. Le meme formulaire sert donc aux deux, pre-rempli. */
+function inpDe(racine, id) {
+  return stub.findAll(racine, "INPUT").filter(function (i) { return i.id === id; })[0];
+}
+function selDe(racine, id) {
+  return stub.findAll(racine, "SELECT").filter(function (s) { return s.id === id; })[0];
+}
+const fluxMoon = F("p2", "res:moon", "MoonLight", "udp", "47998,47999", "aller");
+app.setState({
+  acces: {groupes: [G("gaming", "Gaming", ["telephone"], [fluxMoon])],
+          ressources: [{id: "moon", libelle: "MoonLight", cible: "192.168.1.18"}]},
+  peers: [{name: "telephone"}], server: {}, time: 5
+});
+app.ouvrirNouvelleRegle({groupe: {id: "gaming", libelle: "Gaming"}, flux: fluxMoon});
+const modR = env.doc.getElementById("dlg-body");
+eq("les ports existants sont repris tels quels", inpDe(modR, "reg-ports").value, "47998,47999");
+eq("la destination est reprise", selDe(modR, "reg-dst").value, "res:moon");
+eq("le protocole est repris", selDe(modR, "reg-proto").value, "udp");
+/* Le protocole etant UDP, les ports doivent rester saisissables : un pre-remplissage
+   suivi d un champ grise aurait efface la liste que l on vient justement de montrer. */
+eq("et les ports restent modifiables", inpDe(modR, "reg-ports").disabled, false);
+/* Changer « qui » ne modifie pas la regle : cela en fait une autre. Le serveur ignore
+   ce champ, la fenetre ne doit donc pas laisser croire qu il agit. */
+eq("le groupe source est verrouillé", selDe(modR, "reg-src").disabled, true);
+eq("et montre le groupe de la règle", selDe(modR, "reg-src").value, "gaming");
+
+/* Une creation ordinaire ne doit evidemment rien avoir herite de tout cela. */
+app.ouvrirNouvelleRegle();
+const neuve = env.doc.getElementById("dlg-body");
+eq("une création part toujours de champs vides", inpDe(neuve, "reg-ports").value, "");
+eq("et son groupe source reste choisissable", selDe(neuve, "reg-src").disabled, false);
+
+/* La ressource : son nom est la cle citee par les regles. Le renommer les ferait
+   pointer dans le vide, alors que changer son adresse les deplace toutes en silence. */
+app.ouvrirNouvelleRessource({id: "moon", libelle: "MoonLight", cible: "192.168.1.18"});
+const modS = env.doc.getElementById("dlg-body");
+eq("l adresse de la ressource est reprise", inpDe(modS, "res-ip").value, "192.168.1.18");
+eq("le nom est montré mais verrouillé", inpDe(modS, "res-id").disabled, true);
+contient("et la fenêtre annonce ce que la modification entraîne",
+         stub.textOf(modS), "pointera vers la nouvelle adresse");
+
 console.log("");
 console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");
 process.exit(fail === 0 ? 0 : 1);

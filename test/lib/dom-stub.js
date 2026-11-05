@@ -10,7 +10,7 @@ function makeEl(tag) {
     tagName: String(tag || "div").toUpperCase(),
     className: "", title: "", id: "", type: "",
     _text: "",
-    innerHTML: "", hidden: false, value: "",
+    innerHTML: "", hidden: false, value: "", disabled: false, selected: false,
     children: [], parentNode: null, attributes: {},
     style: {}, dataset: {},
     classList: {
@@ -68,6 +68,19 @@ function makeEl(tag) {
     },
     enumerable: true, configurable: true
   });
+  if (e.tagName === "SELECT") {
+    delete e.value;
+    Object.defineProperty(e, "value", {
+      get: function () {
+        var choisie = e.children.filter(function (o) { return o.selected; })[0] || e.children[0];
+        return choisie ? choisie.value : "";
+      },
+      set: function (v) {
+        e.children.forEach(function (o) { o.selected = (o.value === v); });
+      },
+      enumerable: true, configurable: true
+    });
+  }
   return e;
 }
 

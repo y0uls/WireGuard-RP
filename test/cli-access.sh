@@ -299,5 +299,53 @@ eq "le rappel revient quand le filtrage dort" "$(run cmd_access allow admin inte
 eq "et le code de retour reste bon en mode ouvert" "$(runok cmd_access allow admin maison)" oui
 
 echo
+echo "-- modifier une regle sans la ressaisir"
+# Ajouter un seul port obligeait a supprimer la regle puis a retaper toute la liste.
+{
+  echo "V|1"
+  echo "MODE|ouvert"
+  echo "GROUP|gaming|Gaming"
+  echo "GROUP|admin|Administration"
+  echo "RES|moon|MoonLight|192.168.1.18"
+} > "$ACC"
+silent cmd_access allow gaming res:moon --proto=udp --ports=47998,47999
+silent cmd_access allow admin maison
+eq "modification des ports acceptee" "$(runok cmd_access set p1 --ports=9,47998,47999)" oui
+eq "les ports sont bien changes" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $7 }')" "9,47998,47999"
+# Ce qui n est pas donne ne bouge pas, sinon chaque retouche serait une ressaisie.
+eq "le protocole est conserve" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $6 }')" "udp"
+eq "la destination est conservee" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $5 }')" "res:moon"
+eq "le groupe source est conserve" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $4 }')" "grp:gaming"
+# La regle garde sa place : corriger un port ne doit pas la faire sauter en bas de liste.
+eq "la regle garde sa position" "$(rows | grep '^POLICY' | head -1 | awk -F'|' '{ print $2 }')" "p1"
+# « --ports= » vide est le seul moyen de revenir a tous les ports.
+eq "ports vides acceptes" "$(runok cmd_access set p1 --ports=)" oui
+eq "tous les ports sont revenus" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $7 }')" ""
+eq "changement de destination" "$(runok cmd_access set p1 --dest=maison)" oui
+eq "destination changee" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $5 }')" "maison"
+eq "vider le libelle le regenere" "$(runok cmd_access set p1 --libelle=)" oui
+
+eq "identifiant inconnu refuse" "$(runok cmd_access set p99 --ports=9)" non
+eq "option inconnue refusee" "$(runok cmd_access set p1 --couleur=rouge)" non
+# La modification DOIT refuser exactement ce que la creation refuse. Sinon il suffirait
+# de creer une regle anodine puis de la modifier pour contourner la validation.
+eq "ports invalides refuses comme a la creation" "$(runok cmd_access set p1 --proto=tcp --ports=abc)" non
+eq "sens deux hors groupe refuse comme a la creation" "$(runok cmd_access set p1 --sens=deux)" non
+eq "destination inventee refusee comme a la creation" "$(runok cmd_access set p1 --dest=ailleurs)" non
+eq "ressource inexistante refusee comme a la creation" "$(runok cmd_access set p1 --dest=res:absente)" non
+eq "protocole invente refuse comme a la creation" "$(runok cmd_access set p1 --proto=sctp)" non
+# Et aucun de ces refus n a touche au fichier.
+eq "un refus ne modifie rien" "$(rows | grep '^POLICY|p1|' | awk -F'|' '{ print $5 }')" "maison"
+
+echo
+echo "-- changer l adresse d une ressource"
+# Repointer une ressource deplace toutes les regles qui la citent sans que leur ligne
+# change d un caractere : le message doit le dire, sinon la portee reste invisible.
+eq "l adresse peut changer" "$(runok cmd_resource add moon 192.168.1.30)" oui
+eq "la nouvelle adresse est en place" "$(rows | grep '^RES|moon|' | awk -F'|' '{ print $4 }')" "192.168.1.30"
+eq "le message parle de modification" "$(run cmd_resource add moon 192.168.1.31 | grep -c 'modifiée')" "1"
+eq "une creation parle d enregistrement" "$(run cmd_resource add nas9 192.168.1.40 | grep -c 'enregistrée')" "1"
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))
