@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.5.0"
+readonly WGPI_VERSION="1.5.1"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -4429,8 +4429,15 @@ il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
       { access_cat; echo "POLICY|$id|1|grp:$src|$dst|$proto|$ports|$sens|$libelle"; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
       ok "Règle $id enregistrée : $libelle"
-      [[ $(access_mode) == ouvert ]] &&
+      # « if » et NON « [[ … ]] && … » : en dernière instruction d'une branche de « case »,
+      # un test faux devient le code de retour de cmd_access. Avec le filtrage déjà actif,
+      # « access allow » sortait donc en ERREUR après avoir correctement enregistré la règle.
+      # Le panneau web se fie à ce code : il affichait le message de succès dans le bandeau
+      # rouge, gardait la fenêtre ouverte, et surtout n'appelait jamais « access-apply ».
+      # La règle apparaissait dans la liste sans exister dans le noyau.
+      if [[ $(access_mode) == ouvert ]]; then
         txt "   ${DIM}Le filtrage n'est pas encore actif : cette règle est enregistrée mais ne change rien pour l'instant.${RESET}"
+      fi
       ;;
     rm|remove|supprimer)
       take_lock

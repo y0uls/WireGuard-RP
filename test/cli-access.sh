@@ -268,5 +268,36 @@ eq "les deux sens sont refuses vers tout" "$(runok cmd_access allow admin tout -
 eq "une destination inventee reste refusee" "$(runok cmd_access allow admin partout)" non
 
 echo
+echo "-- ecriture pendant que le filtrage tourne deja"
+# Toutes les ecritures ci-dessus tournent en mode « ouvert ». Ce mode-la rendait vrai le
+# test final de la branche « allow », qui renvoyait donc 0 : le code de retour etait juste
+# PAR ACCIDENT. En mode « filtre » le test devenait faux, et comme il etait la derniere
+# instruction de la branche, sa valeur devenait le code de retour de cmd_access tout entier.
+# « access allow » sortait en erreur APRES avoir enregistre la regle. Le panneau web, qui se
+# fie au code de retour, montrait le succes en rouge et n appliquait jamais la regle : la
+# liste affichait une regle absente du noyau. On exerce donc chaque ecriture dans les DEUX
+# modes, puisque c est le mode qui decidait du resultat.
+{
+  echo "V|1"
+  echo "MODE|filtre"
+  echo "GROUP|admin|Administration"
+} > "$ACC"
+eq "autorisation acceptee avec le filtrage actif" "$(runok cmd_access allow admin tout)" oui
+eq "et la regle est bien enregistree" "$(rows | grep -c "^POLICY")" "1"
+eq "suppression acceptee avec le filtrage actif" "$(runok cmd_access rm p1)" oui
+eq "creation de groupe acceptee avec le filtrage actif" "$(runok cmd_group add salon)" oui
+eq "creation de ressource acceptee avec le filtrage actif" "$(runok cmd_resource add nas3 192.168.1.30)" oui
+# Le rappel « pas encore actif » serait un mensonge quand le filtrage tourne.
+eq "aucun rappel trompeur quand le filtrage tourne" "$(run cmd_access allow admin maison | grep -c "pas encore actif")" "0"
+
+{
+  echo "V|1"
+  echo "MODE|ouvert"
+  echo "GROUP|admin|Administration"
+} > "$ACC"
+eq "le rappel revient quand le filtrage dort" "$(run cmd_access allow admin internet | grep -c "pas encore actif")" "1"
+eq "et le code de retour reste bon en mode ouvert" "$(runok cmd_access allow admin maison)" oui
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))
