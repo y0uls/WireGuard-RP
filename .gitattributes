@@ -1,0 +1,13 @@
+# Fins de ligne — wg-pi.sh doit arriver sur le Pi en LF : un fichier en CRLF ne s'exécute pas.
+# « eol=lf » impose le LF dans l'arbre de travail même sur une machine configurée avec
+# core.autocrlf=true (le défaut sous Windows). Sans cela, le fichier est livré en CRLF
+# localement : les outils de vérification signalent alors 3 500 erreurs de retour chariot
+# qui masquent tout le reste, et un commit fait depuis un outil qui ne normalise pas
+# enverrait un script inexécutable sur le Pi.
+*           text=auto eol=lf
+*.sh        text eol=lf
+
+# Captures d'écran du README : jamais de conversion.
+*.png       binary
+*.jpg       binary
+*.gif       binary
