@@ -89,6 +89,24 @@ function findAll(e, tag) {
   return out;
 }
 
+/* Pose une valeur sur l objet global, quelle que soit la version de node.
+   Depuis node 21, « navigator » existe deja et n a qu un accesseur en lecture : une
+   simple affectation leve « Cannot set property navigator ». On passe donc par
+   defineProperty, et on renonce en silence si meme cela est refuse — le code teste
+   s accommode de la valeur native. */
+function poser(nom, valeur) {
+  try {
+    global[nom] = valeur;
+    if (global[nom] === valeur) { return true; }
+  } catch (e) { /* propriete en lecture seule : on tente defineProperty */ }
+  try {
+    Object.defineProperty(global, nom, {value: valeur, writable: true, configurable: true});
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function install(ids) {
   var registry = Object.create(null);
   (ids || []).forEach(function (id) { registry[id] = makeEl("div"); registry[id].id = id; });
@@ -110,25 +128,26 @@ function install(ids) {
     addEventListener: function () {},
     removeEventListener: function () {}
   };
-  global.document = doc;
-  global.window = {
+  poser("document", doc);
+  const fenetre = {
     addEventListener: function () {}, removeEventListener: function () {},
     matchMedia: function () { return {matches: false, addEventListener: function () {}, addListener: function () {}}; },
     location: {href: "", pathname: "/", reload: function () {}},
     navigator: {clipboard: {writeText: function () { return Promise.resolve(); }}},
     setTimeout: setTimeout, setInterval: function () { return 0; }
   };
-  global.location = global.window.location;
-  global.navigator = global.window.navigator;
-  global.localStorage = {
+  poser("window", fenetre);
+  poser("location", fenetre.location);
+  poser("navigator", fenetre.navigator);
+  poser("localStorage", {
     _d: Object.create(null),
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; },
     setItem: function (k, v) { this._d[k] = String(v); },
     removeItem: function (k) { delete this._d[k]; }
-  };
-  global.fetch = function () { return Promise.reject(new Error("aucun reseau dans les tests")); };
+  });
+  poser("fetch", function () { return Promise.reject(new Error("aucun reseau dans les tests")); });
   /* setInterval neutralise : le code du panneau en installe un au chargement. */
-  global.setInterval = function () { return 0; };
+  poser("setInterval", function () { return 0; });
   return {doc: doc, registry: registry};
 }
 

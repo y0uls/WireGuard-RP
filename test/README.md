@@ -29,6 +29,20 @@ qui rend le contrôle des fins de ligne inopérant.
 docker run --rm -v "$PWD:/repo" debian:12-slim bash -c "apt-get -qq update && apt-get -qq install -y shellcheck >/dev/null && bash /repo/test/run-all.sh /repo/wg-pi.sh"
 ```
 
+## Reproduire l'intégration continue avant de déposer
+
+Les tests passent facilement sur une machine confortable et échouent sur le runner, qui
+diffère sur trois points : **Node 22** (et non 18), un utilisateur **non privilégié**, et
+**`sshd` installé**. Les trois ont déjà causé des échecs. Pour rejouer la CI à l'identique :
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" node:22-bookworm-slim bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null && apt-get -qq install -y --no-install-recommends shellcheck python3 iproute2 openssh-server >/dev/null && useradd -m runner && mkdir -p /src && cp -r /repo/wg-pi.sh /repo/test /src/ && chown -R runner /src && su runner -c "cd /src && for t in helpers access cli-access engine apply json ui role detect-reachability firewall heredoc; do bash ./test/\$t.sh >/dev/null 2>&1 && echo \"OK   \$t\" || echo \"ECHEC \$t\"; done"'
+```
+
+Règle qui en découle : **un test ne doit jamais dépendre de ce qui est installé sur la
+machine qui l'exécute.** Si un test a besoin qu'une commande soit absente, il doit
+neutraliser la fonction qui l'appelle, pas espérer que la machine soit nue.
+
 ## Ajouter un cas à `detect-reachability.sh`
 
 Une ligne suffit, les colonnes sont alignées sur le commentaire d'en-tête du tableau :
