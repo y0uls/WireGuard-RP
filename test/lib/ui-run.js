@@ -135,9 +135,15 @@ eq("note masquée sans port", r.listen.hidden, true);
 eq("protocole any", app.fluxTexte(F("x", "internet", "Internet")), "tout");
 eq("protocole et ports", app.fluxTexte(F("x", "internet", "I", "tcp", "443")), "tcp 443");
 eq("sens deux signalé", app.fluxTexte(F("x", "grp:a", "A", "any", "", "deux")), "tout ⇄");
-eq("rang internet", app.destRang("internet"), 1);
-eq("rang ressource", app.destRang("res:nas"), 4);
-eq("rang groupe", app.destRang("grp:a"), 5);
+/* Ce qui compte est l ORDRE des colonnes, pas la valeur des rangs : fixer les nombres
+   faisait echouer trois tests au seul ajout d une destination, sans qu aucun
+   comportement visible ait change. */
+eq("les colonnes vont du plus large au plus precis",
+   ["grp:a", "res:nas", "pi", "maison", "internet", "tout"]
+     .sort(function (x, y) { return app.destRang(x) - app.destRang(y); }).join(" "),
+   "tout internet maison pi res:nas grp:a");
+eq("une destination inconnue ne casse pas le tri",
+   typeof app.destRang("quelque-chose"), "number");
 
 /* --- robustesse : un état incomplet ne doit pas faire planter le panneau ---- */
 try {
@@ -508,6 +514,35 @@ app.ouvrirAjoutMembre({id: "g", libelle: "Groupe", appareils: ["telephone"]});
 const proposes = stub.findAll(env.doc.getElementById("dlg-body"), "OPTION")
   .map(function (o) { return o.value; }).sort().join(",");
 eq("un appareil au nom hérité du prototype est proposé", proposes, "constructor,toString");
+
+/* --- le formulaire de regle ------------------------------------------------- */
+app.setState({
+  acces: {groupes: [G("admin", "Administration", ["telephone"])],
+          ressources: [{id: "nas", libelle: "Le NAS", cible: "192.168.1.20"}]},
+  peers: [{name: "telephone"}], server: {}, time: 4
+});
+app.ouvrirNouvelleRegle();
+const corps = env.doc.getElementById("dlg-body");
+function selParId(id) {
+  return stub.findAll(corps, "SELECT").filter(function (s) { return s.id === id; })[0];
+}
+const dst = selParId("reg-dst");
+/* Donner tous les droits a un groupe demandait quatre regles, a completer a chaque
+   nouveau groupe. « Tout le trafic » les remplace, et reprend le mot employe a la
+   creation d un appareil. */
+eq("« Tout le trafic » est proposé en premier", dst.children[0].value, "tout");
+eq("et porte le même libellé qu à la création d un appareil",
+   dst.children[0].textContent, "Tout le trafic");
+
+/* Un champ inopérant SANS explication adjacente se lit comme une panne : c est
+   exactement ce qui a ete signale a l usage. */
+const sens = selParId("reg-sens");
+eq("le sens est inopérant hors destination « Groupe »", sens.disabled, true);
+contient("et il dit pourquoi, juste en dessous de lui",
+         stub.textOf(sens.parentNode.children[2]), "Groupe");
+const ports = stub.findAll(corps, "INPUT").filter(function (i) { return i.id === "reg-ports"; })[0];
+eq("les ports sont inopérants sans TCP ni UDP", ports.disabled, true);
+contient("et le disent aussi", stub.textOf(ports.parentNode.children[2]), "TCP");
 
 console.log("");
 console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");

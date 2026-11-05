@@ -77,7 +77,12 @@ wg-pi access allow famille maison >/dev/null 2>&1
 wg-pi access allow famille res:nas --proto=tcp --ports=445,5000-5001 >/dev/null 2>&1
 wg-pi access allow invites internet >/dev/null 2>&1
 wg-pi access allow famille grp:famille --sens=deux >/dev/null 2>&1
-eq "cinq regles enregistrees" "$(wg-pi access list 2>/dev/null | grep -cE '^   p[0-9]')" "5"
+# Un groupe d administration qui joint TOUT, en une seule regle. Pose ici pour que l essai
+# a blanc le soumette a un VRAI noyau : c est la seule preuve que « -d 0.0.0.0/0 » passe.
+wg-pi group add admin --libelle="Administration" >/dev/null 2>&1
+wg-pi group join pc-salon admin >/dev/null 2>&1
+wg-pi access allow admin tout >/dev/null 2>&1
+eq "six regles enregistrees" "$(wg-pi access list 2>/dev/null | grep -cE '^   p[0-9]')" "6"
 eq "le mode reste ouvert : rien n est applique" "$(bash -c "source <(head -n -1 $WG); load_settings; access_mode")" "ouvert"
 eq "aucune chaine du moteur avant activation" "$(iptables -S | grep -c '^-N WGPI')" "0"
 
@@ -105,6 +110,10 @@ eq "/run garde ses droits normaux" "$(stat -c %a /run)" "755"
 eq "l instantane a son propre dossier, prive" "$(stat -c %a /run/wg-pi)" "700"
 LOAD="source <(head -n -1 $WG); load_settings"
 eq "etat lu dans le noyau" "$(bash -c "$LOAD; access_kernel_state")" "actif"
+# iptables normalise « -d 0.0.0.0/0 » en l effacant : la regle du groupe admin apparait
+# donc SANS aucune contrainte, ce qui est exactement le sens voulu.
+eq "la regle tout est posee, sans restriction" \
+   "$(iptables -S | grep -cE '^-A WGPI-S-admin-[AB] -m comment --comment "?wgpi:pol:[A-Za-z0-9]+"? -j ACCEPT')" "1"
 eq "le saut est en premiere position" "$(bash -c "$LOAD; access_jump_first && echo oui || echo non")" "oui"
 eq "l acceptation generale a disparu" "$(iptables -S FORWARD | grep -c '^-A FORWARD -i wg0 -j ACCEPT')" "0"
 ge "les chaines du moteur sont posees" "$(iptables -S | grep -c '^-N WGPI')" "6"

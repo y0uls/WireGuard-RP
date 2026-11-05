@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.4.0"
+readonly WGPI_VERSION="1.5.0"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -1343,6 +1343,7 @@ access_group_devices() {
 # Libellé lisible d'une destination de règle.
 access_dest_label() {
   case ${1-} in
+    tout)     echo "Tout le trafic" ;;
     internet) echo "Internet" ;;
     maison)   echo "Le réseau de la maison (${LAN_NET:-?})" ;;
     pi)       echo "Le Raspberry Pi lui-même" ;;
@@ -1434,7 +1435,7 @@ access_valid_two_way() {   # <sens> <destination>
 # ici on ne juge que la syntaxe.
 access_valid_dest() {
   case ${1-} in
-    internet|maison|pi) return 0 ;;
+    tout|internet|maison|pi) return 0 ;;
     res:*) access_valid_id "${1#res:}" ;;
     grp:*) access_valid_id "${1#grp:}" ;;
     *) return 1 ;;
@@ -3135,6 +3136,14 @@ access_match_dest() {   # <destination>
         [[ -n $ip ]] && echo "-o $WG_IF -d $ip"
       done < <(access_group_devices "${d#grp:}")
       ;;
+    tout)
+      # Aucune contrainte de destination ni d'interface : tout ce que le Pi achemine pour
+      # ce groupe passe — Internet, la maison, les autres appareils du VPN. « -d 0.0.0.0/0 »
+      # plutôt qu'une chaîne vide, parce que l'émetteur ignore les lignes vides, et plutôt
+      # que « -o + » parce que tous les iptables ne l'acceptent pas.
+      # L'accès au Pi lui-même est ajouté à part, dans la chaîne INPUT.
+      echo "-d 0.0.0.0/0"
+      ;;
     pi)
       # Joindre le Pi lui-même relève de la chaîne INPUT, pas de FORWARD : rien à émettre
       # ici. access_rules_plan s'en occupe à part.
@@ -3243,7 +3252,7 @@ access_rules_plan() {
         [[ ${psrc#grp:} == "$gid" ]] || continue
         : "$psens"   # utilise plus bas, dans la passe « deux sens »
         case $pdst in
-          internet) (( rank == 1 )) || continue ;;
+          tout|internet) (( rank == 1 )) || continue ;;
           maison|res:*) (( rank == 2 )) || continue ;;
           grp:*) (( rank == 3 )) || continue ;;
           pi) continue ;;   # traité dans INPUT
@@ -3291,7 +3300,9 @@ access_rules_plan() {
   while IFS='|' read -r pid pact psrc pdst pproto pports _ _; do
     [[ -n $pid ]] || continue
     [[ $pact == 1 ]] || continue
-    [[ $pdst == pi ]] || continue
+    # « tout » inclut le Pi : sinon « accès à tout » serait un mensonge sur le seul point
+    # que l'utilisateur vérifie en premier, le panneau web ou SSH.
+    [[ $pdst == pi || $pdst == tout ]] || continue
     frag=$(access_match_proto "$pproto" "$pports")
     while read -r name; do
       [[ -n $name ]] || continue
@@ -3670,7 +3681,7 @@ access_dns_blocked_groups() {
     access_rows POLICY | awk -F'|' -v g="grp:$gid" '$2 == 1 && $3 == g { print $4 }' |
       while read -r d; do
         case $d in
-          maison) echo couvert; break ;;
+          tout|maison) echo couvert; break ;;
           res:*) is_ipv4 "$(access_res_target "${d#res:}")" &&
                  cidr_overlap "$dns/32" "$(access_res_target "${d#res:}")/32" && { echo couvert; break; } ;;
         esac
@@ -4200,7 +4211,7 @@ cmd_access() {
       dst=${1-}; [[ -n $dst ]] && shift
       [[ -n $src && -n $dst ]] ||
         die "Usage : wg-pi access allow <groupe> <destination> [--proto=tcp] [--ports=445,5000-5001] [--sens=deux] [--libelle=\"...\"]
-Destinations : internet, maison, pi, res:<ressource>, grp:<groupe>"
+Destinations : tout, internet, maison, pi, res:<ressource>, grp:<groupe>"
       for a in "$@"; do
         v=$(opt_value "$a" proto);   [[ -n $v ]] && proto=$v
         v=$(opt_value "$a" ports);   [[ -n $v ]] && ports=$v
@@ -4343,7 +4354,7 @@ NEW_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")  # pas de « - » e
 # Identifiants et destinations des règles. Jamais de « - » en tête : wg-pi recevrait
 # l'argument comme une option. Les motifs reprennent ceux du script, volontairement.
 ACCES_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
-DEST_RE = re.compile(r"internet|maison|pi|(?:res|grp):[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
+DEST_RE = re.compile(r"tout|internet|maison|pi|(?:res|grp):[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
 PORTS_RE = re.compile(r"[0-9]{1,5}(?:-[0-9]{1,5})?(?:,[0-9]{1,5}(?:-[0-9]{1,5})?)*")
 CIBLE_RE = re.compile(r"[0-9a-fA-F:.]{2,45}(?:/[0-9]{1,3})?")
 REGLE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")
@@ -4808,6 +4819,8 @@ dialog::backdrop{background:rgba(10,12,16,.55)}
 input[type=text],input[type=password]{width:100%;height:40px;padding:0 12px;border:1px solid var(--line);border-radius:10px;
 background:var(--soft);color:var(--text);font:inherit}
 input[type=text]:focus,input[type=password]:focus,select:focus,.search:focus-within{outline:2px solid var(--accent);outline-offset:1px}
+input:disabled,select:disabled{opacity:.5;cursor:not-allowed}
+input:disabled+.hint,select:disabled+.hint{color:var(--muted)}
 .form .hint{margin:6px 0 14px}
 .choices{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .choice{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid var(--line);border-radius:12px;cursor:pointer}
@@ -5425,6 +5438,7 @@ APP_JS = r"""
       renderConfirmation: renderConfirmation,
       majBascule: majBascule,
       ouvrirAjoutMembre: ouvrirAjoutMembre,
+      ouvrirNouvelleRegle: ouvrirNouvelleRegle,
       renderMap: renderMap,
       openAcces: openAcces,
       fluxSortants: fluxSortants,
@@ -5445,10 +5459,11 @@ APP_JS = r"""
   /* Le panneau n'évalue RIEN : il affiche ce que « wg-pi json » a déjà résolu. Dupliquer
      ici l'évaluation des règles ferait dériver les deux implémentations, et la vue
      finirait par annoncer un cloisonnement que le pare-feu n'applique pas. */
-  var DEST_RANG = {internet: 1, maison: 2, pi: 3};
+  /* Les rangs commencent à 1 : « if (DEST_RANG[d]) » tiendrait un 0 pour absent. */
+  var DEST_RANG = {tout: 1, internet: 2, maison: 3, pi: 4};
   function destRang(d) {
     if (DEST_RANG[d]) { return DEST_RANG[d]; }
-    return d.indexOf("res:") === 0 ? 4 : 5;
+    return d.indexOf("res:") === 0 ? 5 : 6;
   }
   function fluxTexte(f) {
     var t = f.proto === "any" ? "tout" : f.proto;
@@ -6010,10 +6025,14 @@ APP_JS = r"""
     inp.spellcheck = false; inp.setAttribute("autocapitalize", "off");
     if (gabarit) { inp.pattern = gabarit; }
     enveloppe.append(lab, inp);
-    if (aide) { enveloppe.append(el("div", "hint", aide)); }
-    return {bloc: enveloppe, input: inp};
+    /* L'aide est créée même vide : c'est elle qui portera l'explication quand le champ
+       devient inopérant. Une explication en bas du formulaire laisse le champ mort sans
+       raison visible à côté de lui. */
+    var h = el("div", "hint", aide || "");
+    enveloppe.append(h);
+    return {bloc: enveloppe, input: inp, aide: h};
   }
-  function liste(id, libelle, options, valeur) {
+  function liste(id, libelle, options, valeur, aide) {
     var enveloppe = el("div"), lab = el("label", "field", libelle), sel = el("select");
     lab.htmlFor = id; sel.id = id;
     options.forEach(function (o) {
@@ -6023,7 +6042,9 @@ APP_JS = r"""
       sel.append(op);
     });
     enveloppe.append(lab, sel);
-    return {bloc: enveloppe, select: sel};
+    var h = el("div", "hint", aide || "");
+    enveloppe.append(h);
+    return {bloc: enveloppe, select: sel, aide: h};
   }
 
   function ouvrirNouveauGroupe() {
@@ -6080,7 +6101,10 @@ APP_JS = r"""
   }
 
   function destinationsPossibles() {
-    var out = [{valeur: "internet", texte: "Internet"},
+    /* « Tout le trafic » en tête, et dans les mots employés à la création d'un appareil :
+       deux vocabulaires pour la même idée obligeraient à traduire mentalement. */
+    var out = [{valeur: "tout", texte: "Tout le trafic"},
+               {valeur: "internet", texte: "Internet"},
                {valeur: "maison", texte: "Le réseau de la maison"},
                {valeur: "pi", texte: "Le Pi lui-même"}];
     (acces().ressources || []).forEach(function (r) {
@@ -6111,30 +6135,35 @@ APP_JS = r"""
       ports.input.maxLength = 120;   /* le corps des requêtes est borné à 4096 octets */
       var sens = liste("reg-sens", "Sens", [
         {valeur: "aller", texte: "Aller simple : la source appelle"},
-        {valeur: "deux", texte: "Les deux sens (entre groupes seulement)"}
-      ], "aller");
+        {valeur: "deux", texte: "Les deux sens"}
+      ], "aller", "");
       var lib = champ("reg-lib", "Libellé affiché", "Facultatif.", "");
       lib.input.maxLength = 60;
       var grille = el("div", "grid-form");
       grille.append(src.bloc, dst.bloc, proto.bloc, ports.bloc, sens.bloc);
-      var note = el("div", "hint");
-      /* « deux sens » n'a de sens qu'entre groupes : vers Internet ou la maison, le
-         retour ne repasse pas par le VPN et wg-pi ne peut rien en promettre. */
+      /* Deux champs dépendent des autres. Plutôt que de les laisser inertes sans
+         explication — ce qui se lit comme une panne — chacun dit JUSTE EN DESSOUS de
+         lui-même pourquoi il ne répond pas, et à quelle condition il répondra. */
       function majSens() {
         var versGroupe = dst.select.value.indexOf("grp:") === 0;
         sens.select.disabled = !versGroupe;
         if (!versGroupe) { sens.select.value = "aller"; }
+        sens.aide.textContent = versGroupe
+          ? "Les deux sens : chacun des deux groupes peut appeler l autre."
+          : "Réservé aux destinations « Groupe ». Ailleurs, le trafic de retour ne repasse pas "
+            + "par le VPN : il dépend de votre box, et wg-pi ne peut rien en promettre.";
         var avecPorts = proto.select.value === "tcp" || proto.select.value === "udp";
         ports.input.disabled = !avecPorts;
         if (!avecPorts) { ports.input.value = ""; }
-        note.textContent = versGroupe ? "" :
-          "Les deux sens ne sont proposés qu entre groupes : ailleurs, le trafic de retour ne passe pas par le VPN.";
+        ports.aide.textContent = avecPorts
+          ? "Exemples : 445 ou 445,5000-5001. Laissez vide pour tous les ports."
+          : "Choisissez d abord TCP ou UDP : les autres protocoles n ont pas de ports.";
       }
       dst.select.addEventListener("change", majSens);
       proto.select.addEventListener("change", majSens);
       majSens();
       var err = errorBox(), act = actionsBar("Annuler", "Créer la règle", "primary");
-      f.append(grille, note, lib.bloc, err, act.bar);
+      f.append(grille, lib.bloc, err, act.bar);
       f.addEventListener("submit", function (e) {
         e.preventDefault();
         if (act.ok.disabled) { return; }

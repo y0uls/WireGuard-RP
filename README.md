@@ -17,6 +17,11 @@ et vous accompagne jusqu'à l'ouverture du port sur votre box.
 curl -fsSL https://raw.githubusercontent.com/y0uls/WireGuard-RP/main/wg-pi.sh | sudo bash
 ```
 
+<img src="docs/panneau-appareils.png" width="820"
+     alt="Le panneau web de wg-pi : chaque appareil sur une ligne, avec son débit en direct">
+
+<sub>Le panneau web, servi par le Pi lui-même. Aucun service en ligne, aucun compte.</sub>
+
 </div>
 
 ---
@@ -288,14 +293,22 @@ recherche et tri.
 vos **ressources** : le NAS, une imprimante, la box… nommées une fois pour leur donner accès
 ensuite.
 
+![L'onglet Groupes : trois groupes d'appareils et trois ressources de la maison](docs/panneau-groupes.png)
+
 **Accès** — le tableau de ce que chaque groupe peut joindre et sur quels ports, les cases
 hachurées signalant ce qui n'est pas autorisé ; la liste des règles une par une, avec leur
 suppression ; et le bouton qui **active ou coupe le filtrage**, avec le même filet de
 sécurité qu'en ligne de commande (voir [Qui peut joindre quoi](#qui-peut-joindre-quoi)).
 
+![L'onglet Accès : la matrice des droits et la liste des règles](docs/panneau-acces.png)
+
 **Carte** — vos appareils à gauche, le Pi au centre, ce qu'ils peuvent joindre à droite. Le
 trait reliant chaque appareil au Pi **s'anime au rythme de son débit réel**. Un clic sur un
-appareil ou une destination n'affiche plus que ce qui le concerne.
+appareil ou une destination n'affiche plus que ce qui le concerne — le tracé traverse le Pi
+et continue jusqu'aux destinations autorisées, pour répondre à « et ensuite, qu'est-ce qu'il
+atteint ? ».
+
+![L'onglet Carte : un appareil sélectionné, et tout ce qu'il peut joindre](docs/panneau-carte.png)
 
 **Serveur** — la clé publique (copiable), le port, le DNS, l'IPv6, le keepalive, le réseau de
 la maison, la version. L'essentiel — adresse publique, réseau du VPN, appareils connectés —
@@ -508,8 +521,32 @@ penser.
 | `sudo wg-pi access on` · `confirm` · `off` | activer, confirmer, désactiver |
 | `sudo wg-pi access check` | vérifier la cohérence |
 
-Les destinations possibles sont `internet`, `maison`, `pi` (les services du Pi lui-même),
-`res:<ressource>`, et `grp:<groupe>` pour laisser des appareils se joindre entre eux.
+Les destinations possibles :
+
+| Destination | Ce qu elle couvre |
+|---|---|
+| `tout` | **Tout le trafic** : Internet, la maison, le Pi, et les autres appareils du VPN |
+| `internet` | Internet seulement — ni la maison, ni les autres appareils |
+| `maison` | le réseau de la maison |
+| `pi` | les services du Pi lui-même |
+| `res:<ressource>` | une machine ou un réseau que vous avez nommé |
+| `grp:<groupe>` | les appareils d un groupe, pour qu ils se joignent entre eux |
+
+`tout` est le raccourci d un groupe d administration : une seule règle, qui reste juste
+quand vous ajoutez un groupe plus tard. Sans elle, il en faudrait quatre, et une de plus
+à chaque nouveau groupe.
+
+```bash
+sudo wg-pi group add admin --libelle="Administration"
+```
+
+```bash
+sudo wg-pi group join mon-portable admin
+```
+
+```bash
+sudo wg-pi access allow admin tout
+```
 
 | Option de `access allow` | Rôle |
 |---|---|

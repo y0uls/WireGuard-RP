@@ -187,6 +187,32 @@ hasnt "aucune chaine du tampon B"    "WGPI-FWD-B"
 LONG=$(grep -oE 'WGPI-[A-Za-z0-9_-]+' "$TMP/plan" | sort -u | awk '{ if (length($0) > 28) print }')
 if [[ -z $LONG ]]; then ok "tous les noms de chaines tiennent en 28 caracteres"; else ko "noms trop longs : $LONG"; fi
 
+echo "-- destination tout"
+# Donner tous les droits a un groupe d administration demandait quatre regles — internet,
+# maison, pi, et une par groupe — qu il aurait fallu completer a chaque nouveau groupe.
+# « tout » les remplace par une seule, qui ne contraint ni la destination ni l interface.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|filtre
+GROUP|admin|Administration
+GROUP|invites|Invites
+MEMBER|telephone|admin
+MEMBER|tablette-amis|invites
+POLICY|t1|1|grp:admin|tout|any||aller|Administration : tout
+POLICY|t2|1|grp:invites|maison|any||aller|Invites : la maison
+ACC
+plan B 1 > "$TMP/plan"
+has "tout : aucune contrainte de destination" "-A WGPI-S-admin-B -d 0.0.0.0/0"
+hasnt "tout : aucune contrainte d interface"  "-A WGPI-S-admin-B -o wg0"
+hasnt "tout : aucune exclusion"               "-A WGPI-S-admin-B !"
+# « Tout » doit inclure le Pi lui-meme : SSH et le panneau web sont la premiere chose
+# que l on verifie, et les trouver fermes ferait mentir le mot.
+has "tout ouvre aussi le Pi"                  "-A WGPI-IN-B -s 10.8.0.2"
+# Le trafic de masse en premier : la regle large doit preceder les regles etroites.
+before "tout precede les regles plus precises" "-d 0.0.0.0/0" "-A WGPI-S-invites-B -d 192.168.1.0/24"
+# Et il ne deborde pas sur les autres groupes.
+hasnt "les invites ne recoivent pas tout"     "-A WGPI-S-invites-B -d 0.0.0.0/0"
+
 echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))

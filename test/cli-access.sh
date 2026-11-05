@@ -250,5 +250,23 @@ silent cmd_group join telephone invites
 eq "deux groupes sont joints par une virgule" "$(run cmd_list | grep telephone | grep -cE 'famille,invites|invites,famille')" "1"
 
 echo
+echo "-- destination tout"
+# Donner tous les droits a un groupe d administration tenait en quatre regles — internet,
+# maison, pi, et une par groupe — qu il aurait fallu completer a chaque nouveau groupe.
+{
+  echo "V|1"
+  echo "MODE|ouvert"
+  echo "GROUP|admin|Administration"
+} > "$ACC"
+silent cmd_access allow admin tout
+eq "la regle tout est enregistree" "$(rows | grep -c '^POLICY.*|tout|')" "1"
+# Le meme mot qu a la creation d un appareil : deux vocabulaires pour la meme idee
+# obligeraient l utilisateur a traduire mentalement.
+eq "le libelle reprend le vocabulaire des appareils" "$(run cmd_access show | grep -c 'Tout le trafic')" "1"
+# « deux sens » reste reserve aux groupes : ailleurs le retour ne repasse pas par le VPN.
+eq "les deux sens sont refuses vers tout" "$(runok cmd_access allow admin tout --sens=deux)" non
+eq "une destination inventee reste refusee" "$(runok cmd_access allow admin partout)" non
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))
