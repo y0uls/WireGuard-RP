@@ -117,7 +117,17 @@ case "$*" in *is-active*) exit 1 ;; esac
 exit 0
 SCTL
 chmod +x "$BIN/systemd-run" "$BIN/systemctl"
-cp "$BIN/iptables" "$BIN/iptables-save"
+# iptables-save doit rendre quelque chose : un instantane vide fait echouer la prise
+# d instantane, et l application refuse alors d armer son filet de securite. Un Pi qui
+# fonctionne rend toujours au moins les chaines par defaut.
+cat > "$BIN/iptables-save" <<'SAVE'
+#!/bin/sh
+echo "save $*" >> "$IPT_DIR/ipt.log"
+# Echec provoque, pour verifier le refus d armer un filet inexistant.
+[ -f "$IPT_DIR/save.fail" ] && exit 1
+printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' ':FORWARD ACCEPT [0:0]' ':OUTPUT ACCEPT [0:0]' 'COMMIT'
+SAVE
+chmod +x "$BIN/iptables-save"
 cp "$BIN/iptables" "$BIN/iptables-restore"
 export IPT_DIR=$TMP
 export PATH="$BIN:$PATH"
@@ -348,6 +358,82 @@ POLICY|p1|1|grp:invites|internet|any||aller|Internet
 POLICY|p2|1|grp:invites|maison|any||aller|La maison
 ACC
 eq "acces a la maison : aucun avertissement" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_groups | wc -l)" "0"
+echo
+echo "-- modification, reapplication, et coherence du filet"
+# Le critere n est pas « on reapplique » mais « la configuration a-t-elle change ».
+# Une reapplication a l identique ne doit rien redemander ; une modification, si.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|filtre
+GROUP|g|G
+POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert
+ACC
+
+reset
+rm -f "$TMP/save.fail"
+eq "--modifie retire la confirmation" \
+   "$(load; access_set_confirmed 1; cmd_access_apply --modifie >/dev/null 2>&1; access_confirmed && echo oui || echo non)" "non"
+
+reset
+eq "une reapplication a l identique la conserve" \
+   "$(load; access_set_confirmed 1; cmd_access_apply >/dev/null 2>&1; access_confirmed && echo oui || echo non)" "oui"
+
+# INVARIANT : un minuteur arme implique une configuration non confirmee. Sans lui, le
+# panneau web n afficherait pas son bandeau, personne ne confirmerait, et deux minutes
+# plus tard tout le cloisonnement tomberait — pour une simple modification de regle.
+reset
+( load; access_set_confirmed 0; cmd_access_apply ) >/dev/null 2>&1
+eq "minuteur arme : la configuration n est pas marquee confirmee" \
+   "$(load; access_confirmed && echo oui || echo non)" "non"
+
+# Sans instantane, le minuteur n aurait rien a restaurer : l armer donnerait un filet
+# qui n existe pas, et « access-rollback » affirmerait plus tard une restauration qui
+# n a pas eu lieu.
+reset
+: > "$TMP/save.fail"
+eq "sans instantane, l application refuse" \
+   "$(load; access_set_confirmed 0; cmd_access_apply 2>&1 | grep -c 'Instantané du pare-feu impossible')" "1"
+eq "et elle indique comment passer outre" \
+   "$(load; access_set_confirmed 0; cmd_access_apply 2>&1 | grep -c -- '--sans-filet')" "1"
+eq "--sans-filet applique quand meme" \
+   "$(load; access_set_confirmed 0; cmd_access_apply --sans-filet >/dev/null 2>&1; echo $?)" "0"
+rm -f "$TMP/save.fail"
+
+# « access on » refusait deja une configuration sans regle, mais il n est pas le seul
+# chemin : le panneau web reapplique apres CHAQUE ecriture, et supprimer la derniere
+# regle arrivait la sans garde-fou, coupant tous les appareils d un coup.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|filtre
+GROUP|g|G
+ACC
+reset
+eq "aucune regle : l application refuse" \
+   "$(load; cmd_access_apply 2>&1 | grep -c 'couperait tous vos appareils')" "1"
+eq "et rien n a ete bascule" "$(grep -cE -- '-I (FORWARD|INPUT)' "$TMP/ipt.log")" "0"
+
+# Un bandeau de confirmation que rien ne peut faire disparaitre serait pire qu absent :
+# « confirm » rattrape un etat enregistre en retard sur la realite.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|filtre
+GROUP|g|G
+POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert
+ACC
+reset
+rm -f "$TMP/snap"
+eq "confirm rattrape un filtrage actif non marque" \
+   "$(load; access_set_confirmed 0; cmd_access_confirm >/dev/null 2>&1; access_confirmed && echo oui || echo non)" "oui"
+
+# atomic_write ne doit jamais laisser son temporaire : il sert aussi a ecrire wg0.conf,
+# qui contient la cle privee du serveur.
+( load; echo contenu | atomic_write "$TMP/etc/essai.txt" 600 )
+eq "atomic_write ecrit le fichier" "$(cat "$TMP/etc/essai.txt" 2>/dev/null)" "contenu"
+eq "et ne laisse aucun temporaire" "$(find "$TMP/etc" -maxdepth 1 -name '.essai.txt.*' | wc -l)" "0"
+( load; echo contenu | atomic_write "$TMP/etc/sous-dossier-absent/x" 600 ) 2>/dev/null
+eq "un chemin impossible ne laisse rien derriere" \
+   "$(find "$TMP/etc" -maxdepth 1 -name '.x.*' | wc -l)" "0"
+
 echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))

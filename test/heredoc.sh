@@ -79,6 +79,16 @@ if command -v node >/dev/null 2>&1; then
       ko "node --check $(basename "$js") :"; sed 's/^/       /' "$TMP/err"
     fi
   done
+
+  # Deux fonctions de meme nom dans la meme portee : la seconde ecrase la premiere, en
+  # silence. « node --check » ne voit rien, et les appels ecrits pour la premiere partent
+  # avec la mauvaise signature.
+  if node ./lib/doublons.js "$TMP"/*.js >"$TMP/dbl" 2>&1; then
+    ok "aucune fonction déclarée deux fois dans la même portée"
+  else
+    ko "fonction déclarée deux fois (la seconde écrase la première) :"
+    sed "s/^/       /" "$TMP/dbl"
+  fi
 else
   echo "  --   node absent, vérification du JavaScript ignorée"
 fi

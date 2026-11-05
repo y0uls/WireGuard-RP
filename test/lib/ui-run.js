@@ -228,22 +228,56 @@ eq("débit en ko/s", app.humanRate(45000), "45 ko/s");
 eq("débit en o/s", app.humanRate(300), "300 o/s");
 
 /* --- mode focus ------------------------------------------------------------ */
-const noeudDev = stub.findAll(svgs[0], "G").filter(function (g) {
-  return g.getAttribute("data-dev") === "telephone";
-})[0];
-app.mapClick(noeudDev);
+/* Le focus doit suivre le CHEMIN COMPLET. Les liens de gauche portent « data-dev »,
+   ceux de droite « data-grp » et « data-dest » : une mise en evidence qui ne filtre que
+   sur l attribut du type clique s arrete au Pi, et laisse croire que la question
+   « et ensuite, qu est-ce qu il atteint ? » n a pas de reponse. */
+function noeudCarte(svg, attr, val) {
+  return stub.findAll(svg, "G").filter(function (g) { return g.getAttribute(attr) === val; })[0];
+}
+function vueFocus() {
+  const s = stub.findAll(env.doc.getElementById("map-box"), "SVG")[0];
+  function marques(liste) {
+    return liste.filter(function (e) { return (e.getAttribute("class") || "").indexOf("sel") >= 0; });
+  }
+  return {svg: s, liens: marques(stub.findAll(s, "PATH")), noeuds: marques(stub.findAll(s, "G"))};
+}
+
+app.mapClick(noeudCarte(svgs[0], "data-dev", "telephone"));
 eq("le focus est mémorisé", app.mapFocusKey(), "dev:telephone");
-box = env.doc.getElementById("map-box");
-svgs = stub.findAll(box, "SVG");
-contient("le SVG passe en mode focus", svgs[0].getAttribute("class"), "focus");
-const selectionnes = stub.findAll(svgs[0], "PATH").filter(function (l) {
-  return (l.getAttribute("class") || "").indexOf("sel") >= 0;
-});
-eq("seul le lien de l appareil est sélectionné", selectionnes.length, 1);
+let vf = vueFocus();
+contient("le SVG passe en mode focus", vf.svg.getAttribute("class"), "focus");
+/* « telephone » est dans « confiance », qui mene a Internet et au NAS : son lien vers le
+   Pi, plus ces deux regles. */
+eq("le chemin ne s arrête pas au Pi", vf.liens.length, 3);
+eq("les destinations joignables sont allumées",
+   vf.noeuds.filter(function (g) { return g.getAttribute("data-dest"); })
+     .map(function (g) { return g.getAttribute("data-dest"); }).sort().join(","),
+   "internet,res:nas");
+/* Un lien de politique n est retenu que si SES DEUX bouts le sont : sinon, selectionner
+   un appareil allumerait la regle d un AUTRE groupe vers la meme destination, et
+   donnerait a lire un droit qu il n a pas. */
+eq("la règle de l autre groupe reste éteinte",
+   vf.liens.filter(function (l) { return l.getAttribute("data-grp") === "invites"; }).length, 0);
+eq("l appareil d un autre groupe reste éteint",
+   vf.liens.filter(function (l) { return l.getAttribute("data-dev") === "tablette"; }).length, 0);
 /* « sel » et non « on » : « on » marque deja les appareils connectes. */
-eq("le marqueur de focus n est pas « on »", selectionnes[0].getAttribute("class").indexOf(" on") , -1);
-app.mapClick(noeudDev);
+eq("le marqueur de focus n est pas « on »", vf.liens[0].getAttribute("class").indexOf(" on"), -1);
+app.mapClick(noeudCarte(vf.svg, "data-dev", "telephone"));
 eq("un second clic rétablit tout", app.mapFocusKey(), null);
+
+/* Symétrie : une destination montre QUI peut l atteindre. */
+svgs = stub.findAll(env.doc.getElementById("map-box"), "SVG");
+app.mapClick(noeudCarte(svgs[0], "data-dest", "internet"));
+eq("le focus retient la destination", app.mapFocusKey(), "dest:internet");
+vf = vueFocus();
+/* Deux groupes menent a Internet : les deux appareils, leurs liens vers le Pi, et les
+   deux regles. */
+eq("les deux appareils et leurs règles", vf.liens.length, 4);
+eq("la règle vers le NAS reste éteinte",
+   vf.liens.filter(function (l) { return l.getAttribute("data-dest") === "res:nas"; }).length, 0);
+app.mapClick(noeudCarte(vf.svg, "data-dest", "internet"));
+eq("un second clic rétablit tout (destination)", app.mapFocusKey(), null);
 
 /* --- cas limites ----------------------------------------------------------- */
 box = renderCarte(accesCarte, []);
@@ -255,6 +289,20 @@ try {
   ko("une carte sans règles lève : " + e.message);
 }
 eq("la légende est posée", env.doc.getElementById("map-legend").hidden, false);
+
+/* La légende ne doit décrire que ce qui est à l'écran : sans règle, pas d'arête de
+   politique, donc pas un mot sur leur épaisseur ni leurs pointillés. */
+renderCarte({mode: "ouvert", noyau: "inactif", groupes: [], ressources: [], ecoute: []}, pairs);
+const legSansRegle = env.doc.getElementById("map-legend").textContent;
+contient("sans règle, la légende annonce la colonne vide", legSansRegle, "se remplira");
+eq("sans règle, elle ne parle pas de trait épais", legSansRegle.indexOf("trait épais"), -1);
+eq("sans règle, elle ne parle pas de pointillé", legSansRegle.indexOf("pointillé"), -1);
+contient("elle parle quand même du débit", legSansRegle, "débit réel");
+
+renderCarte(accesCarte, pairs);
+const legAvecRegle = env.doc.getElementById("map-legend").textContent;
+contient("avec des règles, elle décrit le trait épais", legAvecRegle, "trait épais");
+contient("et le mode focus", legAvecRegle, "Cliquez");
 
 
 /* --- fiche d'accès d'un appareil ------------------------------------------- */
@@ -340,6 +388,126 @@ try {
 } catch (e) {
   ko("une fiche sans vue d'accès lève : " + e.message);
 }
+
+/* ---- Groupes, ressources, règles et bascule ---- */
+const accesGestion = {
+  mode: "filtre", noyau: "actif", confirme: false,
+  groupes: [
+    G("famille", "Ma famille", ["telephone", "tablette"],
+      [F("r1", "internet", "Internet"), F("r2", "res:nas", "Le NAS", "tcp", "445,5000-5001")]),
+    G("vide", "Groupe sans personne", []),
+    G("tous", "Tous les appareils", ["telephone"], [], true)
+  ],
+  ressources: [{id: "nas", libelle: "Le NAS", cible: "192.168.1.20"}],
+  ecoute: [22, 443]
+};
+const pairsGestion = [{name: "telephone"}, {name: "tablette"}, {name: "pc-bureau"}];
+
+function rendreGestion(acces, pairs) {
+  app.setState({acces: acces, peers: pairs || pairsGestion, server: {}, time: 1});
+  app.renderGroupes();
+  app.renderRegles();
+  app.renderConfirmation();
+  app.majBascule();
+  return {
+    groupes: env.doc.getElementById("grp-list"),
+    ressources: env.doc.getElementById("res-list"),
+    regles: env.doc.getElementById("acc-rules"),
+    bandeau: env.doc.getElementById("acc-confirm"),
+    bascule: env.doc.getElementById("acc-switch"),
+    cGrp: env.doc.getElementById("c-grp"),
+    cAcc: env.doc.getElementById("c-acc")
+  };
+}
+
+let v = rendreGestion(accesGestion);
+contient("le groupe est affiché avec son libellé", stub.textOf(v.groupes), "Ma famille");
+contient("ses appareils apparaissent", stub.textOf(v.groupes), "telephone");
+contient("un groupe vide le dit", stub.textOf(v.groupes), "aucun appareil");
+/* « tous » est automatique : on ne le propose ni à la suppression ni à l'ajout de membres. */
+eq("le groupe automatique n est pas listé", stub.textOf(v.groupes).indexOf("Tous les appareils"), -1);
+eq("compteur des groupes nommés", v.cGrp.textContent, "2");
+eq("compteur des règles", v.cAcc.textContent, "2");
+contient("la ressource montre son adresse", stub.textOf(v.ressources), "192.168.1.20");
+
+contient("la règle nomme sa destination", stub.textOf(v.regles), "Le NAS");
+contient("les ports sont lisibles", stub.textOf(v.regles), "TCP 445,5000-5001");
+contient("une règle sans port dit tous les ports", stub.textOf(v.regles), "tous les ports");
+eq("une ligne par règle", stub.findAll(v.regles, "DIV").filter(function (d) {
+  return d.className === "regle";
+}).length, 2);
+
+/* Le bandeau de confirmation se déduit de l'état du serveur, jamais d'une variable
+   locale : sinon il disparaîtrait au premier rechargement de page, alors que le
+   retour arrière automatique, lui, serait toujours armé. */
+eq("filtrage non confirmé : le bandeau s affiche", v.bandeau.hidden, false);
+contient("et il explique ce qui va se passer", stub.textOf(v.bandeau), "rétablira");
+eq("filtrage actif : la bascule propose de couper", v.bascule.textContent, "Couper le filtrage");
+
+v = rendreGestion(Object.assign({}, accesGestion, {confirme: true}));
+eq("filtrage confirmé : pas de bandeau", v.bandeau.hidden, true);
+
+v = rendreGestion(Object.assign({}, accesGestion, {mode: "ouvert"}));
+eq("sans filtrage : pas de bandeau", v.bandeau.hidden, true);
+eq("sans filtrage : la bascule propose d activer", v.bascule.textContent, "Activer le filtrage");
+
+v = rendreGestion({});
+contient("aucun groupe : le panneau le dit", stub.textOf(v.groupes), "Aucun groupe");
+contient("aucune ressource : le panneau le dit", stub.textOf(v.ressources), "Aucune ressource");
+contient("aucune règle : le panneau le dit", stub.textOf(v.regles), "Aucune règle");
+eq("compteurs vides plutôt que zéro", v.cGrp.textContent + "/" + v.cAcc.textContent, "/");
+
+/* --- ce que la relecture a corrigé ----------------------------------------- */
+const source = require("fs").readFileSync(APP, "utf8");
+
+/* /api/filtrage EXIGE une action : un corps vide lui fait répondre 400 « Action
+   inconnue. ». C'est ainsi que « Couper le filtrage » est resté mort — le seul moyen,
+   depuis le navigateur, de défaire un cloisonnement qui vous enferme. */
+let sansAction = 0, pos = -1;
+while ((pos = source.indexOf("/api/filtrage", pos + 1)) >= 0) {
+  if (source.slice(pos, pos + 180).indexOf("action") < 0) { sansAction += 1; }
+}
+eq("chaque appel à /api/filtrage porte une action", sansAction, 0);
+
+v = rendreGestion(accesGestion);
+const pastilles = stub.findAll(v.groupes, "SPAN").filter(function (s) {
+  return (s.className || "").indexOf("chip") >= 0;
+});
+/* « data-admin » masque l élément pour un compte de consultation. Posé sur la pastille
+   entière, il masquait le NOM de l appareil : les groupes apparaissaient vides, ce qui
+   est un mensonge et non une restriction. Il va sur le bouton de retrait. */
+eq("la pastille d appartenance reste visible en lecture seule",
+   pastilles.filter(function (s) { return s.getAttribute("data-admin") !== null; }).length, 0);
+eq("mais son bouton de retrait est réservé à l administrateur",
+   stub.findAll(v.groupes, "BUTTON").filter(function (b) {
+     return b.textContent === "×" && b.getAttribute("data-admin") !== null;
+   }).length > 0, true);
+
+/* Un rendu qui reconstruit son conteneur alors que rien n a changé vole le focus et
+   avale les clics : le relevé tourne toutes les deux secondes. */
+const avantRendu = v.groupes.children[0];
+app.renderGroupes();
+eq("un rendu identique ne reconstruit rien", v.groupes.children[0] === avantRendu, true);
+const avantRegles = v.regles.children[0];
+app.renderRegles();
+eq("idem pour les règles", v.regles.children[0] === avantRegles, true);
+app.setState({acces: Object.assign({}, accesGestion, {
+  groupes: accesGestion.groupes.concat([G("neuf", "Tout neuf", [])])
+}), peers: pairsGestion, server: {}, time: 2});
+app.renderGroupes();
+contient("mais un changement réel est bien redessiné", stub.textOf(v.groupes), "Tout neuf");
+
+/* Un objet littéral hérite de son prototype : « constructor » et « toString » y valent
+   une fonction, donc vrai. Un appareil portant ce nom n était jamais proposé. */
+app.setState({
+  acces: {groupes: [G("g", "Groupe", ["telephone"])], ressources: []},
+  peers: [{name: "telephone"}, {name: "constructor"}, {name: "toString"}],
+  server: {}, time: 3
+});
+app.ouvrirAjoutMembre({id: "g", libelle: "Groupe", appareils: ["telephone"]});
+const proposes = stub.findAll(env.doc.getElementById("dlg-body"), "OPTION")
+  .map(function (o) { return o.value; }).sort().join(",");
+eq("un appareil au nom hérité du prototype est proposé", proposes, "constructor,toString");
 
 console.log("");
 console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");

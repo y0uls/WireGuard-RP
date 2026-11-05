@@ -273,27 +273,35 @@ sudo wg-pi add nas-acces --split  # seulement l'accès au réseau de la maison
 
 ## Interface web
 
-Tout ce que fait la commande `wg-pi` pour les appareils est aussi possible depuis un navigateur,
-sur un ordinateur ou sur le téléphone :
+Tout ce que fait la commande `wg-pi` est aussi possible depuis un navigateur, sur un
+ordinateur ou sur le téléphone. Le panneau est rangé en cinq onglets.
 
-- **chaque appareil sur une ligne** : qui est connecté (point vert), d'où, depuis quand,
-  **débit en direct** (↓ ↑) avec sa courbe, totaux échangés ;
-- **un interrupteur pour couper ou rétablir l'accès** d'un appareil, sans le supprimer ;
-- **nouvel appareil** en deux clics, avec son **QR code** affiché aussitôt ;
-- **téléchargement du fichier `.conf`** pour un ordinateur, sans passer par `scp` ;
-- renommer et supprimer un appareil ;
-- recherche et tri des appareils ;
-- **état du serveur** : adresse publique, réseau, nombre d'appareils connectés, et en détail
-  la clé publique (copiable), le DNS, l'IPv6 et le keepalive ;
-- une vue **« Accès »** : un tableau qui montre, pour chaque groupe d'appareils, ce qu'il
-  peut joindre et sur quels ports, les cases hachurées signalant ce qui n'est pas autorisé ;
-- le **groupe de chaque appareil** sur sa ligne, et un bouton qui ouvre sa **fiche d'accès** :
-  ce qu'il peut joindre, ce qui peut le joindre, et sur quels ports — la réponse directe à
-  « qu'est-ce que la tablette des enfants peut atteindre ? » ;
-- une **carte** à trois colonnes — vos appareils, le Pi, ce qu'ils peuvent joindre — où le
-  trait reliant chaque appareil au Pi **s'anime au rythme de son débit réel**. Un clic sur un
-  appareil ou une destination n'affiche plus que ce qui le concerne ;
-- thème clair, sombre ou automatique, affichage adapté au téléphone.
+**Appareils** — chacun sur une ligne : qui est connecté (point vert), d'où, depuis quand,
+**débit en direct** (↓ ↑) sur fond de sa courbe, totaux échangés. Un interrupteur coupe ou
+rétablit son accès sans le supprimer ; un bouton ouvre sa **fiche d'accès** — ce qu'il peut
+joindre, ce qui peut le joindre, sur quels ports, la réponse directe à « qu'est-ce que la
+tablette des enfants peut atteindre ? ». Nouvel appareil en deux clics avec son **QR code**
+affiché aussitôt, téléchargement du `.conf` sans passer par `scp`, renommage, suppression,
+recherche et tri.
+
+**Groupes** — créez un groupe, mettez-y des appareils, retirez-les d'un clic. Déclarez aussi
+vos **ressources** : le NAS, une imprimante, la box… nommées une fois pour leur donner accès
+ensuite.
+
+**Accès** — le tableau de ce que chaque groupe peut joindre et sur quels ports, les cases
+hachurées signalant ce qui n'est pas autorisé ; la liste des règles une par une, avec leur
+suppression ; et le bouton qui **active ou coupe le filtrage**, avec le même filet de
+sécurité qu'en ligne de commande (voir [Qui peut joindre quoi](#qui-peut-joindre-quoi)).
+
+**Carte** — vos appareils à gauche, le Pi au centre, ce qu'ils peuvent joindre à droite. Le
+trait reliant chaque appareil au Pi **s'anime au rythme de son débit réel**. Un clic sur un
+appareil ou une destination n'affiche plus que ce qui le concerne.
+
+**Serveur** — la clé publique (copiable), le port, le DNS, l'IPv6, le keepalive, le réseau de
+la maison, la version. L'essentiel — adresse publique, réseau du VPN, appareils connectés —
+reste affiché en permanence au-dessus des onglets.
+
+Thème clair, sombre ou automatique, affichage adapté au téléphone.
 
 Pour l'activer, y compris sur une installation existante après `sudo wg-pi update` :
 
@@ -386,6 +394,11 @@ qu'ils n'atteignent pas le NAS.
 
 L'idée tient en trois mots : des **groupes** d'appareils, des **ressources** de la maison,
 et des **règles** qui disent qui peut joindre quoi.
+
+Tout ce qui suit se fait **aussi depuis le panneau web**, dans les onglets « Groupes » et
+« Accès » : créer un groupe, y mettre des appareils, déclarer une ressource, ajouter ou
+supprimer une règle, activer ou couper le filtrage. Les commandes restent utiles pour aller
+vite, ou quand le panneau n'est pas installé.
 
 Les règles portent sur ce qui **traverse** le Pi : le réseau de la maison, Internet, les
 autres appareils du VPN. Ce qui tourne **sur** le Pi — SSH, le panneau web, Pi-hole, un

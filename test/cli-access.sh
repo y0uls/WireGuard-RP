@@ -199,6 +199,27 @@ eq "check sort en échec" "$(runok cmd_access check)" non
 silent cmd_group add neuf
 eq "une écriture purge la référence morte" "$(rows | grep -c '^POLICY')" "0"
 
+# Une barre verticale dans un libelle de RESSOURCE decale la cible : « RES|<id>|<libelle>
+# |<cible> » place le libelle AU MILIEU. Toutes les ecritures de wg-pi la refusent, mais
+# un fichier edite a la main ou une sauvegarde ancienne peuvent encore en contenir une,
+# et la ressource designerait alors une AUTRE machine sans que rien ne change a l ecran.
+{
+  echo "V|1"
+  echo "MODE|ouvert"
+  echo "RES|nas|Le NAS|192.168.1.99|192.168.1.20"
+} > "$ACC"
+eq "check signale une cible decalee par un libelle" \
+   "$(run cmd_access check | grep -c "ni une adresse IP ni un réseau")" "1"
+eq "check refuse alors de se declarer satisfait" "$(runok cmd_access check)" non
+
+{
+  echo "V|1"
+  echo "MODE|ouvert"
+  echo "RES|nas|Le NAS|192.168.1.20"
+} > "$ACC"
+eq "une ressource saine ne declenche rien" "$(runok cmd_access check)" oui
+
+
 echo "-- le mode reste ouvert : aucun effet sur le trafic"
 eq "mode inchangé par toutes ces commandes" "$(run access_mode)" "ouvert"
 

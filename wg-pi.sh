@@ -55,7 +55,7 @@ readonly ACCESS_ALL="tous"      # identifiant du groupe virtuel « tous les appa
 readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 # Instantané du pare-feu et minuteur d'annulation : dans /run, donc effacés au
 # redémarrage — c'est voulu, un instantané périmé serait pire que pas d'instantané.
-readonly ACCESS_SNAP="/run/wg-pi-access-snapshot"
+readonly ACCESS_SNAP="/run/wg-pi/access-snapshot"
 readonly ACCESS_ROLLBACK_UNIT="wg-pi-access-rollback"
 # La confirmation, elle, doit SURVIVRE au redémarrage : dans STATE_DIR, pas dans /run.
 readonly ACCESS_CONFIRMED="$STATE_DIR/access-confirme"
@@ -301,7 +301,14 @@ atomic_write() {
   tmp=$(mktemp "$dir/.$(basename "$dest").XXXXXX") || return 1
   cat >"$tmp" || { rm -f "$tmp"; return 1; }
   [[ -s $tmp ]] || { rm -f "$tmp"; return 1; }   # un generateur en echec ne doit pas installer un fichier vide
-  chmod "$mode" "$tmp" && mv -f "$tmp" "$dest"
+  # Un chmod ou un mv en échec laisserait le temporaire sur place. Ce n'est pas
+  # seulement de l'encombrement : atomic_write sert aussi à écrire wg0.conf, qui
+  # contient la clé privée du serveur.
+  if ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
 }
 
 ago() {
@@ -729,8 +736,7 @@ case "$1" in
 esac
 exit 0
 EOF
-  } >"$FW_SCRIPT"
-  chmod 700 "$FW_SCRIPT"
+  } | atomic_write "$FW_SCRIPT" 700
 }
 
 # Génération du pare-feu actuellement installé, ou 0 s'il est absent ou antérieur au marqueur.
@@ -748,21 +754,57 @@ fw_installed_gen() {
 # l'ancien pare-feu et qu'aucune correction de règle n'atteignait jamais les installations
 # existantes.
 fw_sync() {
-  local cur
+  local cur sauve=""
   cur=$(fw_installed_gen)
   (( cur == FW_GEN )) && return 0
   info "Mise à jour des règles du pare-feu (génération $cur → $FW_GEN)…"
-  write_firewall_script || { fail "Impossible de régénérer $FW_SCRIPT."; return 1; }
+  # Le nouveau fichier porte la nouvelle génération DÈS SON ÉCRITURE. Si le
+  # rechargement échoue ensuite, le laisser en place ferait mentir « fw-sync » et
+  # « check », qui se croiraient à jour précisément quand il faut agir. On garde donc
+  # de quoi revenir à l'ancien.
+  if [[ -f $FW_SCRIPT ]]; then
+    sauve=$(mktemp) || sauve=""
+    # Un mktemp réussi suivi d'une copie en échec laisserait un fichier orphelin.
+    if [[ -n $sauve ]] && ! cp -p "$FW_SCRIPT" "$sauve" 2>/dev/null; then
+      rm -f "$sauve"
+      sauve=""
+    fi
+  fi
+  write_firewall_script || {
+    fail "Impossible de régénérer $FW_SCRIPT."
+    [[ -n $sauve ]] && rm -f "$sauve"
+    return 1
+  }
   if wg_running; then
     if "$FW_SCRIPT" reload; then
       ok "Règles du pare-feu rechargées."
     else
+      if [[ -n $sauve ]]; then
+        cp -p "$sauve" "$FW_SCRIPT" 2>/dev/null &&
+          info "Ancien pare-feu rétabli : « sudo wg-pi fw-sync » pourra réessayer."
+      fi
+      rm -f "$sauve"
       fail "Rechargement des règles impossible → sudo systemctl restart wg-quick@$WG_IF"
       return 1
     fi
   else
     ok "Règles du pare-feu régénérées (appliquées au prochain démarrage du VPN)."
   fi
+  [[ -n $sauve ]] && rm -f "$sauve"
+  return 0
+}
+
+# Une version de wg-pi antérieure à 1.4.0 rangeait son instantané directement dans /run
+# et lui appliquait « install -d -m 700 », ce qui revenait à faire « chmod 700 /run ».
+# Tout ce qui ne tourne pas en root s'en trouvait cassé : Docker sans privilèges, la
+# session de l'utilisateur, mDNS, la résolution de noms. On répare, et UNIQUEMENT quand
+# les droits valent exactement 700 — c'est-à-dire quand c'est bien nous qui les avons posés.
+repair_run_mode() {
+  local m
+  m=$(stat -c '%a' /run 2>/dev/null) || return 0
+  [[ $m == 700 ]] || return 0
+  chmod 755 /run 2>/dev/null &&
+    warn "Droits de /run remis à 755 : une version précédente de wg-pi les avait restreints à 700."
   return 0
 }
 
@@ -1326,6 +1368,17 @@ emit() { local x; for x in "$@"; do echo "$x"; done; }
 # d'appliquer les règles, et le fait qu'un identifiant se retrouve dans des noms de
 # chaînes. Les LIBELLÉS, eux, sont libres et accentués : ils passent par json_esc.
 access_valid_id() { valid_name "${1-}"; }
+# Un libelle est du texte libre, mais access.conf est un format a barres verticales, et
+# « RES|<id>|<libelle>|<cible> » place le libelle AU MILIEU : une barre y decalerait la
+# cible, et la ressource designerait alors une autre machine. On refuse donc la barre,
+# les caracteres de controle, et on borne la longueur.
+access_valid_label() {
+  local v=${1-}
+  (( ${#v} <= 60 )) || return 1
+  [[ $v == *"|"* ]] && return 1
+  [[ $v == *[[:cntrl:]]* ]] && return 1
+  return 0
+}
 
 access_valid_proto() {
   case ${1-} in any|tcp|udp|icmp) return 0 ;; *) return 1 ;; esac
@@ -2453,6 +2506,7 @@ cmd_uninstall() {
 cmd_update() {
   load_settings
   take_lock
+  repair_run_mode
   local tmp new old
   old=$(script_version "$BIN_PATH" 2>/dev/null)
   old=${old:-$WGPI_VERSION}
@@ -2862,12 +2916,17 @@ access_show() {
 
   # Les appareils qui ne sont dans aucun groupe nommé : utile à voir, parce qu'une fois le
   # filtrage actif ils ne dépendront plus que des règles portant sur « tous ».
+  #
+  # Mais seulement s'il EXISTE au moins un groupe nommé : sinon cette ligne répète mot pour
+  # mot la liste du groupe « tous » affichée juste au-dessus, et n'apprend rien.
   local orphans="" name
-  while read -r name _; do
-    [[ -n $name ]] || continue
-    [[ $(access_device_groups "$name" | grep -vc "^$ACCESS_ALL$") -eq 0 ]] && orphans="$orphans $name"
-  done < <(peers_table)
-  [[ -n $orphans ]] && txt "${DIM}Appareils dans aucun groupe nommé :$orphans${RESET}" ""
+  if [[ -n $(access_rows GROUP) ]]; then
+    while read -r name _; do
+      [[ -n $name ]] || continue
+      [[ $(access_device_groups "$name" | grep -vc "^$ACCESS_ALL$") -eq 0 ]] && orphans="$orphans $name"
+    done < <(peers_table)
+    [[ -n $orphans ]] && txt "${DIM}Appareils dans aucun groupe nommé :$orphans${RESET}" ""
+  fi
 
   access_listening_note
 }
@@ -2927,6 +2986,30 @@ access_check() {
   kv "Ressources" "$n"
   n=$(access_rows POLICY | grep -c . || true)
   kv "Règles" "$n"
+
+  # Toutes les ECRITURES de wg-pi passent par access_valid_label. Restent les fichiers
+  # ecrits a la main et les sauvegardes anciennes : comme « RES|<id>|<libelle>|<cible> »
+  # place le libelle AU MILIEU, une barre verticale y decale la cible, et la ressource
+  # designe alors une AUTRE machine sans que rien ne change a l ecran. Le diagnostic est
+  # le dernier endroit ou cela peut encore se voir.
+  while IFS="|" read -r id libelle a; do
+    [[ -n $id ]] || continue
+    if ! access_valid_target "$a"; then
+      fail "Ressource « $id » : « $a » n'est ni une adresse IP ni un réseau. Le fichier a-t-il été modifié à la main ?"
+      problems=$(( problems + 1 ))
+    fi
+    if ! access_valid_label "$libelle"; then
+      fail "Ressource « $id » : libellé invalide (une barre verticale décalerait la cible)."
+      problems=$(( problems + 1 ))
+    fi
+  done < <(access_rows RES)
+  while IFS="|" read -r id libelle; do
+    [[ -n $id ]] || continue
+    access_valid_label "$libelle" || {
+      fail "Groupe « $id » : libellé invalide."
+      problems=$(( problems + 1 ))
+    }
+  done < <(access_rows GROUP)
 
   # Un groupe vide n'est pas une erreur, mais une règle qui s'appuie dessus n'aura aucun
   # effet : autant le dire.
@@ -3422,12 +3505,13 @@ access_unswitch() {
 # chaînes.
 cmd_access_apply() {
   load_settings
-  local a boot=0 remove=0 sans_filet=0 ctdir=1 cur new
+  local a boot=0 remove=0 sans_filet=0 modifie=0 ctdir=1 cur new filet=1
   for a in "$@"; do
     case $a in
       --boot)        boot=1 ;;
       --remove)      remove=1 ;;
       --sans-filet)  sans_filet=1 ;;
+      --modifie)     modifie=1 ;;
       *) die "Option inconnue : $a" ;;
     esac
   done
@@ -3440,6 +3524,15 @@ cmd_access_apply() {
   fi
 
   [[ $(access_mode) == filtre ]] || { access_unswitch; return 0; }
+
+  # Sans aucune règle, appliquer le filtrage couperait tout : le moteur n'autorise que
+  # ce qui est écrit. « access on » refuse déjà ce cas, mais il n'est pas le seul
+  # chemin — le panneau web réapplique après chaque écriture, et supprimer la dernière
+  # règle arrivait donc ici sans garde-fou, coupant tous les appareils d'un coup.
+  if [[ $(access_policy_count) -eq 0 ]]; then
+    die "Aucune règle enregistrée : appliquer le filtrage couperait tous vos appareils.
+Posez une règle, ou coupez le filtrage : sudo wg-pi access off"
+  fi
 
   # Le garde-fou SSH n'a de valeur que si l'on connaît le bon port. Dans le doute, on
   # refuse de filtrer : poser un secours sur le mauvais port est pire que ne pas filtrer.
@@ -3459,7 +3552,7 @@ cmd_access_apply() {
 
   # L'instantané est pris maintenant : juste avant la première écriture qui touche au
   # trafic, et donc sur un état encore sain.
-  access_snapshot || warn "Instantané du pare-feu impossible : le retour en arrière automatique ne sera pas disponible."
+  access_snapshot || filet=0
 
   # Au démarrage, le minuteur n'est réarmé que si la configuration n'a JAMAIS été
   # confirmée. Sinon le filtrage se désactiverait tout seul après chaque redémarrage passé
@@ -3469,10 +3562,30 @@ cmd_access_apply() {
   # Attention : on saute seulement l'ARMEMENT, jamais la bascule qui suit. Sortir ici
   # laisserait les chaînes construites mais aucun saut pour y mener, donc un filtrage
   # annoncé et inexistant.
-  if (( boot )) && access_confirmed; then
-    : # configuration déjà validée par un humain : pas de minuteur
+  # Une modification efface la validation : la configuration appliquée n'est plus celle
+  # qu'un humain avait approuvée, et le filet doit jouer pour la NOUVELLE.
+  (( modifie )) && access_set_confirmed 0
+
+  if access_confirmed; then
+    # Configuration déjà validée par un humain ET inchangée : pas de minuteur. Le cas
+    # visé est la réapplication à l'identique, après qu'un « ufw reload » ou un
+    # redémarrage de Docker a effacé les chaînes — redemander une confirmation pour
+    # un jeu de règles qui tournait déjà serait du bruit, et personne n'y répondrait.
+    :
   elif (( sans_filet )); then
     warn "Aucune annulation automatique : vous avez demandé à passer outre."
+  elif (( ! filet )); then
+    # Sans instantané, le minuteur n'aurait RIEN à restaurer. L'armer quand même
+    # donnerait un filet qui n'existe pas, et « access-rollback » affirmerait plus tard
+    # une restauration qui n'a pas eu lieu. Mieux vaut refuser que mentir.
+    if (( boot )); then
+      warn "Instantané du pare-feu impossible : aucune annulation automatique disponible."
+    else
+      access_teardown "$new"
+      die "Instantané du pare-feu impossible : le retour en arrière ne peut pas être garanti,
+le filtrage n'est donc pas appliqué.
+Pour forcer malgré tout, en acceptant le risque de perdre l'accès : sudo wg-pi access on --sans-filet"
+    fi
   elif ! access_arm_rollback 120; then
     if (( boot )); then
       warn "Minuteur d'annulation indisponible : les règles de secours SSH restent le seul filet."
@@ -3481,6 +3594,12 @@ cmd_access_apply() {
       die "Impossible d'armer l'annulation automatique (systemd-run). Filtrage non appliqué.
 Pour forcer malgré tout, en acceptant le risque de perdre l'accès : sudo wg-pi access on --sans-filet"
     fi
+  else
+    # INVARIANT : un minuteur armé implique une configuration non confirmée. Sans lui,
+    # « confirme » pouvait rester vrai alors qu'une annulation était en vol : le panneau
+    # web n'affichait pas son bandeau, personne ne confirmait, et deux minutes plus tard
+    # tout le cloisonnement tombait — pour une simple modification de règle.
+    access_set_confirmed 0
   fi
 
   if ! access_switch "$new" "$cur"; then
@@ -3690,6 +3809,15 @@ cmd_access_off() {
 cmd_access_confirm() {
   take_lock
   if ! access_rollback_armed && [[ ! -s $ACCESS_SNAP ]]; then
+    # Aucune annulation en vol. Si le filtrage tourne pourtant sans être marqué comme
+    # confirmé, c'est l'état enregistré qui est en retard sur la réalité : on le remet
+    # d'aplomb. Sans cela, le bandeau du panneau web resterait affiché indéfiniment et
+    # son bouton ne pourrait rien y changer.
+    if [[ $(access_mode) == filtre ]] && ! access_confirmed; then
+      access_set_confirmed 1
+      ok "Configuration confirmée : aucune annulation n'était en attente."
+      return 0
+    fi
     info "Rien à confirmer : aucune annulation n'est en attente."
     return 0
   fi
@@ -3797,8 +3925,9 @@ access_json_devices() {   # <groupe>
 
 access_json() {
   local gid glabel rid rlabel rtarget p first=1
-  printf '{"mode":"%s","noyau":"%s","groupes":[' \
-    "$(access_mode)" "$(access_kernel_state_safe)"
+  printf '{"mode":"%s","noyau":"%s","confirme":%s,"groupes":[' \
+    "$(access_mode)" "$(access_kernel_state_safe)" \
+    "$(if access_confirmed; then echo true; else echo false; fi)"
   while IFS='|' read -r gid glabel; do
     [[ -n $gid ]] || continue
     (( first )) || printf ','
@@ -3895,9 +4024,9 @@ cmd_group() {
       while IFS='|' read -r id libelle; do
         [[ -n $id ]] || continue
         n=$(( n + 1 ))
-        kv "$(pad "$id" 16)$libelle" "$(access_group_devices "$id" | wc -l) appareil(s)"
+        printf '   %s %s %s\n' "$(pad "$id" 16)" "$(pad "$libelle" 28)" "${DIM}$(access_group_devices "$id" | wc -l) appareil(s)${RESET}"
       done < <(access_rows GROUP)
-      kv "$(pad "$ACCESS_ALL" 16)Tous les appareils" "$(access_group_devices "$ACCESS_ALL" | wc -l) appareil(s)"
+      printf '   %s %s %s\n' "$(pad "$ACCESS_ALL" 16)" "$(pad "Tous les appareils" 28)" "${DIM}$(access_group_devices "$ACCESS_ALL" | wc -l) appareil(s)${RESET}"
       if (( n == 0 )); then
         echo
         txt "Aucun groupe pour l'instant. Le groupe « $ACCESS_ALL » existe toujours et contient" \
@@ -3913,6 +4042,8 @@ cmd_group() {
       access_valid_id "$id" || die "Nom de groupe invalide : 1 à 15 caractères parmi lettres, chiffres, - et _."
       access_is_all "$id" && die "« $ACCESS_ALL » est le groupe automatique : il existe déjà et contient tous vos appareils."
       for a in "$@"; do libelle=$(opt_value "$a" libelle); [[ -n $libelle ]] && break; done
+      access_valid_label "$libelle" ||
+        die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle=$id
       access_group_exists "$id" && info "Le groupe « $id » existait déjà : son libellé est mis à jour."
       { access_cat | access_drop GROUP "$id"; echo "GROUP|$id|$libelle"; } | access_save ||
@@ -4012,6 +4143,8 @@ cmd_resource() {
         warn "« $target » n'est pas dans le réseau de la maison ($LAN_NET) : la règle risque d'être sans effet."
       fi
       for a in "$@"; do libelle=$(opt_value "$a" libelle); [[ -n $libelle ]] && break; done
+      access_valid_label "$libelle" ||
+        die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle=$id
       { access_cat | access_drop RES "$id"; echo "RES|$id|$libelle|$target"; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
@@ -4090,6 +4223,8 @@ il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
         die "Liste de ports invalide : « $ports ». Exemples : 445 ou 445,5000-5001. Au plus 15 ports, une plage en comptant deux."
       [[ -n $ports && $proto != tcp && $proto != udp ]] &&
         die "Des ports n'ont de sens qu'avec --proto=tcp ou --proto=udp."
+      access_valid_label "$libelle" ||
+        die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle="$(access_group_label "$src") → $(access_dest_label "$dst")"
       id=$(access_next_policy_id)
       { access_cat; echo "POLICY|$id|1|grp:$src|$dst|$proto|$ports|$sens|$libelle"; } | access_save ||
@@ -4205,6 +4340,18 @@ BLOCK_SECONDS = 300
 CACHE_SECONDS = 30
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,15}")
 NEW_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")  # pas de « - » en tête (pris pour une option)
+# Identifiants et destinations des règles. Jamais de « - » en tête : wg-pi recevrait
+# l'argument comme une option. Les motifs reprennent ceux du script, volontairement.
+ACCES_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
+DEST_RE = re.compile(r"internet|maison|pi|(?:res|grp):[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
+PORTS_RE = re.compile(r"[0-9]{1,5}(?:-[0-9]{1,5})?(?:,[0-9]{1,5}(?:-[0-9]{1,5})?)*")
+CIBLE_RE = re.compile(r"[0-9a-fA-F:.]{2,45}(?:/[0-9]{1,3})?")
+REGLE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")
+
+
+def libelle_ok(v):
+    """La barre verticale est le séparateur d'access.conf : elle n'entre pas dans un libellé."""
+    return len(v) <= 60 and "|" not in v and all(32 <= ord(c) != 127 for c in v)
 # Seuls le réseau local, le VPN et la machine elle-même peuvent joindre le panneau
 ALLOWED_NETS = [ipaddress.ip_network(n) for n in (
     "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
@@ -4355,6 +4502,34 @@ def get_state():
             "time": time.time()}
 
 
+def acces_vue():
+    """La vue d'accès déjà résolue par « wg-pi json » : mode, groupes, ressources."""
+    try:
+        return load_base().get("acces") or {}
+    except Exception:
+        return {}
+
+
+def acces_actif():
+    """Le filtrage tourne-t-il ? Une règle écrite pendant qu'il tourne ne vaut rien
+    tant qu'elle n'est pas poussée dans le noyau."""
+    return acces_vue().get("mode") == "filtre"
+
+
+def avertissements(texte):
+    """Les « warn » du CLI sortent sur la SORTIE STANDARD, mêlés aux messages de succès.
+
+    clean_message() aplatit tout et retire les marqueurs : il ne sait donc pas distinguer
+    un avertissement d'un succès. On relit le texte brut pour ne garder que les lignes
+    marquées, car ce sont les seules qui apprennent quelque chose au panneau — qu'une
+    ressource est hors du réseau de la maison, ou qu'une règle va bloquer le DNS de la
+    box. Les jeter, c'était laisser l'utilisateur découvrir le problème par lui-même."""
+    propre = re.sub(r"\x1b\[[0-9;]*m", "", texte or "")
+    gardes = [l.strip().lstrip("⚠").strip()
+              for l in propre.splitlines() if l.strip().startswith("⚠")]
+    return " ".join(g for g in gardes if g)[:400]
+
+
 def client_conf_path(name):
     if not NAME_RE.fullmatch(name or ""):
         return None
@@ -4387,12 +4562,12 @@ TRADEMARK = ('« WireGuard » et le logo « WireGuard » sont des marques dépos
              '<a href="https://www.wireguard.com/" target="_blank" rel="noopener noreferrer">wireguard.com</a>')
 
 DARK = ("--bg:#0d0f12;--card:#16191e;--soft:#1d2127;--text:#e7e9ec;--muted:#98a2b3;--line:#282d35;"
-        "--accent:#e5484d;--accent-2:#f05b60;--ok:#3ccb7f;--ok-soft:#10291c;--bad:#f97066;--bad-soft:#2c1412;"
+        "--accent:#e5484d;--accent-2:#f05b60;--accent-soft:#2d1618;--on-accent:#16191e;--ok:#3ccb7f;--ok-soft:#10291c;--bad:#f97066;--bad-soft:#2c1412;"
         "--g1:#60a5fa;--g2:#34d399;--g3:#fbbf24;--g4:#a78bfa;--g5:#22d3ee;--g6:#f472b6;"
         "--shadow:none")
 CSS = """
 :root{--bg:#f3f4f6;--card:#fff;--soft:#f7f8fa;--text:#14171a;--muted:#667085;--line:#e5e7eb;
---accent:#88171a;--accent-2:#6f1215;--on-accent:#fff;--ok:#12a150;--ok-soft:#e8f7ee;--bad:#d92d20;--bad-soft:#fdeeec;
+--accent:#88171a;--accent-2:#6f1215;--on-accent:#fff;--accent-soft:#f7e9e9;--ok:#12a150;--ok-soft:#e8f7ee;--bad:#d92d20;--bad-soft:#fdeeec;
 --g1:#2563eb;--g2:#059669;--g3:#b45309;--g4:#7c3aed;--g5:#0e7490;--g6:#be185d;
 --shadow:0 1px 2px rgba(16,24,40,.05),0 2px 8px rgba(16,24,40,.06);--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 :root[data-theme=dark]{%DARK%}
@@ -4406,7 +4581,9 @@ a{color:var(--accent)}
 .acces .clients-head{align-items:center;gap:10px}
 #acc-matrix{overflow-x:auto;-webkit-overflow-scrolling:touch}
 table.matrix{border-collapse:separate;border-spacing:0;width:100%;min-width:min-content;font-size:13px}
-table.matrix th,table.matrix td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:middle}
+table.matrix th,table.matrix td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:middle}
+table.matrix th:first-child,table.matrix td:first-child{padding-left:16px}
+table.matrix th:last-child,table.matrix td:last-child{padding-right:16px}
 table.matrix thead th{position:sticky;top:0;background:var(--card);font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap}
 table.matrix tbody th{position:sticky;left:0;background:var(--card);min-width:9.5rem;font-weight:600}
 table.matrix th.corner{left:0;z-index:2;background:var(--card)}
@@ -4416,6 +4593,9 @@ table.matrix td.yes{background:var(--ok-soft)}
 table.matrix td.yes span{font-family:var(--mono);font-size:12px}
 table.matrix td.no{background:repeating-linear-gradient(135deg,transparent,transparent 5px,var(--line) 5px,var(--line) 6px)}
 .acc-note{color:var(--muted);font-size:12.5px;margin:12px 0 0}
+.pan > .acc-note{padding:0 16px 14px;margin-top:12px}
+.pan > .alert{margin:12px 16px}
+.pan > #map-box{padding:0 16px}
 /* Pastille de groupe sur la ligne d un appareil, et fiche d acces. */
 .badge.grp{border-color:currentColor}
 .badge.grp.g1{color:var(--g1)}.badge.grp.g2{color:var(--g2)}.badge.grp.g3{color:var(--g3)}
@@ -4437,6 +4617,7 @@ padding:10px 12px;margin:10px 0;color:var(--muted);font-size:12.5px}
 /* Compte de consultation : les commandes qui ne feraient rien sont masquees. Purement
    cosmetique — le refus est applique cote serveur. */
 body[data-role=lecture] [data-admin]{display:none!important}
+body[data-role=lecture] .chip{padding:2px 9px}
 body[data-role=lecture] .ro-note{display:block}
 .ro-note{display:none;color:var(--muted);font-size:12.5px;margin:0 0 12px}
 /* Carte. Le SVG garde une largeur minimale et le conteneur defile : a 375 px, des
@@ -4496,6 +4677,10 @@ text-decoration:none;white-space:nowrap;transition:background .15s,border-color 
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}.btn.primary:hover{background:var(--accent-2)}
 .btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
 .btn.ghost{background:transparent}.btn.block{width:100%}.btn[disabled]{opacity:.6;cursor:default}
+/* « ghost danger » : un bouton de suppression discret. Sans cette regle, il heriterait
+   du texte blanc de .btn.danger sur un fond transparent, donc blanc sur blanc. */
+.btn.ghost.danger{background:transparent;border-color:var(--line);color:var(--bad)}
+.btn.ghost.danger:hover{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
 .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:9px;
 border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;text-decoration:none;
 transition:background .15s,color .15s,border-color .15s}
@@ -4510,11 +4695,52 @@ main{padding-top:16px;padding-bottom:4px}
 .pill.ok{background:var(--ok-soft);color:var(--ok)}.pill.bad{background:var(--bad-soft);color:var(--bad)}
 .kv{display:flex;flex-direction:column;min-width:0}.kv>span{color:var(--muted);font-size:12px}.kv b{font-weight:600;overflow-wrap:anywhere}
 .push{margin-left:auto}
-.srv-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px 24px;margin-top:12px;
-padding-top:12px;border-top:1px dashed var(--line)}
+.srv-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px 24px;
+padding:14px 16px 16px}
 .srv-details .wide{grid-column:1/-1}.key{display:flex;align-items:center;gap:8px}
-#srv-toggle[aria-expanded=true] .ico{transform:rotate(180deg)}
 .clients{overflow:hidden}
+.tabs{display:flex;gap:4px;margin:0 0 14px;padding:4px;background:var(--card);border:1px solid var(--line);
+border-radius:14px;box-shadow:var(--shadow);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:1 1 auto;height:38px;padding:0 14px;border:none;border-radius:10px;background:transparent;
+color:var(--muted);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap;
+display:inline-flex;align-items:center;justify-content:center;gap:7px}
+.tabs button:hover{background:var(--soft);color:var(--text)}
+.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.tabs button[aria-selected=true]{background:var(--accent);color:var(--on-accent)}
+.tabs button[aria-selected=true]:hover{background:var(--accent-2)}
+/* Sur l onglet actif, le fond EST deja l accent : un anneau de focus de la meme
+   couleur y serait invisible, et la navigation au clavier se ferait a l aveugle. */
+.tabs button[aria-selected=true]:focus-visible{outline-color:var(--on-accent)}
+.tcount{font-size:11px;font-weight:700;padding:1px 6px;border-radius:999px;background:var(--soft);color:var(--muted)}
+.tcount:empty{display:none}
+.tabs button[aria-selected=true] .tcount{background:rgba(0,0,0,.26);color:var(--on-accent)}
+.pan[hidden]{display:none}
+.secbox{padding:14px 16px}.secbox+.secbox{border-top:1px solid var(--line)}
+.sec-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.sec-head h3{margin:0;font-size:15px;display:flex;align-items:center;gap:8px}
+.tile{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);
+border-radius:12px;background:var(--soft)}
+.tile+.tile{margin-top:8px}.tile b{font-size:14px}
+.tile .push,.regle .push{margin-left:auto;display:flex;flex-wrap:wrap;gap:8px}
+.tile .sub{color:var(--muted);font-size:12.5px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:2px 4px 2px 9px;
+border-radius:999px;background:var(--card);border:1px solid var(--line);color:var(--muted)}
+.chip.plain{padding:2px 9px}
+.chip button{border:none;background:transparent;color:var(--muted);cursor:pointer;font:inherit;line-height:1;
+padding:2px 4px;border-radius:999px}
+.chip button:hover{background:var(--bad-soft);color:var(--bad)}
+.grid-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;align-items:start}
+.grid-form .field{margin:0 0 6px}.grid-form select{width:100%}
+.grid-form .wide{grid-column:1/-1}
+.alert .btn{margin-left:auto}
+.alert-ligne{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.regle{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.regle:last-child{border-bottom:none}
+.regle .fleche{color:var(--muted)}
+.regle .push{margin-left:auto}
+.regle-vide{padding:22px 16px;text-align:center;color:var(--muted)}
 .clients-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;
 border-bottom:1px solid var(--line)}
 .clients-head h2{margin:0;font-size:17px;display:flex;align-items:center;gap:8px}
@@ -4524,13 +4750,14 @@ border-bottom:1px solid var(--line)}
 background:var(--soft);color:var(--muted)}
 .search input{border:none;background:transparent;color:var(--text);font:inherit;width:170px;outline:none}
 select{height:36px;padding:0 8px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--text);font:inherit}
-.row{position:relative;display:grid;grid-template-columns:42px minmax(0,1fr) 200px auto;align-items:center;gap:14px;
-padding:11px 16px;border-bottom:1px solid var(--line);overflow:hidden}
+.row{position:relative;border-bottom:1px solid var(--line);overflow:hidden}
 .row:last-child{border-bottom:none}.row:hover{background:var(--soft)}
-.spark{position:absolute;left:0;bottom:0;width:100%;height:100%;pointer-events:none}
-.spark path{fill:var(--accent);opacity:.1}
-.row>:not(.spark){position:relative}
-.avatar{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+.spark{position:absolute;left:0;top:0;right:0;bottom:0;width:100%;height:100%;pointer-events:none;z-index:0}
+.spark path{fill:var(--accent);opacity:.13}
+.row-main{position:relative;z-index:1;display:grid;grid-template-columns:42px minmax(0,1fr) auto auto;
+align-items:center;gap:2px 14px;padding:10px 16px}
+.avatar{position:relative;width:42px;height:42px;border-radius:50%;display:grid;place-items:center;color:#fff;
+font-weight:700;font-size:15px;flex:none}
 .avatar .dot{position:absolute;right:-1px;bottom:-1px;width:13px;height:13px;border-radius:50%;background:var(--muted);
 border:2px solid var(--card)}
 .row.online .avatar .dot{background:var(--ok);animation:pulse 2s infinite}
@@ -4540,10 +4767,16 @@ border:2px solid var(--card)}
 .name{font-weight:700;font-size:15px}
 .badge{font-size:11.5px;font-weight:600;padding:0 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted)}
 .badge.off{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
-.ips{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.info{min-width:0}
+.l2{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;margin-top:2px}
+.ips{color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ips .sep{opacity:.45;margin:0 2px}
 .status{font-size:12.5px;color:var(--muted)}.status.on{color:var(--ok);font-weight:600}
-.traffic{text-align:right;min-width:0}.traffic[hidden]{display:block!important;visibility:hidden}
-.rates{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.traffic{text-align:right;min-width:0;display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.traffic[hidden]{display:flex!important;visibility:hidden}
+.rates{font-weight:700;font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap;
+padding:2px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent)}
+.rates:empty{display:none}
 .totals{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .actions{display:flex;align-items:center;gap:6px}
 .switch{position:relative;display:inline-block;width:38px;height:22px;margin-right:4px;flex:none}
@@ -4592,9 +4825,11 @@ code{font-family:var(--mono);font-size:12px;background:var(--soft);border:1px so
 border-radius:12px;background:#111827;color:#fff;font-weight:600;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .toast.bad{background:var(--bad)}
 @media (max-width:760px){
-.row{grid-template-columns:42px minmax(0,1fr);gap:8px 12px}
-.traffic{grid-column:2;text-align:left;min-width:0}.traffic[hidden]{display:none!important}
+.row-main{grid-template-columns:42px minmax(0,1fr);gap:8px 12px}
+.traffic{grid-column:2;align-items:flex-start;text-align:left;min-width:0}
+.traffic[hidden]{display:none!important}
 .actions{grid-column:1/-1;justify-content:flex-end}
+.tabs button{flex:0 0 auto;padding:0 12px}
 .search input{width:110px}.brand small,.hide-sm{display:none}
 .qr-wrap{grid-template-columns:1fr;justify-items:center}.choices{grid-template-columns:1fr}
 }
@@ -4684,11 +4919,6 @@ APP_JS = r"""
     b.type = "button"; b.title = title; b.setAttribute("aria-label", title); b.innerHTML = ICONS[name];
     return b;
   }
-  function svgEl(tag, attrs) {
-    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
-    return e;
-  }
   function toast(msg, bad) {
     var t = $("toast");
     t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
@@ -4757,6 +4987,10 @@ APP_JS = r"""
     renderServer();
     renderList();
     renderAcces();
+    renderGroupes();
+    renderRegles();
+    renderConfirmation();
+    majBascule();
     renderMap();
   }
 
@@ -4956,13 +5190,21 @@ APP_JS = r"""
     applyMapFocus(svg);
     svg.addEventListener("click", onMapClick);
 
+    /* La légende ne décrit que ce qui est RÉELLEMENT à l'écran. Sans aucune règle il n'y a
+       pas d'arête de politique : parler de leur épaisseur et de leurs pointillés enverrait
+       le lecteur chercher quelque chose qui n'existe pas. */
     var leg = $("map-legend");
     if (leg) {
-      leg.textContent = "À gauche vos appareils, au centre le Pi, à droite ce qu'ils peuvent"
-        + " joindre. Le trait animé vers le Pi suit le débit réel de l'appareil ; les traits"
-        + " de droite montrent ce que vos règles autorisent — un trait épais signifie tous"
-        + " les ports, un trait pointillé que seul l'appareil peut engager la connexion."
-        + " Cliquez sur un appareil ou une destination pour n'afficher que ce qui le concerne.";
+      var t = "À gauche vos appareils, au centre le Pi. Le trait animé suit le débit réel de"
+        + " l'appareil ; un appareil au repos n'est pas animé.";
+      if (dests.length) {
+        t += " À droite, ce qu'ils peuvent joindre : un trait épais signifie tous les ports,"
+          + " un trait pointillé que seul l'appareil peut engager la connexion."
+          + " Cliquez sur un appareil ou une destination pour n'afficher que ce qui le concerne.";
+      } else {
+        t += " La colonne de droite se remplira quand vous aurez créé des règles d'accès.";
+      }
+      leg.textContent = t;
       leg.hidden = false;
     }
   }
@@ -4989,18 +5231,59 @@ APP_JS = r"""
     mapFocus = mapFocus === key ? null : key;
     renderMap();
   }
+  /* Le focus suit le CHEMIN COMPLET, et pas seulement le segment clique.
+
+     Les liens de gauche portent « data-dev », ceux de droite « data-grp » et
+     « data-dest » : ne filtrer que sur l'attribut du type clique arretait donc la mise
+     en evidence au Pi. Or la question que l'on se pose en cliquant sur un appareil est
+     precisement « et ensuite, qu'est-ce qu'il atteint ? » — s'arreter au Pi laissait
+     croire qu'elle n'avait pas de reponse. La symetrie vaut dans l'autre sens : cliquer
+     sur une destination montre quels appareils peuvent l'atteindre. */
   function applyMapFocus(svg) {
     if (!mapFocus) { return; }
     var kind = mapFocus.indexOf("dev:") === 0 ? "dev" : "dest";
     var val = mapFocus.slice(kind.length + 1);
-    var attr = "data-" + kind;
-    var lies = svg.querySelectorAll("[" + attr + "]") || [];
-    Array.prototype.forEach.call(lies, function (e) {
-      /* « sel » et non « on » : « on » marque deja les appareils connectes, et le
-         reutiliser rendrait opaque tout appareil connecte en mode focus. */
-      if (e.getAttribute(attr) === val) {
-        e.setAttribute("class", (e.getAttribute("class") || "") + " sel");
-      }
+    var groupes = (state && state.acces && state.acces.groupes) || [];
+    var devs = Object.create(null), dests = Object.create(null), grps = Object.create(null);
+
+    if (kind === "dev") {
+      devs[val] = true;
+      groupes.forEach(function (g) {
+        if ((g.appareils || []).indexOf(val) < 0) { return; }
+        grps[g.id] = true;
+        (g.flux || []).forEach(function (f) { dests[f.dest] = true; });
+      });
+    } else {
+      dests[val] = true;
+      groupes.forEach(function (g) {
+        var mene = (g.flux || []).filter(function (f) { return f.dest === val; }).length > 0;
+        if (!mene) { return; }
+        grps[g.id] = true;
+        (g.appareils || []).forEach(function (d) { devs[d] = true; });
+      });
+    }
+
+    /* « sel » et non « on » : « on » marque deja les appareils connectes, et le
+       reutiliser rendrait opaque tout appareil connecte en mode focus. */
+    function balayer(attr, retenu) {
+      var lies = svg.querySelectorAll("[" + attr + "]") || [];
+      Array.prototype.forEach.call(lies, function (e) {
+        if (retenu(e.getAttribute(attr), e)) {
+          e.setAttribute("class", (e.getAttribute("class") || "") + " sel");
+        }
+      });
+    }
+    balayer("data-dev", function (v) { return !!devs[v]; });
+    /* Un lien de politique n'est retenu que si SES DEUX bouts le sont. Sans cette
+       condition, selectionner un appareil allumerait aussi la regle d'un AUTRE groupe
+       vers la meme destination, et donnerait a lire un droit qu'il n'a pas. */
+    balayer("data-grp", function (v, e) {
+      return !!grps[v] && !!dests[e.getAttribute("data-dest")];
+    });
+    /* Les liens de politique portent AUSSI « data-dest » : ils viennent d'etre traites,
+       on ne garde ici que les noeuds de destination, pour ne pas marquer deux fois. */
+    balayer("data-dest", function (v, e) {
+      return e.getAttribute("data-grp") == null && !!dests[v];
     });
   }
 
@@ -5137,6 +5420,11 @@ APP_JS = r"""
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       renderAcces: renderAcces,
+      renderGroupes: renderGroupes,
+      renderRegles: renderRegles,
+      renderConfirmation: renderConfirmation,
+      majBascule: majBascule,
+      ouvrirAjoutMembre: ouvrirAjoutMembre,
       renderMap: renderMap,
       openAcces: openAcces,
       fluxSortants: fluxSortants,
@@ -5169,10 +5457,9 @@ APP_JS = r"""
     return t;
   }
   function renderAcces() {
-    var a = state.acces || {}, sect = $("acces");
+    var a = state.acces || {}, sect = $("p-acc");
     if (!sect) { return; }
     var groupes = a.groupes || [], pill = $("acc-state"), warn = $("acc-warn");
-    sect.hidden = false;
 
     /* L'état affiché vient du noyau, jamais d'un fichier de réglages : un panneau qui
        annonce « filtrage actif » sur la foi d'un fichier mentirait dès qu'un « ufw reload »
@@ -5290,8 +5577,11 @@ APP_JS = r"""
   /* ---- Appareils ---- */
   function makeRow(name) {
     var r = {name: name, el: el("div", "row")};
-    r.spark = svgEl("svg", {"class": "spark", viewBox: "0 0 100 30", preserveAspectRatio: "none", "aria-hidden": "true"});
-    r.area = svgEl("path", {d: ""});
+    r.spark = svgEl("svg", "spark");
+    r.spark.setAttribute("viewBox", "0 0 100 30");
+    r.spark.setAttribute("preserveAspectRatio", "none");
+    r.spark.setAttribute("aria-hidden", "true");
+    r.area = svgEl("path");
     r.spark.appendChild(r.area);
     r.avatar = el("div", "avatar");
     r.ini = el("span");
@@ -5300,8 +5590,9 @@ APP_JS = r"""
     r.nameEl = el("span", "name"); r.mode = el("span", "badge"); r.off = el("span", "badge off", "Désactivé");
     r.grp = el("span", "badge grp");
     l1.append(r.nameEl, r.mode, r.grp, r.off);
-    r.ips = el("div", "ips mono"); r.status = el("div", "status");
-    info.append(l1, r.ips, r.status);
+    r.ips = el("span", "ips mono"); r.status = el("span", "status");
+    var l2 = el("div", "l2"); l2.append(r.ips, r.status);
+    info.append(l1, l2);
     r.traffic = el("div", "traffic"); r.rates = el("div", "rates"); r.totals = el("div", "totals");
     r.traffic.append(r.rates, r.totals);
     var act = el("div", "actions"), sw = el("label", "switch");
@@ -5319,7 +5610,12 @@ APP_JS = r"""
        contiennent la clé privée de l'appareil. */
     [sw, r.qr, r.ren, r.dl, r.del].forEach(function (e) { e.setAttribute("data-admin", ""); });
     act.append(sw, r.acc, r.qr, r.ren, r.dl, r.del);
-    r.el.append(r.spark, r.avatar, info, r.traffic, act);
+    /* Le sparkline est POSE EN SUPERPOSITION, hors de la grille : « r.main » porte seul
+       la mise en colonnes. Si « position:absolute » venait a ne pas s appliquer, la
+       grille resterait intacte au lieu de se decaler d une colonne. */
+    r.main = el("div", "row-main");
+    r.main.append(r.avatar, info, r.traffic, act);
+    r.el.append(r.spark, r.main);
     r.toggle.addEventListener("change", function () { setEnabled(r, r.toggle.checked); });
     r.qr.addEventListener("click", function () { openQR(r.name, false); });
     r.ren.addEventListener("click", function () { openRename(r.name); });
@@ -5419,7 +5715,7 @@ APP_JS = r"""
     var current = Array.prototype.filter.call(list.children, function (c) { return c.id !== "empty"; });
     var same = current.length === wanted.length && wanted.every(function (e, i) { return current[i] === e; });
     if (!same) { wanted.forEach(function (e) { list.appendChild(e); }); }
-    var c = $("count"); c.textContent = String(state.peers.length); c.hidden = !state.peers.length;
+    $("count").textContent = state.peers.length ? String(state.peers.length) : "";
   }
 
   /* ---- Actions ---- */
@@ -5569,15 +5865,470 @@ APP_JS = r"""
     });
   }
 
+  /* ---- Groupes, ressources et règles ---- */
+  /* Tout passe par les routes du panneau, qui appellent wg-pi. Rien n'est écrit ici :
+     le JavaScript propose, le script dispose — et c'est lui qui tient le verrou. */
+  function acces() { return (state && state.acces) || {}; }
+  function groupesTous() { return acces().groupes || []; }
+  function groupesNommesListe() {
+    return groupesTous().filter(function (g) { return !g.auto; });
+  }
+  function regleToutes() {
+    var out = [];
+    groupesTous().forEach(function (g) {
+      (g.flux || []).forEach(function (f) { out.push({groupe: g, flux: f}); });
+    });
+    return out;
+  }
+  function libelleProto(f) {
+    if (f.proto === "any" || !f.proto) { return "tous les ports"; }
+    if (!f.ports) { return f.proto.toUpperCase(); }
+    return f.proto.toUpperCase() + " " + f.ports;
+  }
+  /* « data-admin » va sur le BOUTON de retrait, jamais sur la pastille : posé sur la
+     pastille, il masquait le nom de l'appareil lui-même, et un compte de consultation
+     voyait tous les groupes vides — c'est-à-dire un mensonge, pas une restriction. */
+  function puce(texte, surRetrait) {
+    var c = el("span", "chip" + (surRetrait ? "" : " plain"), texte);
+    if (surRetrait) {
+      var x = el("button", null, "×");
+      x.type = "button"; x.title = "Retirer"; x.setAttribute("aria-label", "Retirer " + texte);
+      x.setAttribute("data-admin", "");
+      x.addEventListener("click", function () { surRetrait(x); });
+      c.append(x);
+    }
+    return c;
+  }
+  /* Un envoi en cours désactive son bouton. Sans cela, deux clics rapides font deux
+     écritures — et chacune réarme le minuteur d'annulation de deux minutes. */
+  function envoiUnique(bouton, lancer) {
+    if (!bouton || bouton.disabled) { return; }
+    bouton.disabled = true;
+    lancer().catch(function (x) {
+      if (x && x.message !== "session") { toast(x.message, true); }
+    }).then(function () { bouton.disabled = false; });
+  }
+  /* Un rendu qui reconstruit son conteneur alors que rien n'a changé vole le focus et
+     avale les clics : le relevé tourne toutes les deux secondes, et il suffit de viser
+     « Supprimer » au mauvais moment. On ne redessine que sur changement réel. */
+  var signatures = Object.create(null);
+  function inchange(cle, valeur) {
+    if (signatures[cle] === valeur) { return true; }
+    signatures[cle] = valeur;
+    return false;
+  }
+  function boutonTexte(libelle, classe, action) {
+    var b = el("button", "btn " + classe, libelle);
+    b.type = "button";
+    b.setAttribute("data-admin", "");
+    b.addEventListener("click", function () { action(b); });
+    return b;
+  }
+  /* Une écriture a abouti : on prévient, on signale une application ratée, et on
+     rafraîchit. L'avertissement n'est PAS avalé : une règle enregistrée mais non
+     appliquée doit se voir, sinon le panneau laisserait croire qu'elle protège. */
+  function apresEcriture(d, message) {
+    toast(message);
+    if (d && d.avertissement) { toast(d.avertissement, true); }
+    /* Le bandeau de confirmation se déduit de l'état renvoyé par le serveur, donc il
+       apparaîtra au prochain relevé. Le dire tout de suite évite deux secondes pendant
+       lesquelles un minuteur est armé sans que rien à l'écran ne le laisse voir. */
+    if (d && d.aconfirmer) {
+      toast("Règles appliquées : confirmez dans les deux minutes, sinon tout revient en arrière.");
+    }
+    poll();
+  }
+
+  function renderGroupes() {
+    var box = $("grp-list"), rbox = $("res-list");
+    if (!box || !rbox) { return; }
+    var nommes = groupesNommesListe(), res = acces().ressources || [];
+    $("c-grp").textContent = nommes.length ? String(nommes.length) : "";
+    $("c-acc").textContent = regleToutes().length ? String(regleToutes().length) : "";
+    if (inchange("groupes", JSON.stringify([nommes, res]))) { return; }
+
+    box.textContent = "";
+    if (!nommes.length) {
+      box.append(el("p", "regle-vide", "Aucun groupe pour l instant. Créez-en un, puis glissez-y des appareils."));
+    }
+    nommes.forEach(function (g) {
+      var tuile = el("div", "tile"), tete = el("div");
+      tete.append(el("b", null, g.libelle), el("div", "sub", g.id));
+      var ch = el("div", "chips");
+      (g.appareils || []).forEach(function (d) {
+        ch.append(puce(d, function (bouton) { quitterGroupe(d, g, bouton); }));
+      });
+      if (!(g.appareils || []).length) { ch.append(puce("aucun appareil", null)); }
+      var fin = el("div", "push");
+      fin.append(boutonTexte("Ajouter un appareil", "ghost", function () { ouvrirAjoutMembre(g); }),
+                 boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprGroupe(g); }));
+      tuile.append(tete, ch, fin);
+      box.append(tuile);
+    });
+
+    rbox.textContent = "";
+    if (!res.length) {
+      rbox.append(el("p", "regle-vide", "Aucune ressource. Nommez une machine de la maison pour pouvoir y donner accès."));
+    }
+    res.forEach(function (r) {
+      var tuile = el("div", "tile"), tete = el("div");
+      tete.append(el("b", null, r.libelle), el("div", "sub mono", r.cible + " · " + r.id));
+      var fin = el("div", "push");
+      fin.append(boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRessource(r); }));
+      tuile.append(tete, fin);
+      rbox.append(tuile);
+    });
+  }
+
+  function renderRegles() {
+    var box = $("acc-rules");
+    if (!box) { return; }
+    var toutes = regleToutes();
+    if (inchange("regles", JSON.stringify(toutes))) { return; }
+    box.textContent = "";
+    if (!toutes.length) {
+      box.append(el("p", "regle-vide", "Aucune règle. Tant qu il n y en a pas, activer le filtrage couperait tout."));
+      return;
+    }
+    toutes.forEach(function (x) {
+      var l = el("div", "regle");
+      l.append(el("span", "chip plain", x.groupe.libelle), el("span", "fleche", "→"),
+               el("b", null, x.flux.label), el("span", "chip plain", libelleProto(x.flux)));
+      if (x.flux.sens === "deux") { l.append(el("span", "chip plain", "les deux sens")); }
+      var fin = el("div", "push");
+      fin.append(boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRegle(x); }));
+      l.append(fin);
+      box.append(l);
+    });
+  }
+
+  /* ---- Fenêtres de création ---- */
+  function champ(id, libelle, aide, valeur, gabarit) {
+    var enveloppe = el("div"), lab = el("label", "field", libelle), inp = el("input");
+    lab.htmlFor = id;
+    inp.id = id; inp.type = "text"; inp.value = valeur || ""; inp.autocomplete = "off";
+    inp.spellcheck = false; inp.setAttribute("autocapitalize", "off");
+    if (gabarit) { inp.pattern = gabarit; }
+    enveloppe.append(lab, inp);
+    if (aide) { enveloppe.append(el("div", "hint", aide)); }
+    return {bloc: enveloppe, input: inp};
+  }
+  function liste(id, libelle, options, valeur) {
+    var enveloppe = el("div"), lab = el("label", "field", libelle), sel = el("select");
+    lab.htmlFor = id; sel.id = id;
+    options.forEach(function (o) {
+      var op = el("option", null, o.texte);
+      op.value = o.valeur;
+      if (o.valeur === valeur) { op.selected = true; }
+      sel.append(op);
+    });
+    enveloppe.append(lab, sel);
+    return {bloc: enveloppe, select: sel};
+  }
+
+  function ouvrirNouveauGroupe() {
+    openDialog("Nouveau groupe", function (b) {
+      var f = el("form", "form");
+      var nom = champ("grp-id", "Nom court", "1 à 15 caractères : lettres, chiffres, - et _.", "",
+                      "[A-Za-z0-9_][A-Za-z0-9_-]{0,14}");
+      nom.input.required = true; nom.input.maxLength = 15; nom.input.placeholder = "ex. famille, invites";
+      var lib = champ("grp-lib", "Libellé affiché", "Facultatif. Ce que vous lirez dans le panneau.", "");
+      lib.input.maxLength = 60; lib.input.placeholder = "ex. Ma famille";
+      var err = errorBox(), act = actionsBar("Annuler", "Créer le groupe", "primary");
+      f.append(nom.bloc, lib.bloc, err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", "/api/groupes", {id: nom.input.value.trim(), libelle: lib.input.value.trim()})
+          .then(function (d) {
+            if (f.isConnected) { closeDialog(); }
+            apresEcriture(d, "Groupe créé");
+          }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+      setTimeout(function () { nom.input.focus(); }, 30);
+    });
+  }
+
+  function ouvrirNouvelleRessource() {
+    openDialog("Nouvelle ressource", function (b) {
+      var f = el("form", "form");
+      var nom = champ("res-id", "Nom court", "1 à 15 caractères : lettres, chiffres, - et _.", "",
+                      "[A-Za-z0-9_][A-Za-z0-9_-]{0,14}");
+      nom.input.required = true; nom.input.maxLength = 15; nom.input.placeholder = "ex. nas, imprimante";
+      var cible = champ("res-ip", "Adresse ou réseau", "Exemples : 192.168.1.20 ou 192.168.1.64/28.", "");
+      cible.input.required = true; cible.input.placeholder = "192.168.1.20";
+      var lib = champ("res-lib", "Libellé affiché", "Facultatif.", "");
+      lib.input.maxLength = 60; lib.input.placeholder = "ex. Le NAS";
+      var err = errorBox(), act = actionsBar("Annuler", "Créer la ressource", "primary");
+      f.append(nom.bloc, cible.bloc, lib.bloc, err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", "/api/ressources", {id: nom.input.value.trim(), cible: cible.input.value.trim(),
+                                        libelle: lib.input.value.trim()})
+          .then(function (d) {
+            if (f.isConnected) { closeDialog(); }
+            apresEcriture(d, "Ressource créée");
+          }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+      setTimeout(function () { nom.input.focus(); }, 30);
+    });
+  }
+
+  function destinationsPossibles() {
+    var out = [{valeur: "internet", texte: "Internet"},
+               {valeur: "maison", texte: "Le réseau de la maison"},
+               {valeur: "pi", texte: "Le Pi lui-même"}];
+    (acces().ressources || []).forEach(function (r) {
+      out.push({valeur: "res:" + r.id, texte: "Ressource : " + r.libelle});
+    });
+    groupesTous().forEach(function (g) {
+      out.push({valeur: "grp:" + g.id, texte: "Groupe : " + g.libelle});
+    });
+    return out;
+  }
+
+  function ouvrirNouvelleRegle() {
+    openDialog("Nouvelle règle d accès", function (b) {
+      var f = el("form", "form");
+      var sources = groupesTous().map(function (g) { return {valeur: g.id, texte: g.libelle}; });
+      if (!sources.length) {
+        b.append(el("p", null, "Créez d abord un groupe : une règle part toujours d un groupe d appareils."));
+        return;
+      }
+      var src = liste("reg-src", "Qui ?", sources, sources[0].valeur);
+      var dst = liste("reg-dst", "Peut joindre quoi ?", destinationsPossibles(), "internet");
+      var proto = liste("reg-proto", "Protocole", [
+        {valeur: "any", texte: "Tous (et tous les ports)"},
+        {valeur: "tcp", texte: "TCP"}, {valeur: "udp", texte: "UDP"}, {valeur: "icmp", texte: "ICMP (ping)"}
+      ], "any");
+      var ports = champ("reg-ports", "Ports", "Avec TCP ou UDP. Exemples : 445 ou 445,5000-5001. Vide = tous.", "");
+      ports.input.placeholder = "445,5000-5001";
+      ports.input.maxLength = 120;   /* le corps des requêtes est borné à 4096 octets */
+      var sens = liste("reg-sens", "Sens", [
+        {valeur: "aller", texte: "Aller simple : la source appelle"},
+        {valeur: "deux", texte: "Les deux sens (entre groupes seulement)"}
+      ], "aller");
+      var lib = champ("reg-lib", "Libellé affiché", "Facultatif.", "");
+      lib.input.maxLength = 60;
+      var grille = el("div", "grid-form");
+      grille.append(src.bloc, dst.bloc, proto.bloc, ports.bloc, sens.bloc);
+      var note = el("div", "hint");
+      /* « deux sens » n'a de sens qu'entre groupes : vers Internet ou la maison, le
+         retour ne repasse pas par le VPN et wg-pi ne peut rien en promettre. */
+      function majSens() {
+        var versGroupe = dst.select.value.indexOf("grp:") === 0;
+        sens.select.disabled = !versGroupe;
+        if (!versGroupe) { sens.select.value = "aller"; }
+        var avecPorts = proto.select.value === "tcp" || proto.select.value === "udp";
+        ports.input.disabled = !avecPorts;
+        if (!avecPorts) { ports.input.value = ""; }
+        note.textContent = versGroupe ? "" :
+          "Les deux sens ne sont proposés qu entre groupes : ailleurs, le trafic de retour ne passe pas par le VPN.";
+      }
+      dst.select.addEventListener("change", majSens);
+      proto.select.addEventListener("change", majSens);
+      majSens();
+      var err = errorBox(), act = actionsBar("Annuler", "Créer la règle", "primary");
+      f.append(grille, note, lib.bloc, err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", "/api/regles", {source: src.select.value, destination: dst.select.value,
+                                    proto: proto.select.value, ports: ports.input.value.trim(),
+                                    sens: sens.select.value, libelle: lib.input.value.trim()})
+          .then(function (d) {
+            if (f.isConnected) { closeDialog(); }
+            apresEcriture(d, "Règle créée");
+          }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+    });
+  }
+
+  function ouvrirAjoutMembre(g) {
+    /* Object.create(null) et non « {} » : un appareil nomme « constructor » ou
+       « toString » heritait d une valeur vraie du prototype, et n etait donc jamais
+       propose a l ajout. */
+    var dedans = Object.create(null);
+    (g.appareils || []).forEach(function (d) { dedans[d] = true; });
+    var libres = ((state && state.peers) || []).filter(function (p) { return !dedans[p.name]; });
+    openDialog("Ajouter un appareil à « " + g.libelle + " »", function (b) {
+      if (!libres.length) {
+        b.append(el("p", null, "Tous vos appareils sont déjà dans ce groupe."));
+        return;
+      }
+      var f = el("form", "form");
+      var sel = liste("grp-dev", "Appareil", libres.map(function (p) {
+        return {valeur: p.name, texte: p.name};
+      }), libres[0].name);
+      var err = errorBox(), act = actionsBar("Annuler", "Ajouter", "primary");
+      f.append(sel.bloc, err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", "/api/groupes/" + encodeURIComponent(g.id) + "/join", {appareil: sel.select.value})
+          .then(function (d) {
+            if (f.isConnected) { closeDialog(); }
+            apresEcriture(d, "Appareil ajouté");
+          }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+    });
+  }
+
+  function quitterGroupe(appareil, g, bouton) {
+    envoiUnique(bouton, function () {
+      return api("POST", "/api/groupes/" + encodeURIComponent(g.id) + "/leave", {appareil: appareil})
+        .then(function (d) { apresEcriture(d, "« " + appareil + " » retiré de « " + g.libelle + " »"); });
+    });
+  }
+
+  /* « corps » n'est pas facultatif par confort : /api/filtrage EXIGE une action, et
+     l'oublier faisait répondre 400 « Action inconnue. » au bouton « Couper le filtrage »
+     — le seul moyen, depuis le navigateur, de défaire un cloisonnement qui vous enferme. */
+  function confirmer(titre, texte, bouton, url, message, corps) {
+    openDialog(titre, function (b) {
+      var f = el("form", "form"), err = errorBox(), act = actionsBar("Annuler", bouton, "danger");
+      f.append(el("p", null, texte), err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", url, corps || {}).then(function (d) {
+          if (f.isConnected) { closeDialog(); }
+          apresEcriture(d, message);
+        }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+    });
+  }
+  function ouvrirSupprGroupe(g) {
+    confirmer("Supprimer le groupe « " + g.libelle + " » ?",
+              "Les appareils ne sont pas supprimés : ils sortent simplement du groupe. " +
+              "Un groupe encore cité par une règle ne peut pas être supprimé.",
+              "Supprimer le groupe", "/api/groupes/" + encodeURIComponent(g.id) + "/delete",
+              "Groupe supprimé");
+  }
+  function ouvrirSupprRessource(r) {
+    confirmer("Supprimer la ressource « " + r.libelle + " » ?",
+              "La machine n est pas touchée : seul son nom dans wg-pi disparaît. " +
+              "Une ressource encore citée par une règle ne peut pas être supprimée.",
+              "Supprimer la ressource", "/api/ressources/" + encodeURIComponent(r.id) + "/delete",
+              "Ressource supprimée");
+  }
+  function ouvrirSupprRegle(x) {
+    confirmer("Supprimer cette règle ?",
+              "« " + x.groupe.libelle + " » ne pourra plus joindre « " + x.flux.label + " ».",
+              "Supprimer la règle", "/api/regles/" + encodeURIComponent(x.flux.id) + "/delete",
+              "Règle supprimée");
+  }
+
+  /* ---- Activer ou couper le filtrage ---- */
+  function ouvrirBascule() {
+    var actif = acces().mode === "filtre";
+    if (actif) {
+      confirmer("Couper le filtrage ?",
+                "Tous vos appareils pourront de nouveau se joindre entre eux et joindre la maison. " +
+                "Vos groupes et vos règles sont conservés : vous pourrez les réactiver.",
+                "Couper le filtrage", "/api/filtrage", "Filtrage coupé", {action: "off"});
+      return;
+    }
+    openDialog("Activer le filtrage ?", function (b) {
+      var f = el("form", "form"), err = errorBox();
+      var act = actionsBar("Annuler", "Activer le filtrage", "primary");
+      f.append(el("p", null, "À partir de maintenant, seules vos règles passeront : tout le reste sera refusé " +
+                             "entre appareils."),
+               el("p", null, "wg-pi arme un retour arrière automatique de deux minutes. Si vous perdez la main, " +
+                             "ne touchez à rien : l état précédent revient tout seul. Si tout va bien, confirmez " +
+                             "avec le bouton qui apparaîtra."),
+               err, act.bar);
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (act.ok.disabled) { return; }
+        act.ok.disabled = true; err.hidden = true;
+        api("POST", "/api/filtrage", {action: "on"}).then(function (d) {
+          if (f.isConnected) { closeDialog(); }
+          apresEcriture(d, "Filtrage activé : confirmez dans les deux minutes.");
+        }).catch(function (x) { showError(f, err, act.ok, x); });
+      });
+      b.append(f);
+    });
+  }
+
+  /* Bandeau de confirmation : il doit survivre à un rechargement de page, donc son
+     affichage est déduit de l'état renvoyé par le serveur, jamais d'une variable locale. */
+  function renderConfirmation() {
+    var box = $("acc-confirm");
+    if (!box) { return; }
+    var a = acces();
+    box.textContent = "";
+    if (a.mode !== "filtre" || a.confirme !== false) { box.hidden = true; return; }
+    var l = el("div", "alert-ligne");
+    l.append(el("b", null, "Filtrage en attente de confirmation."),
+             el("span", null, "Sans confirmation, wg-pi rétablira tout seul l état précédent."),
+             boutonTexte("Tout va bien, confirmer", "primary", function (bouton) {
+               envoiUnique(bouton, function () {
+                 return api("POST", "/api/filtrage", {action: "confirm"})
+                   .then(function (d) { apresEcriture(d, "Filtrage confirmé"); });
+               });
+             }));
+    box.append(l);
+    box.hidden = false;
+  }
+
+  function majBascule() {
+    var b = $("acc-switch");
+    if (!b) { return; }
+    var actif = acces().mode === "filtre";
+    b.textContent = actif ? "Couper le filtrage" : "Activer le filtrage";
+    b.className = "btn " + (actif ? "ghost danger" : "ghost");
+  }
+
+  /* ---- Onglets ---- */
+  var ONGLETS = ["app", "grp", "acc", "map", "srv"], ongletCourant = "app";
+  function montrerOnglet(cle) {
+    if (ONGLETS.indexOf(cle) < 0) { cle = "app"; }
+    ongletCourant = cle;
+    ONGLETS.forEach(function (c) {
+      var b = $("t-" + c), p = $("p-" + c), actif = (c === cle);
+      b.setAttribute("aria-selected", String(actif));
+      b.tabIndex = actif ? 0 : -1;
+      p.hidden = !actif;
+    });
+    try { localStorage.setItem("wgpi-onglet", cle); } catch (e) { /* navigation privee */ }
+    /* La carte se mesure a l affichage : la dessiner pendant que son volet est
+       cache donnerait une largeur nulle et une carte vide. */
+    if (cle === "map" && state) { renderMap(); }
+  }
+  ONGLETS.forEach(function (c) {
+    $("t-" + c).addEventListener("click", function () { montrerOnglet(c); });
+  });
+  $("tabs").addEventListener("keydown", function (ev) {
+    var d = ev.key === "ArrowRight" ? 1 : (ev.key === "ArrowLeft" ? -1 : 0);
+    if (!d) { return; }
+    ev.preventDefault();
+    var i = (ONGLETS.indexOf(ongletCourant) + d + ONGLETS.length) % ONGLETS.length;
+    montrerOnglet(ONGLETS[i]);
+    $("t-" + ONGLETS[i]).focus();
+  });
+  try { montrerOnglet(localStorage.getItem("wgpi-onglet") || "app"); }
+  catch (e) { montrerOnglet("app"); }
+
   /* ---- Barre d'outils ---- */
   $("new").addEventListener("click", openNew);
+  $("grp-new").addEventListener("click", ouvrirNouveauGroupe);
+  $("res-new").addEventListener("click", ouvrirNouvelleRessource);
+  $("rule-new").addEventListener("click", ouvrirNouvelleRegle);
+  $("acc-switch").addEventListener("click", ouvrirBascule);
   $("search").addEventListener("input", function (e) { query = e.target.value; if (state) { renderList(); } });
   $("sort").addEventListener("change", function (e) { sortKey = e.target.value; if (state) { renderList(); } });
-  $("srv-toggle").addEventListener("click", function () {
-    var open = $("srv-details").hidden;
-    $("srv-details").hidden = !open;
-    $("srv-toggle").setAttribute("aria-expanded", String(open));
-  });
   $("copy-key").addEventListener("click", function () {
     if (!state || !navigator.clipboard) { return; }
     navigator.clipboard.writeText(state.server.pubkey).then(function () { toast("Clé publique copiée"); });
@@ -5636,9 +6387,58 @@ def app_page(sess):
 <div class="kv"><span>Adresse publique</span><b class="mono" id="srv-endpoint">…</b></div>
 <div class="kv"><span>Réseau du VPN</span><b class="mono" id="srv-net">…</b></div>
 <div class="kv"><span>Connectés</span><b id="srv-online">…</b></div>
-<button type="button" class="btn ghost push" id="srv-toggle" aria-expanded="false" aria-controls="srv-details">Détails<span class="ico" data-icon="chevron"></span></button>
+<span class="pill push" id="srv-filtre" hidden>…</span>
+</div></section>
+<nav class="tabs" id="tabs" role="tablist" aria-label="Sections du panneau">
+<button type="button" role="tab" id="t-app" aria-controls="p-app" aria-selected="true">Appareils<span class="tcount" id="count"></span></button>
+<button type="button" role="tab" id="t-grp" aria-controls="p-grp" aria-selected="false" tabindex="-1">Groupes<span class="tcount" id="c-grp"></span></button>
+<button type="button" role="tab" id="t-acc" aria-controls="p-acc" aria-selected="false" tabindex="-1">Accès<span class="tcount" id="c-acc"></span></button>
+<button type="button" role="tab" id="t-map" aria-controls="p-map" aria-selected="false" tabindex="-1">Carte</button>
+<button type="button" role="tab" id="t-srv" aria-controls="p-srv" aria-selected="false" tabindex="-1">Serveur</button>
+</nav>
+<section class="card clients pan" id="p-app" role="tabpanel" aria-labelledby="t-app">
+<div class="clients-head"><h2>Appareils</h2>
+<div class="clients-tools">
+<label class="search" data-icon="search"><input type="search" id="search" placeholder="Rechercher…" aria-label="Rechercher un appareil" autocomplete="off"></label>
+<select id="sort" aria-label="Trier les appareils"><option value="name">Nom</option><option value="seen">Dernière connexion</option><option value="traffic">Trafic</option></select>
+<button type="button" class="btn primary" id="new" data-icon="plus" data-admin><span>Nouvel appareil</span></button>
+</div></div>
+<div id="list"></div>
+</section>
+<section class="card pan" id="p-grp" role="tabpanel" aria-labelledby="t-grp" hidden>
+<div class="secbox">
+<div class="sec-head"><h3>Groupes</h3>
+<button type="button" class="btn primary" id="grp-new" data-icon="plus" data-admin><span>Nouveau groupe</span></button></div>
+<p class="acc-note">Un groupe rassemble des appareils pour leur donner les mêmes droits. Le groupe « tous » existe toujours et contient chaque appareil.</p>
+<div id="grp-list"></div>
 </div>
-<div class="srv-details" id="srv-details" hidden>
+<div class="secbox">
+<div class="sec-head"><h3>Ressources</h3>
+<button type="button" class="btn primary" id="res-new" data-icon="plus" data-admin><span>Nouvelle ressource</span></button></div>
+<p class="acc-note">Une ressource est une machine ou un réseau de la maison que vous nommez une fois pour y donner accès ensuite : le NAS, une imprimante, la box…</p>
+<div id="res-list"></div>
+</div>
+</section>
+<section class="card acces pan" id="p-acc" role="tabpanel" aria-labelledby="t-acc" hidden>
+<div class="clients-head"><h2>Règles d accès <span class="pill" id="acc-state">…</span></h2>
+<div class="clients-tools">
+<button type="button" class="btn ghost" id="acc-switch" data-admin><span>…</span></button>
+<button type="button" class="btn primary" id="rule-new" data-icon="plus" data-admin><span>Nouvelle règle</span></button>
+</div></div>
+<div class="alert" id="acc-warn" role="status" hidden></div>
+<div class="alert" id="acc-confirm" role="status" hidden></div>
+<div id="acc-matrix"></div>
+<div id="acc-rules"></div>
+<p class="acc-note" id="acc-listen" hidden></p>
+</section>
+<section class="card pan" id="p-map" role="tabpanel" aria-labelledby="t-map" hidden>
+<div class="clients-head"><h2>Carte des accès</h2></div>
+<div id="map-box" aria-label="Carte des accès"></div>
+<p class="acc-note" id="map-legend" hidden></p>
+</section>
+<section class="card pan" id="p-srv" role="tabpanel" aria-labelledby="t-srv" hidden>
+<div class="clients-head"><h2>Serveur</h2></div>
+<div class="srv-details" id="srv-details">
 <div class="kv wide"><span>Clé publique du serveur</span><div class="key"><b class="mono" id="d-pubkey"></b>
 <button type="button" class="icon-btn" id="copy-key" data-icon="copy" title="Copier la clé publique" aria-label="Copier la clé publique"></button></div></div>
 <div class="kv"><span>Port</span><b id="d-port"></b></div>
@@ -5649,23 +6449,6 @@ def app_page(sess):
 <div class="kv"><span>Mode par défaut</span><b id="d-mode"></b></div>
 <div class="kv"><span>Version</span><b id="d-version"></b></div>
 </div></section>
-<section class="card clients" aria-label="Appareils">
-<div class="clients-head"><h2>Appareils <span class="count" id="count" hidden></span></h2>
-<div class="clients-tools">
-<label class="search" data-icon="search"><input type="search" id="search" placeholder="Rechercher…" aria-label="Rechercher un appareil" autocomplete="off"></label>
-<select id="sort" aria-label="Trier les appareils"><option value="name">Nom</option><option value="seen">Dernière connexion</option><option value="traffic">Trafic</option></select>
-<button type="button" class="btn primary" id="new" data-icon="plus" data-admin><span>Nouvel appareil</span></button>
-</div></div>
-<div id="list"></div>
-</section>
-<section class="card acces" id="acces" aria-label="Accès" hidden>
-<div class="clients-head"><h2>Accès</h2><span class="pill" id="acc-state">…</span></div>
-<div class="alert" id="acc-warn" role="status" hidden></div>
-<div id="acc-matrix"></div>
-<div id="map-box" aria-label="Carte des accès"></div>
-<p class="acc-note" id="map-legend" hidden></p>
-<p class="acc-note" id="acc-listen" hidden></p>
-</section>
 </main>
 <footer>Accessible uniquement depuis le réseau de la maison et le VPN · wg-pi {esc(VERSION)}<div class="tm">{TRADEMARK}</div></footer>
 <dialog id="dlg" aria-labelledby="dlg-title"><div class="dlg" id="dlg-body"></div></dialog>
@@ -5794,7 +6577,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if not 0 <= length <= 4096:
-            return self.send(413, "Requête refusée.\n", "text/plain; charset=utf-8")
+            # En JSON : le panneau lit « error ». Un texte brut lui faisait afficher
+            # « Erreur 413 », qui n apprend rien a personne.
+            return self.send_json(413, {"error": "Requête trop volumineuse : raccourcissez votre saisie."})
         raw = self.rfile.read(length).decode("utf-8", "replace")
         path = urllib.parse.urlsplit(self.path).path
         if path == "/login":
@@ -5845,7 +6630,134 @@ class Handler(http.server.BaseHTTPRequestHandler):
             args = ("remove", name, "--yes") if action == "delete" else (action, name)
             labels = {"delete": "supprimé", "enable": "réactivé", "disable": "désactivé"}
             return self.mutate(args, f"appareil « {name} » {labels[action]}", {"ok": True})
+
+        # ---- Groupes, ressources et règles ----
+        # Toutes passent par le CLI : le panneau n'écrit JAMAIS access.conf lui-même.
+        # Une seconde écriture du même fichier dériverait de la première au premier
+        # changement de format, et le verrou de wg-pi ne protégerait plus rien.
+        if path == "/api/groupes":
+            gid = str(body.get("id", "")).strip()
+            lib = str(body.get("libelle", "")).strip()
+            if not ACCES_ID_RE.fullmatch(gid):
+                return self.send_json(400, {"error": "Nom de groupe invalide : 1 à 15 caractères parmi "
+                                                     "lettres, chiffres, - et _ (sans tiret au début)."})
+            if not libelle_ok(lib):
+                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            # « group add » est un enregistrement : sur un nom déjà pris, il remplace le
+            # libellé sans rien demander. En ligne de commande c'est pratique ; derrière
+            # un bouton « Nouveau groupe », c'est une surprise. On refuse.
+            if any(g.get("id") == gid for g in acces_vue().get("groupes", [])):
+                return self.send_json(409, {"error": f"Un groupe « {gid} » existe déjà."})
+            args = ["group", "add", gid] + (["--libelle=" + lib] if lib else [])
+            return self.mutate_acces(args, f"groupe « {gid} » créé")
+        m = re.fullmatch(r"/api/groupes/([A-Za-z0-9_][A-Za-z0-9_-]{0,14})/(delete|join|leave)", path)
+        if m:
+            gid, action = m.groups()
+            if action == "delete":
+                return self.mutate_acces(("group", "rm", gid), f"groupe « {gid} » supprimé")
+            dev = str(body.get("appareil", "")).strip()
+            if not NAME_RE.fullmatch(dev) or dev.startswith("-"):
+                return self.send_json(400, {"error": "Appareil invalide."})
+            quoi = "ajouté au" if action == "join" else "retiré du"
+            return self.mutate_acces(("group", action, dev, gid), f"« {dev} » {quoi} groupe « {gid} »")
+        if path == "/api/ressources":
+            rid = str(body.get("id", "")).strip()
+            cible = str(body.get("cible", "")).strip()
+            lib = str(body.get("libelle", "")).strip()
+            if not ACCES_ID_RE.fullmatch(rid):
+                return self.send_json(400, {"error": "Nom de ressource invalide : 1 à 15 caractères parmi "
+                                                     "lettres, chiffres, - et _ (sans tiret au début)."})
+            if not CIBLE_RE.fullmatch(cible):
+                return self.send_json(400, {"error": "Adresse invalide (exemples : 192.168.1.20 ou 192.168.1.64/28)."})
+            if not libelle_ok(lib):
+                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            # Plus grave encore que pour un groupe : réutiliser un nom de ressource
+            # repointerait TOUTES les règles « res:<nom> » vers une autre machine, sans
+            # que la liste des règles change d'un caractère.
+            if any(r.get("id") == rid for r in acces_vue().get("ressources", [])):
+                return self.send_json(409, {"error": f"Une ressource « {rid} » existe déjà. "
+                                                     f"Supprimez-la d'abord si vous voulez la faire pointer ailleurs."})
+            args = ["resource", "add", rid, cible] + (["--libelle=" + lib] if lib else [])
+            return self.mutate_acces(args, f"ressource « {rid} » créée")
+        m = re.fullmatch(r"/api/ressources/([A-Za-z0-9_][A-Za-z0-9_-]{0,14})/delete", path)
+        if m:
+            return self.mutate_acces(("resource", "rm", m.group(1)), f"ressource « {m.group(1)} » supprimée")
+        if path == "/api/regles":
+            src = str(body.get("source", "")).strip()
+            dst = str(body.get("destination", "")).strip()
+            proto = str(body.get("proto", "any")).strip() or "any"
+            ports = str(body.get("ports", "")).strip()
+            sens = str(body.get("sens", "aller")).strip() or "aller"
+            lib = str(body.get("libelle", "")).strip()
+            if not ACCES_ID_RE.fullmatch(src):
+                return self.send_json(400, {"error": "Groupe source invalide."})
+            if not DEST_RE.fullmatch(dst):
+                return self.send_json(400, {"error": "Destination invalide."})
+            if proto not in ("any", "tcp", "udp", "icmp"):
+                return self.send_json(400, {"error": "Protocole invalide."})
+            if sens not in ("aller", "deux"):
+                return self.send_json(400, {"error": "Sens invalide."})
+            if ports and not PORTS_RE.fullmatch(ports):
+                return self.send_json(400, {"error": "Liste de ports invalide. Exemples : 445 ou 445,5000-5001."})
+            if not libelle_ok(lib):
+                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            args = ["access", "allow", src, dst, "--proto=" + proto, "--sens=" + sens]
+            if ports:
+                args.append("--ports=" + ports)
+            if lib:
+                args.append("--libelle=" + lib)
+            return self.mutate_acces(args, f"règle « {src} vers {dst} » créée")
+        m = re.fullmatch(r"/api/regles/([A-Za-z0-9_-]{1,16})/delete", path)
+        if m:
+            rid = m.group(1)
+            if rid.startswith("-"):
+                return self.send_json(404, {"error": "Règle introuvable."})
+            return self.mutate_acces(("access", "rm", rid), f"règle « {rid} » supprimée")
+        if path == "/api/filtrage":
+            action = str(body.get("action", "")).strip()
+            if action not in ("on", "off", "confirm"):
+                return self.send_json(400, {"error": "Action inconnue."})
+            # « on » et « off » ne repassent PAS par mutate_acces : ce sont eux qui
+            # appliquent, il n'y a rien à réappliquer derrière.
+            libelles = {"on": "filtrage activé", "off": "filtrage désactivé", "confirm": "filtrage confirmé"}
+            r = run_wgpi("access", action, timeout=180)
+            invalidate()
+            if r.returncode != 0:
+                return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+            log(f"{self.client_address[0]} : {libelles[action]}")
+            return self.send_json(200, {"ok": True, "aconfirmer": action == "on"})
         return self.send_json(404, {"error": "Action inconnue."})
+
+    def mutate_acces(self, args, what):
+        """Écrit par le CLI, puis REPOUSSE les règles dans le noyau si le filtrage tourne.
+
+        Sans cela, le panneau afficherait une règle que le pare-feu n'applique pas : la
+        vue mentirait, ce qui est pire que de ne rien afficher. La réapplication arme le
+        retour arrière de deux minutes de wg-pi — c'est voulu : une règle maladroite posée
+        à distance se défait toute seule au lieu de couper l'accès pour de bon."""
+        r = run_wgpi(*args)
+        invalidate()
+        if r.returncode != 0:
+            return self.send_json(400, {"error": clean_message(r.stderr or r.stdout)})
+        log(f"{self.client_address[0]} : {what}")
+        avert = avertissements(r.stdout)
+        if not acces_actif():
+            return self.send_json(200, {"ok": True, "applique": False, "avertissement": avert})
+        # --modifie : ce n'est plus la configuration validée, il faut la revalider.
+        a = run_wgpi("access-apply", "--modifie", timeout=180)
+        invalidate()
+        if a.returncode != 0:
+            # L'écriture a réussi, l'application NON. Répondre « ok » laisserait le panneau
+            # afficher une règle que le pare-feu n'applique pas, sous une pastille verte :
+            # access_kernel_state ne juge que la topologie des sauts, pas le contenu des
+            # chaînes, et l'ancien jeu de règles est toujours en vigueur. Une erreur reste
+            # à l'écran ; un message passager, non.
+            return self.send_json(409, {
+                "error": "Enregistré, mais le pare-feu a refusé de l'appliquer : "
+                         + clean_message(a.stderr or a.stdout)
+                         + " Le cloisonnement en vigueur est toujours le précédent."})
+        return self.send_json(200, {"ok": True, "applique": True, "aconfirmer": True,
+                                    "avertissement": avert})
 
     def mutate(self, args, what, result):
         r = run_wgpi(*args)

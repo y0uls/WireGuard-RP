@@ -97,6 +97,12 @@ wg-pi access on >/tmp/e2e-on.log 2>&1
 eq "l activation reussit" "$(grep -c 'Filtrage actif' /tmp/e2e-on.log)" "1"
 # Le piege du DNS : « Internet seulement » exclut le reseau de la maison, donc la box.
 eq "l avertissement DNS se declenche" "$(grep -c 'aucun nom de site' /tmp/e2e-on.log)" "1"
+# Une version anterieure rangeait son instantane a la racine de /run, et lui appliquait
+# « install -d -m 700 » : cela revenait a faire « chmod 700 /run », ce qui casse Docker
+# sans privileges, la session de l utilisateur, mDNS et la resolution de noms. GNU install
+# applique bien le mode a un dossier DEJA existant : le defaut etait reel.
+eq "/run garde ses droits normaux" "$(stat -c %a /run)" "755"
+eq "l instantane a son propre dossier, prive" "$(stat -c %a /run/wg-pi)" "700"
 LOAD="source <(head -n -1 $WG); load_settings"
 eq "etat lu dans le noyau" "$(bash -c "$LOAD; access_kernel_state")" "actif"
 eq "le saut est en premiere position" "$(bash -c "$LOAD; access_jump_first && echo oui || echo non")" "oui"

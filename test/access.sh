@@ -183,5 +183,19 @@ eq "le sens reste dans son champ" "$(load; access_rows POLICY | awk -F'|' '{ pri
 eq "le champ ports reste vide" "$(load; access_rows POLICY | awk -F'|' '{ print "[" $6 "]" }')" "[]"
 
 echo
+echo "-- validation des libellés"
+# access.conf est un format a barres verticales, et « RES|<id>|<libelle>|<cible> » place
+# le libelle AU MILIEU : une barre y decalerait la cible, et la ressource designerait
+# alors une autre machine que celle demandee.
+vl() { ( source "$SRC"; access_valid_label "$1" ) && echo oui || echo non; }
+eq "libellé simple accepté" "$(vl "Le NAS")" "oui"
+eq "libellé vide accepté" "$(vl "")" "oui"
+eq "accents et espaces acceptés" "$(vl "Imprimante du bureau à l étage")" "oui"
+eq "barre verticale refusée" "$(vl "NAS|192.168.1.99")" "non"
+eq "tabulation refusée" "$(printf "a	b" | { read -r v; vl "$v"; })" "non"
+eq "libellé trop long refusé" "$(vl "$(printf "%061d" 0)")" "non"
+eq "libellé de 60 caractères accepté" "$(vl "$(printf "%060d" 0)")" "oui"
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))
