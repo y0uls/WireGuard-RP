@@ -22,3 +22,17 @@ jobs:
 
       - name: ShellCheck
         run: shellcheck -S warning wg-pi.sh
+
+      - name: Tests unitaires
+        run: |
+          bash ./test/helpers.sh
+          bash ./test/access.sh
+          bash ./test/cli-access.sh
+          bash ./test/engine.sh
+          bash ./test/apply.sh
+          bash ./test/json.sh
+          bash ./test/ui.sh
+          bash ./test/role.sh
+          bash ./test/detect-reachability.sh
+          bash ./test/firewall.sh
+          bash ./test/heredoc.sh
