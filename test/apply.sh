@@ -241,18 +241,22 @@ eq "le refus parle de contournement en IPv6" "$(load; IPV6_NAT=1; cmd_access_on 
 
 # Port SSH indeterminable : on refuse de filtrer plutot que de poser un secours sur le
 # mauvais port.
-rm -f "$TMP/sshd_config"
 cat > "$TMP/etc/access.conf" <<'ACC'
 V|1
 MODE|filtre
 GROUP|g|G
 POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert
 ACC
-# « die » quitte le sous-shell : le « || » doit donc porter sur un sous-shell IMBRIQUE,
+# access_ssh_ports est neutralisee ici plutot que de compter sur l absence de sshd : sur
+# un runner d integration continue il EST installe, donc la fonction retombe sur son
+# defaut 22 et le refus ne se declencherait jamais. Un test ne doit pas dependre de ce
+# qui est installe sur la machine qui l execute.
+# Et « die » quitte le sous-shell : le « || » doit porter sur un sous-shell IMBRIQUE,
 # sinon il ne s execute jamais et le test passerait a tort.
-eq "port SSH inconnu : rien n est applique" "$( ( load; cmd_access_apply ) >/dev/null 2>&1 || echo refuse )" "refuse"
-eq "le refus parle du port SSH" "$(load; cmd_access_apply 2>&1 | grep -c 'Port SSH')" "1"
-echo "Port 22" > "$TMP/sshd_config"
+eq "port SSH inconnu : rien n est applique" \
+   "$( ( load; access_ssh_ports() { :; }; cmd_access_apply ) >/dev/null 2>&1 || echo refuse )" "refuse"
+eq "le refus parle du port SSH" \
+   "$( ( load; access_ssh_ports() { :; }; cmd_access_apply ) 2>&1 | grep -c 'Port SSH' )" "1"
 
 echo "-- essai a blanc"
 reset

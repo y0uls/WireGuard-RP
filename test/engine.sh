@@ -145,7 +145,14 @@ echo "-- sens deux : le miroir est emis"
 has "miroir du pair-a-pair"          "wgpi:pol:p5:retour"
 
 echo "-- chaine INPUT : le garde-fou SSH d abord, RETURN a la fin"
-has "SSH accepte inconditionnellement" "-A WGPI-IN-B -p tcp --dport 2222 -m comment --comment wgpi:secours:ssh -j ACCEPT"
+# Le port attendu est celui que la fonction detecte, et non une valeur ecrite en dur :
+# « sshd -T » est essaye en premier, donc sur une machine ou sshd tourne vraiment le port
+# retenu peut differer du fichier de configuration simule.
+# SSHD_CONFIG est deja redirige par le sed en tete de ce fichier, et il est « readonly » :
+# le reassigner ferait sortir le sous-shell en erreur, et le port ressortirait vide.
+PORT_SSH=$( ( source "$SRC"; access_ssh_ports ) 2>/dev/null | head -n1 )
+eq "un port SSH est determine" "$([[ -n ${PORT_SSH:-} ]] && echo oui || echo non)" "oui"
+has "SSH accepte inconditionnellement" "-A WGPI-IN-B -p tcp --dport $PORT_SSH -m comment --comment wgpi:secours:ssh -j ACCEPT"
 has "le port du VPN reste joignable"   "-A WGPI-IN-B -p udp --dport 51820 -m comment --comment wgpi:secours:vpn -j ACCEPT"
 has "le ping du Pi reste possible"     "-A WGPI-IN-B -p icmp -m comment --comment wgpi:secours:ping -j ACCEPT"
 has "la regle pi va bien dans INPUT"   "-A WGPI-IN-B -s 10.8.0.2 -p tcp -m multiport --dports 443 -m comment --comment wgpi:pol:p6 -j ACCEPT"
