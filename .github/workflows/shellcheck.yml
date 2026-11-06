@@ -31,6 +31,7 @@ jobs:
           bash ./test/engine.sh
           bash ./test/apply.sh
           bash ./test/json.sh
+          bash ./test/python.sh
           bash ./test/ui.sh
           bash ./test/role.sh
           bash ./test/detect-reachability.sh
