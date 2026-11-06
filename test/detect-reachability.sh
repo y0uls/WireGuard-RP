@@ -56,6 +56,21 @@ mock_ip() {                        # $1 : adresse du Pi, rendue par « ip route 
   chmod +x "$BIN/ip"
 }
 
+# --- confinement du PATH -----------------------------------------------------
+# Retirer un faux executable ne desinstalle rien : la fonction trouve alors le VRAI ping de
+# la machine qui lance les tests, sonde Internet pour de bon, et rend le verdict du reseau de
+# cette machine. Les cas « commande absente » passaient donc dans un conteneur minimal, ou ni
+# ping ni upnpc ne sont installes, et tombaient sur une Ubuntu ordinaire. On confine le PATH de
+# la sonde a nos faux et aux seuls utilitaires dont elle a besoin : absent y veut dire absent,
+# et la suite ne touche plus le reseau.
+OUTILS=$TMP/outils
+mkdir -p "$OUTILS"
+for u in timeout sed awk head tr; do
+  p=$(command -v "$u") || { echo "Utilitaire introuvable : $u" >&2; exit 2; }
+  { echo "#!/bin/sh"; echo "exec '$p' " '"$@"'; } > "$OUTILS/$u"
+  chmod +x "$OUTILS/$u"
+done
+
 # --- exécution d'un cas ------------------------------------------------------
 pass=0 fail=0
 t() {  # t <libellé> <attendu> <ext UPnP> <sauts ping> <IP publique> <passerelle> <adresse du Pi>
@@ -65,6 +80,9 @@ t() {  # t <libellé> <attendu> <ext UPnP> <sauts ping> <IP publique> <passerell
     # shellcheck source=/dev/null
     source "$SRC"
     LAN_IF=eth0; LAN_GW=$gw; PUBLIC_IP=$pip; LAN_IP=$self
+    # Apres le chargement, et seulement pour la sonde : le script a besoin du vrai PATH
+    # pour se charger, la sonde a besoin de ne voir que nos faux.
+    PATH=$BIN:$OUTILS
     detect_reachability
     printf '%s %s\n' "$REACH" "$REACH_WHY"
   )

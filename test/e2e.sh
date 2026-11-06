@@ -53,7 +53,12 @@ eq "le service est actif" "$(systemctl is-active wg-quick@wg0)" "active"
 eq "wg0 porte l adresse du serveur" "$(ip -4 -br addr show wg0 | awk '{ print $3 }')" "10.8.0.1/24"
 eq "un pair est configure" "$(wg show wg0 peers | wc -l)" "1"
 eq "cle pre-partagee presente" "$(wg show wg0 preshared-keys | awk '{ print ($2 != "(none)") }')" "1"
-eq "generation du pare-feu" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "5"
+# La generation est LUE dans le script teste, jamais ecrite en dur : un nombre fige se
+# perime a la version suivante sans que rien ne le signale, et l assertion passe alors a
+# cote de ce qu elle surveille. C est ce qui avait rendu e2e-migration.sh inoperant.
+GEN_ATTENDUE=$(grep -m1 '^readonly FW_GEN=' "$SRC" | cut -d= -f2)
+[[ $GEN_ATTENDUE =~ ^[0-9]+$ ]] || { echo "  KO   generation illisible dans $SRC" >&2; exit 2; }
+eq "generation du pare-feu" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "$GEN_ATTENDUE"
 # La fuite corrigee : sans « ! -i wg0 », un flux etabli entre deux appareils du VPN
 # contourne tout filtrage a venir.
 eq "la regle conntrack porte ! -i wg0" "$(iptables -S FORWARD | grep -c '! -i wg0')" "1"

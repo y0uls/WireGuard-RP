@@ -433,9 +433,16 @@ sudo wg-pi access allow invites internet                        # les invités :
 sudo wg-pi access allow famille maison                          # la famille : tout le réseau
 sudo wg-pi access allow famille res:nas --proto=tcp --ports=445 # et les partages du NAS
 
+# Les mêmes ports en TCP et en UDP, en UNE règle plutôt que deux à tenir à jour :
+sudo wg-pi access allow famille res:nas --proto=tcpudp --ports=27015,27036
+
 # Ajouter un port à une règle existante, sans retaper la liste.
 # « sudo wg-pi access list » donne les identifiants.
 sudo wg-pi access set p3 --ports=445,139
+
+# Réveiller un PC éteint depuis le VPN (Wake-on-LAN).
+sudo wg-pi resource add pc-jeu 192.168.1.18 --mac=aa:bb:cc:dd:ee:ff
+sudo wg-pi access allow gaming res:pc-jeu --proto=udp --ports=9
 
 # Une machine a changé d adresse : toutes les règles qui la citent suivent.
 sudo wg-pi resource add nas 192.168.1.25
@@ -519,7 +526,7 @@ penser.
 | `sudo wg-pi group join <appareil> <groupe>` | mettre un appareil dans un groupe |
 | `sudo wg-pi group leave <appareil> <groupe>` | l'en retirer |
 | `sudo wg-pi group set <appareil> <g1,g2,…>` | fixer d'un coup la liste de ses groupes |
-| `sudo wg-pi resource add <nom> <ip\|réseau> [--libelle="…"]` | déclarer un appareil de la maison, ou changer son adresse |
+| `sudo wg-pi resource add <nom> <ip\|réseau> [--libelle="…"] [--mac=…]` | déclarer un appareil de la maison, changer son adresse, ou activer son réveil à distance |
 | `sudo wg-pi resource list` · `resource rm <nom>` | lister, supprimer |
 | `sudo wg-pi access show` | ce que chaque groupe peut joindre |
 | `sudo wg-pi access list` | les règles, une par une |
@@ -529,6 +536,55 @@ penser.
 | `sudo wg-pi access plan` | essai à blanc, sans rien appliquer |
 | `sudo wg-pi access on` · `confirm` · `off` | activer, confirmer, désactiver |
 | `sudo wg-pi access check` | vérifier la cohérence |
+
+### Mises à jour
+
+Le panneau web porte un rouage en haut à droite : il dit la version installée, celle du
+dépôt, les paquets du système en attente, et met à jour wg-pi en un clic. En ligne de
+commande :
+
+| Commande | Ce qu elle fait |
+|---|---|
+| `sudo wg-pi update` | installer la dernière version de wg-pi (vos réglages ne changent pas) |
+| `sudo wg-pi maj-auto on` · `off` | activer ou désactiver les mises à jour de **sécurité** du système |
+| `sudo wg-pi check` | état complet, dont les mises à jour en attente et les redémarrages demandés |
+
+> [!TIP]
+> `maj-auto on` confie les correctifs de sécurité du système à Debian lui-même
+> (`unattended-upgrades`). C est la protection qui demande le moins d attention : la
+> plupart des failles exploitées le sont des mois après leur correctif.
+
+### Réveiller une machine éteinte depuis le VPN
+
+Donnez son adresse MAC à la ressource, et le paquet magique traversera le tunnel :
+
+```bash
+sudo wg-pi resource add pc-jeu 192.168.1.18 --mac=aa:bb:cc:dd:ee:ff
+sudo wg-pi access allow gaming res:pc-jeu --proto=udp --ports=9
+```
+
+Le port 9 est celui du réveil : c'est celui qu'utilisent Moonlight et la plupart des
+applications. Le reste se fait tout seul.
+
+<details><summary>Pourquoi une adresse MAC est nécessaire</summary>
+
+Une machine endormie ne répond plus aux appels du réseau. Votre Pi ne sait donc pas à
+quelle carte livrer le paquet de réveil, et le jette avant même d'arriver aux règles.
+
+Donner la MAC permet au Pi de figer l'association adresse → carte. Elle prend effet tout de
+suite, et se repose toute seule à chaque démarrage du Pi : vous n'avez rien à refaire.
+
+Trois adresses sont refusées, parce qu'une erreur d'un seul octet y serait sans retour :
+votre box, le Pi lui-même, et tout ce qui est hors du réseau de la maison. Une adresse
+figée ne se réapprend jamais — sur la passerelle, le Pi perdrait Internet définitivement.
+
+Vous trouverez la MAC de la machine pendant qu'elle est **allumée** :
+
+```bash
+ip neigh show 192.168.1.18
+```
+
+</details>
 
 Les destinations possibles :
 
@@ -559,10 +615,14 @@ sudo wg-pi access allow admin tout
 
 | Option de `access allow` | Rôle |
 |---|---|
-| `--proto=tcp` · `udp` · `icmp` · `any` | le protocole ; `any` par défaut, c'est-à-dire tous |
-| `--ports=445,5000-5001` | les ports, uniquement avec `--proto=tcp` ou `--proto=udp` ; au plus 15 ports, une plage en comptant deux |
+| `--proto=tcp` · `udp` · `tcpudp` · `icmp` · `any` | le protocole ; `any` par défaut, c'est-à-dire tous |
+| `--ports=445,5000-5001` | les ports ; avec `tcp`, `udp` ou `tcpudp` seulement. Au plus 15 ports, une plage en comptant deux |
 | `--sens=deux` | les deux appareils peuvent engager la connexion — **uniquement** vers un `grp:`, voir ci-dessous |
 | `--libelle="…"` | un intitulé lisible, affiché dans les listes et le panneau web |
+
+`tcpudp` pose les deux protocoles sur les mêmes ports, en **une seule règle** : c'est ce
+dont ont besoin un NAS, une imprimante ou un service de jeu, et cela évite de tenir deux
+règles jumelles à jour en parallèle — la façon la plus sûre de les voir diverger.
 
 Par défaut, seule la source engage la connexion : les réponses reviennent, mais la
 destination ne peut rien initier. `--sens=deux` lève cette restriction, et n'est accepté

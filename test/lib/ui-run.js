@@ -578,14 +578,202 @@ const neuve = env.doc.getElementById("dlg-body");
 eq("une création part toujours de champs vides", inpDe(neuve, "reg-ports").value, "");
 eq("et son groupe source reste choisissable", selDe(neuve, "reg-src").disabled, false);
 
+/* addEventListener appelle son auditeur avec l objet Event en PREMIER argument. Depuis
+   que ces fonctions prennent un parametre, un cablage direct leur livrait cet Event — un
+   objet bien vrai — et le bouton « Nouvelle ressource » ouvrait « Modifier la ressource »,
+   nom verrouille et vide, vers /api/ressources/undefined/edit. Le cablage est repare, mais
+   c est la FONCTION qu on teste : elle seule resiste au prochain copier-coller. */
+app.ouvrirNouvelleRessource({type: "click", target: {}});
+const faux = env.doc.getElementById("dlg-body");
+contient("un objet qui n est pas une ressource ouvre la création",
+         stub.textOf(faux), "Créer la ressource");
+eq("et son champ nom reste saisissable", inpDe(faux, "res-id").disabled, false);
+app.ouvrirNouvelleRegle({type: "click", target: {}});
+const fauxR = env.doc.getElementById("dlg-body");
+contient("de même pour une règle", stub.textOf(fauxR), "Créer la règle");
+
 /* La ressource : son nom est la cle citee par les regles. Le renommer les ferait
    pointer dans le vide, alors que changer son adresse les deplace toutes en silence. */
-app.ouvrirNouvelleRessource({id: "moon", libelle: "MoonLight", cible: "192.168.1.18"});
+app.ouvrirNouvelleRessource({id: "moon", libelle: "MoonLight", cible: "192.168.1.18",
+                             mac: "aa:bb:cc:dd:ee:ff"});
 const modS = env.doc.getElementById("dlg-body");
+/* Le reveil a distance : sans MAC retenue, figer l association ARP serait a refaire a
+   chaque redemarrage du Pi, et le Wake-on-LAN ne marcherait qu une fois. */
+eq("la MAC du réveil est reprise", inpDe(modS, "res-mac").value, "aa:bb:cc:dd:ee:ff");
 eq("l adresse de la ressource est reprise", inpDe(modS, "res-ip").value, "192.168.1.18");
 eq("le nom est montré mais verrouillé", inpDe(modS, "res-id").disabled, true);
 contient("et la fenêtre annonce ce que la modification entraîne",
          stub.textOf(modS), "pointera vers la nouvelle adresse");
+
+/* --- l appareil pris entre deux reglages contradictoires ------------------- */
+/* Le mode de routage (ce que l appareil ENVOIE) et les regles de son groupe (ce que le Pi
+   LAISSE PASSER) sont deux choses differentes. Quand « tout le trafic » rencontre « aucune
+   regle Internet », les noms se resolvent et aucune page ne charge. Rien ne le disait.
+   La reponse est calculee en bash, pour « wg-pi check » comme pour le panneau : deux
+   implementations de la meme regle finiraient par diverger. */
+app.setState({
+  acces: {groupes: [], ressources: [],
+          avertissements: [{appareil: "telephone", groupes: "« Administration »"}]},
+  peers: [{name: "telephone"}, {name: "pc-salon"}], server: {}, time: 6
+});
+eq("l appareil signalé par le moteur est reconnu", app.appareilSansInternet("telephone"), true);
+eq("et les autres ne le sont pas", app.appareilSansInternet("pc-salon"), false);
+/* Un etat sans la cle du tout — installation ancienne, reponse tronquee — ne doit pas
+   faire tomber le rendu de la liste des appareils. */
+app.setState({acces: {groupes: [], ressources: []}, peers: [], server: {}, time: 7});
+eq("une absence de la clé ne casse rien", app.appareilSansInternet("telephone"), false);
+
+/* --- modeles de regles ----------------------------------------------------- */
+/* L ORDRE est un piege reel et non une precaution de style : majSens vide le champ des
+   ports des que le protocole n est ni TCP ni UDP. Un modele qui ecrirait les ports AVANT
+   le protocole les perdrait en silence, et l utilisateur verrait un champ vide apres
+   avoir clique. On rejoue ici le comportement exact de majSens. */
+const champsFaux = {
+  proto: {value: "any"}, ports: {value: ""}, lib: {value: ""},
+  maj: function () {
+    if (champsFaux.proto.value !== "tcp" && champsFaux.proto.value !== "udp") {
+      champsFaux.ports.value = "";
+    }
+  }
+};
+const moon = app.MODELES_REGLE.filter(function (m) { return m.cle === "moonlight"; })[0];
+eq("Moonlight annonce deux règles", app.remplirModele(moon, champsFaux), 2);
+eq("le protocole est posé en premier", champsFaux.proto.value, "tcp");
+eq("et les ports survivent à la remise à jour", champsFaux.ports.value, "47984,47989,48010");
+eq("un libellé est proposé", champsFaux.lib.value, "Moonlight (TCP)");
+
+/* Un libelle deja saisi par l utilisateur ne doit pas etre ecrase : c est le sien. */
+const dejaRempli = {proto: {value: "any"}, ports: {value: ""}, lib: {value: "Le mien"},
+                    maj: function () {}};
+app.remplirModele(moon, dejaRempli);
+eq("un libellé déjà saisi est respecté", dejaRempli.lib.value, "Le mien");
+
+/* « -m multiport » ne va pas au-dela de 15 ports, une plage en comptant pour deux. Un
+   modele qui depasserait serait refuse a l ecriture, donc au clic — et le defaut ne se
+   verrait qu une fois chez l utilisateur. On le verifie ici, pas a l execution. */
+function budgetPorts(p) {
+  return p.split(",").reduce(function (s, x) { return s + (x.indexOf("-") >= 0 ? 2 : 1); }, 0);
+}
+const formePorts = /^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$/;
+const fautifs = [];
+app.MODELES_REGLE.forEach(function (m) {
+  if (!m.cle || !m.titre || !m.aide || !m.regles.length) { fautifs.push(m.cle + ":vide"); }
+  m.regles.forEach(function (g) {
+    if (budgetPorts(g.ports) > 15) { fautifs.push(m.cle + ":budget"); }
+    /* Aucune espace : la validation cote serveur n en tolere pas une seule. */
+    if (!formePorts.test(g.ports)) { fautifs.push(m.cle + ":forme"); }
+    /* Des ports n ont de sens qu avec TCP, UDP ou les deux : le moteur refuse les autres. */
+    if (g.proto !== "tcp" && g.proto !== "udp" && g.proto !== "tcpudp") { fautifs.push(m.cle + ":proto"); }
+    if (g.libelle.length > 60 || g.libelle.indexOf("|") >= 0) { fautifs.push(m.cle + ":libelle"); }
+  });
+});
+eq("tous les modèles tiennent dans les limites du moteur", fautifs.join(","), "");
+
+/* Un modele ne doit imposer ni destination ni sens. Lui seul sait si Moonlight vise le PC
+   du salon ou toute la maison ; et le sens est verrouille selon la destination, parce que
+   hors « groupe » le trafic de retour ne repasse pas par le VPN. */
+const imposent = app.MODELES_REGLE.filter(function (m) {
+  return m.regles.some(function (g) { return g.destination || g.dest || g.sens; });
+});
+eq("aucun modèle n impose de destination ni de sens", imposent.length, 0);
+
+/* Les modeles a deux regles sont ceux dont les ports TCP et UDP different : c est la
+   raison d etre de la route de lot. Si cette liste tombait a zero, la route serait morte
+   sans que rien ne le signale. */
+const aDeux = app.MODELES_REGLE.filter(function (m) { return m.regles.length > 1; });
+eq("au moins un modèle pose deux règles", aDeux.length > 0, true);
+const memesPorts = aDeux.filter(function (m) { return m.regles[0].ports === m.regles[1].ports; });
+eq("et leurs deux listes de ports diffèrent vraiment", memesPorts.length, 0);
+
+/* --- le cablage de la route de lot ----------------------------------------- */
+/* Tout ce qui precede verifie les DONNEES des modeles. Le branchement, lui, n etait
+   couvert par rien : quelle route part, avec quel corps, et dans quels cas. C est pourtant
+   la decision la plus delicate du formulaire — un lot envoye a tort cree une regle que
+   l utilisateur n a pas vue, un lot non envoye lui en fait creer deux a la main. */
+function soumettre(modele, retouche) {
+  env.requetes.length = 0;
+  env.etat.reponse = {status: 200, data: {ok: true}};
+  app.setState({
+    acces: {groupes: [G("gaming", "Gaming", ["telephone"])],
+            ressources: [{id: "moon", libelle: "MoonLight", cible: "192.168.1.18"}]},
+    peers: [{name: "telephone"}], server: {}, time: 9
+  });
+  app.ouvrirNouvelleRegle();
+  const b = env.doc.getElementById("dlg-body");
+  const form = stub.findAll(b, "FORM")[0];
+  selDe(b, "reg-dst").value = "res:moon";
+  form.dispatchEvent({type: "change", target: selDe(b, "reg-dst")});
+  if (modele) {
+    /* On clique le bouton du modele, par son libelle : c est ce que fait l utilisateur. */
+    const bouton = stub.findAll(b, "BUTTON").filter(function (x) {
+      return stub.textOf(x) === modele;
+    })[0];
+    if (!bouton) { return {erreur: "bouton « " + modele + " » introuvable"}; }
+    bouton.dispatchEvent({type: "click"});
+  }
+  if (retouche) { retouche(b); }
+  form.dispatchEvent({type: "submit"});
+  return env.requetes[0] || {erreur: "aucune requete"};
+}
+
+/* Moonlight : deux regles, des ports differents par protocole. Le lot doit partir. */
+const rLot = soumettre("Moonlight");
+eq("le modele a deux regles part vers la route de lot", rLot.url, "/api/regles/lot");
+eq("en POST", rLot.method, "POST");
+eq("et le corps porte les deux regles", (rLot.body && rLot.body.regles || []).length, 2);
+eq("la premiere en TCP", (rLot.body && rLot.body.regles || [{}])[0].proto, "tcp");
+eq("la seconde en UDP", (rLot.body && rLot.body.regles || [{}, {}])[1].proto, "udp");
+eq("les deux visent la meme destination",
+   (rLot.body && rLot.body.regles || [{}, {}]).map(function (x) { return x.destination; }).join(","),
+   "res:moon,res:moon");
+/* Le jeton anti-CSRF part avec : sans lui le serveur refuse, et la fenetre resterait
+   ouverte sur une erreur que personne ne saurait interpreter. */
+eq("le jeton anti-CSRF accompagne la requete",
+   typeof (rLot.entetes && rLot.entetes["X-CSRF-Token"]), "string");
+
+/* Un modele a UNE seule regle passe par la route ordinaire : envoyer un lot d un element
+   marcherait, mais la route ordinaire rend un message plus juste. */
+const rSimple = soumettre("NAS");
+eq("un modele a une seule regle passe par la route ordinaire", rSimple.url, "/api/regles");
+eq("et son corps est une regle, pas une liste", rSimple.body && rSimple.body.regles, undefined);
+eq("avec le protocole du modele", rSimple.body && rSimple.body.proto, "tcp");
+
+/* Sans modele du tout : route ordinaire aussi. */
+const rRien = soumettre(null);
+eq("sans modele, route ordinaire", rRien.url, "/api/regles");
+
+/* LE point delicat : des que l utilisateur retouche le protocole ou les ports, il ne voit
+   plus ce que contient la seconde regle. En ajouter une a son insu serait pire que de lui
+   en faire creer deux. Le lot est donc abandonne. */
+const rRetouchePorts = soumettre("Moonlight", function (b) {
+  inpDe(b, "reg-ports").value = "47984";
+});
+eq("des ports retouches abandonnent le lot", rRetouchePorts.url, "/api/regles");
+eq("et la regle envoyee porte les ports de l utilisateur",
+   rRetouchePorts.body && rRetouchePorts.body.ports, "47984");
+
+const rRetoucheProto = soumettre("Moonlight", function (b) {
+  selDe(b, "reg-proto").value = "udp";
+});
+eq("un protocole retouche abandonne le lot aussi", rRetoucheProto.url, "/api/regles");
+
+/* Un libelle que l utilisateur a ecrit lui-meme doit se retrouver sur les DEUX regles du
+   lot : sinon la seconde porterait un nom qu il n a pas choisi. */
+const rLibelle = soumettre("Moonlight", function (b) {
+  inpDe(b, "reg-lib").value = "Mon salon";
+});
+eq("un libelle saisi reste le lot", rLibelle.url, "/api/regles/lot");
+eq("et il habille les deux regles",
+   (rLibelle.body && rLibelle.body.regles || []).map(function (x) { return x.libelle; }).join("|"),
+   "Mon salon|Mon salon");
+
+/* Et le modele a deux protocoles sur les MEMES ports (« Jeu en reseau ») n est PAS un lot :
+   une seule regle en tcpudp suffit, et le moteur en pose deux lignes. */
+const rJeu = soumettre("Jeu en réseau");
+eq("le modele a deux protocoles tient en une regle", rJeu.url, "/api/regles");
+eq("portee par le protocole double", rJeu.body && rJeu.body.proto, "tcpudp");
+eq("et ses ports survivent au verrouillage des champs",
+   rJeu.body && rJeu.body.ports, "27015,27036");
 
 console.log("");
 console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");

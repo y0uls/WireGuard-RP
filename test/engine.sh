@@ -214,5 +214,54 @@ before "tout precede les regles plus precises" "-d 0.0.0.0/0" "-A WGPI-S-invites
 hasnt "les invites ne recoivent pas tout"     "-A WGPI-S-invites-B -d 0.0.0.0/0"
 
 echo
+echo "-- une seule regle, les deux protocoles"
+# Une ligne iptables ne porte qu un protocole. « tcpudp » en pose donc DEUX, sous le MEME
+# identifiant de regle : sans cela il faudrait tenir deux regles jumelles a jour en
+# parallele, ce qui est la facon la plus sure de les voir diverger.
+{
+  echo "V|1"
+  echo "MODE|filtre"
+  echo "GROUP|jeu|Jeu"
+  echo "MEMBER|telephone|jeu"
+  echo "RES|nas|Le NAS|192.168.1.20"
+  echo "POLICY|p1|1|grp:jeu|res:nas|tcpudp|27015,27036|aller|Jeu en reseau"
+  echo "POLICY|p2|1|grp:jeu|pi|tcpudp|8080|aller|Vers le Pi"
+  echo "POLICY|p3|1|grp:jeu|grp:jeu|tcpudp|7777|deux|Entre eux"
+} > "$TMP/etc/access.conf"
+plan B 1 > "$TMP/plan"
+
+# Dans la chaine du groupe : deux lignes, une par protocole, meme identifiant de regle.
+cnt "la regle pose deux lignes" "2" "wgpi:pol:p1"
+has "une ligne TCP"  "-p tcp -m multiport --dports 27015,27036"
+has "une ligne UDP"  "-p udp -m multiport --dports 27015,27036"
+# Et jamais le mot lui-meme : iptables ne connait pas de protocole « tcpudp ».
+hasnt "aucun protocole invente ne sort du moteur" "-p tcpudp"
+
+# Dans la chaine INPUT, ou les regles qui visent le Pi sont traitees a part.
+cnt "le Pi recoit aussi les deux" "2" "wgpi:pol:p2"
+
+# Et dans le sens retour, ou un acces entre groupes pose son miroir.
+cnt "le sens retour aussi" "2" "wgpi:pol:p3:retour"
+
+# Les protocoles existants ne doivent surtout pas avoir change de comportement : « any »
+# sans ports ne contraint RIEN, et faire boucler l appelant sur une sortie vide aurait
+# fait disparaitre la regle au lieu de la poser sans contrainte.
+{
+  echo "V|1"
+  echo "MODE|filtre"
+  echo "GROUP|jeu|Jeu"
+  echo "MEMBER|telephone|jeu"
+  echo "POLICY|p1|1|grp:jeu|maison|any||aller|Tout vers la maison"
+  echo "POLICY|p2|1|grp:jeu|internet|tcp|443|aller|Le web"
+  echo "POLICY|p3|1|grp:jeu|maison|icmp||aller|Le ping"
+} > "$TMP/etc/access.conf"
+plan B 1 > "$TMP/plan"
+cnt "any sans ports pose toujours une ligne" "1" "wgpi:pol:p1"
+cnt "tcp pose toujours une ligne" "1" "wgpi:pol:p2"
+has "et garde ses ports" "-p tcp -m multiport --dports 443"
+cnt "icmp pose toujours une ligne" "1" "wgpi:pol:p3"
+has "et reste de l icmp" "-p icmp"
+
+echo
 echo "  $pass réussi(s), $fail échoué(s)"
 (( fail == 0 ))

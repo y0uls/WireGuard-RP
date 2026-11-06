@@ -56,12 +56,23 @@ eq "le service tourne toujours" "$(systemctl is-active wg-quick@wg0)" "active"
 eq "le pare-feu est reste a l ancienne generation" "$(grep -c 'wg-pi-fw-gen' /etc/wg-pi/firewall.sh)" "0"
 wg-pi check >/tmp/m-check.log 2>&1
 eq "le diagnostic signale le pare-feu perime" "$(grep -c 'Pare-feu resté en génération' /tmp/m-check.log)" "1"
-eq "le diagnostic nomme la reparation" "$(grep -c 'wg-pi fw-sync' /tmp/m-check.log)" "1"
+# « au moins une » et non « exactement une » : fw-sync repare aussi les minuteurs, donc
+# plusieurs defauts peuvent legitimement y renvoyer. Exiger 1 faisait echouer ce test des
+# qu un second diagnostic nommait la meme reparation — il comptait les occurrences au lieu
+# de verifier que la reparation est nommee.
+ge "le diagnostic nomme la reparation" "$(grep -c 'wg-pi fw-sync' /tmp/m-check.log)" "1"
+# Et le minuteur de verification des mises a jour, que l ancienne version ignorait, doit
+# etre signale manquant AVANT la reparation : c est le seul endroit ou cette migration se
+# prouve sur un vrai systemd.
+ge "le minuteur manquant est signale" "$(grep -c 'Recherche des mises à jour inactive' /tmp/m-check.log)" "1"
 
 echo "-- reparation du pare-feu"
+# Le numero est LU dans le script, jamais recopie : ecrit en dur, il se demode a la
+# generation suivante et personne ne le remarque tant que le test passe encore.
+GEN_CIBLE=$(grep -m1 "^readonly FW_GEN=" "$B" | cut -d= -f2)
 wg-pi fw-sync >/tmp/m-sync.log 2>&1
-eq "la migration annonce la generation" "$(grep -c 'génération 0 → 5' /tmp/m-sync.log)" "1"
-eq "le marqueur est pose" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "5"
+eq "la migration annonce la generation" "$(grep -c "génération 0 → $GEN_CIBLE" /tmp/m-sync.log)" "1"
+eq "le marqueur est pose" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "$GEN_CIBLE"
 eq "la fuite pair-a-pair est fermee" "$(iptables -S FORWARD | grep -c '! -i wg0')" "1"
 eq "le diagnostic est satisfait" "$(wg-pi check 2>&1 | grep -c 'Règles du pare-feu à jour')" "1"
 eq "les appareils sont toujours intacts" "$(wg show wg0 peers | wc -l)" "2"
@@ -84,13 +95,25 @@ eq "les appareils ont survecu a tout le parcours" "$(wg show wg0 peers | wc -l)"
 
 echo "-- une seconde mise a jour migre toute seule"
 # La nouvelle version, elle, appelle la migration depuis sa propre commande « update ».
-sed 's/^readonly FW_GEN=4$/readonly FW_GEN=5/' "$B" > /root/v-suivante.sh
+#
+# Les deux numeros sont LUS dans le script au lieu d etre ecrits en dur. Ecrits en dur,
+# ce sed a cesse de correspondre des que FW_GEN a depasse 4 : « v-suivante » devenait une
+# copie conforme de la version deja installee, « update » repondait « deja a jour », et
+# l assertion comparait la generation installee a elle-meme. Le test passait en ne
+# prouvant plus rien. La version doit monter AUSSI, sinon update refuse de descendre.
+GEN_ACT=$(grep -m1 "^readonly FW_GEN=" "$B" | cut -d= -f2)
+GEN_SUIV=$(( GEN_ACT + 1 ))
+VER_ACT=$(grep -m1 "^readonly WGPI_VERSION=" "$B" | cut -d'"' -f2)
+VER_SUIV="${VER_ACT%.*}.$(( ${VER_ACT##*.} + 1 ))"
+sed -e "s/^readonly FW_GEN=$GEN_ACT/readonly FW_GEN=$GEN_SUIV/" -e "s/^readonly WGPI_VERSION=.$VER_ACT./readonly WGPI_VERSION=\"$VER_SUIV\"/" "$B" > /root/v-suivante.sh
+eq "la version suivante a bien ete fabriquee" "$(grep -c "^readonly FW_GEN=$GEN_SUIV" /root/v-suivante.sh)" "1"
+eq "et sa version a bien monte" "$(grep -c "^readonly WGPI_VERSION=.$VER_SUIV." /root/v-suivante.sh)" "1"
 if WGPI_URL="file:///root/v-suivante.sh" timeout 600 wg-pi update >/tmp/m-update2.log 2>&1; then
   ok "la seconde mise a jour se termine"
 else
   ko "la seconde mise a jour a echoue"; tail -8 /tmp/m-update2.log
 fi
-eq "le pare-feu a migre SANS intervention" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "5"
+eq "le pare-feu a migre SANS intervention" "$(sed -n '2p' /etc/wg-pi/firewall.sh | awk '{ print $3 }')" "$GEN_SUIV"
 eq "le filtrage est toujours applique" "$(bash -c "source <(head -n -1 /usr/local/sbin/wg-pi); load_settings; access_kernel_state")" "actif"
 
 echo

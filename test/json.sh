@@ -156,6 +156,64 @@ eq "un appareil sans groupe nommé reste dans tous" \
    "$(q "','.join(sorted([p['groupes'] for p in d['peers'] if p['name']=='tablette'][0]))")" \
    "invites,tous"
 
+echo
+echo "-- l adresse MAC et les avertissements publies"
+# Deux parties du document que rien ne verifiait. Le panneau lit « mac » pour afficher le
+# reveil a distance, et « avertissements » pour la pastille « sans Internet ». Un champ
+# decale dans la boucle des ressources mettrait le libelle a la place de la cible sans
+# qu aucun test ne bronche, et le panneau afficherait une adresse qui n existe pas.
+mkdir -p "$TMP/etc/clients"
+# Un appareil qui envoie TOUT son trafic par le tunnel : c est la condition de
+# l avertissement de contradiction.
+{ echo "[Interface]"; echo "AllowedIPs = 0.0.0.0/0, ::/0"; } > "$TMP/etc/clients/telephone.conf"
+{
+  echo "V|1"
+  echo "MODE|filtre"
+  echo "GROUP|adm|Administration"
+  echo "MEMBER|telephone|adm"
+  echo "RES|pcjeu|Le PC de jeu|192.168.1.18|aa:bb:cc:dd:ee:ff"
+  echo "RES|nas|NAS ${DQ}maison${DQ}|192.168.1.20"
+  echo "POLICY|p1|1|grp:adm|maison|any||aller|Vers la maison"
+} > "$TMP/etc/access.conf"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$TMP/out.json" 2>/dev/null; then
+  ok "le JSON reste valide avec une MAC et un avertissement"
+else
+  ko "JSON invalide avec une MAC et un avertissement"
+fi
+# Chaque champ verifie SEPAREMENT : un decalage d un seul cran serait invisible si on ne
+# comparait que le nombre de ressources.
+eq "la ressource porte son identifiant"  "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}pcjeu${DQ}][0][${DQ}id${DQ}]")" "pcjeu"
+eq "son libelle"                         "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}pcjeu${DQ}][0][${DQ}libelle${DQ}]")" "Le PC de jeu"
+eq "sa cible"                            "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}pcjeu${DQ}][0][${DQ}cible${DQ}]")" "192.168.1.18"
+eq "et son adresse MAC"                  "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}pcjeu${DQ}][0][${DQ}mac${DQ}]")" "aa:bb:cc:dd:ee:ff"
+# Une ressource sans MAC publie une chaine VIDE, et non la cible du voisin ni un « null » :
+# le panneau teste la verite du champ pour decider d afficher le reveil a distance.
+eq "une ressource sans MAC publie une MAC vide" "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}nas${DQ}][0][${DQ}mac${DQ}]")" ""
+eq "et garde sa propre cible"                   "$(q "[r for r in d[${DQ}acces${DQ}][${DQ}ressources${DQ}] if r[${DQ}id${DQ}]==${DQ}nas${DQ}][0][${DQ}cible${DQ}]")" "192.168.1.20"
+# L avertissement : un appareil qui envoie tout par le tunnel dans un groupe sans Internet.
+eq "un appareil contradictoire est signale" "$(q "len(d[${DQ}acces${DQ}][${DQ}avertissements${DQ}])")" "1"
+eq "par son nom"                            "$(q "d[${DQ}acces${DQ}][${DQ}avertissements${DQ}][0][${DQ}appareil${DQ}]")" "telephone"
+eq "et par le groupe en cause"              "$(q "d[${DQ}acces${DQ}][${DQ}avertissements${DQ}][0][${DQ}groupes${DQ}] != ${DQ}${DQ}")" "True"
+# Et il se TAIT des que le groupe a Internet : sinon la pastille devient du bruit que
+# personne ne lit plus.
+{
+  echo "V|1"; echo "MODE|filtre"; echo "GROUP|adm|Administration"
+  echo "MEMBER|telephone|adm"
+  echo "POLICY|p1|1|grp:adm|internet|any||aller|Internet"
+} > "$TMP/etc/access.conf"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "aucun avertissement quand le groupe a Internet" "$(q "len(d[${DQ}acces${DQ}][${DQ}avertissements${DQ}])")" "0"
+# Hors filtrage non plus : rien n est encore applique, l avertissement serait premature.
+{
+  echo "V|1"; echo "MODE|ouvert"; echo "GROUP|adm|Administration"
+  echo "MEMBER|telephone|adm"
+  echo "POLICY|p1|1|grp:adm|maison|any||aller|Vers la maison"
+} > "$TMP/etc/access.conf"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "ni hors filtrage" "$(q "len(d[${DQ}acces${DQ}][${DQ}avertissements${DQ}])")" "0"
+rm -rf "$TMP/etc/clients"
+
 echo "-- compatibilité : aucun fichier d accès"
 rm -f "$TMP/etc/access.conf"
 ( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true

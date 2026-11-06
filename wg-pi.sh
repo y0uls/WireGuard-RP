@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly WGPI_VERSION="1.6.0"
+readonly WGPI_VERSION="1.8.0"
 readonly WGPI_GH="y0uls/WireGuard-RP"
 readonly WGPI_BRANCH="main"
 readonly WGPI_REPO="https://github.com/$WGPI_GH"
@@ -45,7 +45,7 @@ readonly MARK="### Client:"
 readonly KEEPALIVE=25
 # Génération du pare-feu généré. À incrémenter dès que write_firewall_script change :
 # c'est ce qui déclenche la migration d'une installation existante par « wg-pi update ».
-readonly FW_GEN=5
+readonly FW_GEN=6
 # Groupes, ressources et règles d'accès (sudo wg-pi group / resource / access)
 readonly ACCESS_FILE="$STATE_DIR/access.conf"
 readonly ACCESS_VER=1
@@ -56,6 +56,12 @@ readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 # Instantané du pare-feu et minuteur d'annulation : dans /run, donc effacés au
 # redémarrage — c'est voulu, un instantané périmé serait pire que pas d'instantané.
 readonly ACCESS_SNAP="/run/wg-pi/access-snapshot"
+# Le relevé des mises à jour vit dans /run et NON dans STATE_DIR : « wg-pi backup » empaquette
+# STATE_DIR entier et « restore » le réinstalle tel quel, éventuellement sur un AUTRE Pi. Le
+# panneau afficherait alors un compte de paquets et une version de WireGuard venus d'ailleurs,
+# sous un horodatage qui les ferait passer pour frais.
+readonly SYS_DIR="/run/wg-pi"
+readonly SYS_FILE="/run/wg-pi/systeme.json"
 readonly ACCESS_ROLLBACK_UNIT="wg-pi-access-rollback"
 # La confirmation, elle, doit SURVIVRE au redémarrage : dans STATE_DIR, pas dans /run.
 readonly ACCESS_CONFIRMED="$STATE_DIR/access-confirme"
@@ -264,6 +270,17 @@ valid_name()      { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,14}$ ]]; }   # pas de 
 port_in_use()     { [[ -n $(ss -Hlun "sport = :$1" 2>/dev/null) ]]; }
 is_installed()    { [[ -f $SETTINGS_FILE && -f $WG_CONF ]]; }
 wg_running()      { systemctl is-active --quiet "wg-quick@$WG_IF"; }
+
+# Repose les associations ARP figées immédiatement, au lieu d'attendre le prochain
+# montage du tunnel. Sans effet si le tunnel est à l'arrêt — c'est alors son démarrage
+# qui s'en charge — ou si le pare-feu installé est trop ancien pour connaître ce verbe,
+# auquel cas « wg-pi update » le régénérera.
+arp_resync() {
+  [[ -x $FW_SCRIPT ]] || return 0
+  wg_running || return 0
+  "$FW_SCRIPT" arp >>"$LOG_FILE" 2>&1 || true
+  return 0
+}
 
 human() { numfmt --to=iec --suffix=o "${1:-0}" 2>/dev/null || echo "${1:-0} o"; }
 
@@ -629,6 +646,13 @@ write_firewall_script() {
     echo "NET6='${WG_NET6}/64'"
     echo "IPV6_NAT='$IPV6_NAT'"
     echo "IPV6_ON='$IPV6_ON'"
+    echo "LAN_IF='$LAN_IF'"
+    echo "LAN_GW='$LAN_GW'"
+    echo "LAN_IP='$LAN_IP'"
+    # Liste des associations que CE script a figées. Dans /run : une entrée permanente du
+    # noyau ne survit pas davantage à un redémarrage, les deux durées de vie coïncident donc
+    # exactement, et rien ne reste à nettoyer après une coupure de courant.
+    echo "ARP_STATE='/run/wg-pi/arp-figees'"
     cat <<'EOF'
 
 # Le filtrage est-il demandé ? Lu dans le fichier d'accès, pas dans les réglages : c'est
@@ -711,10 +735,78 @@ v6_block_add() {
   return 0
 }
 
+# Réveil à distance (Wake-on-LAN) à travers le VPN.
+#
+# Une machine endormie ne répond plus à l'ARP : le Pi ne sait donc pas à quelle carte
+# livrer le paquet magique, et le jette avant même d'arriver aux règles de filtrage.
+# Figer l'association adresse → carte lève cet obstacle. Cela se perd à chaque
+# redémarrage, d'où la repose ici : wg-quick appelle ce script au démarrage du tunnel,
+# donc à chaque démarrage du Pi.
+#
+# On lit le fichier d'accès DIRECTEMENT, et non par wg-pi : ce script tourne dans
+# PostUp, avant que quoi que ce soit d'autre soit garanti disponible.
+# Ici les champs sont ceux du FICHIER : RES|<id>|<libellé>|<cible>|<mac>, donc $4 et $5.
+arp_fige() {
+  [ -n "$LAN_IF" ] || return 0
+  [ -r "$ACCESS_FILE" ] || return 0
+  command -v ip >/dev/null 2>&1 || return 0
+  # Le dossier se deduit du chemin de la liste, et n est pas ecrit en dur : un test qui
+  # execute ce script pour de vrai doit pouvoir detourner les deux.
+  mkdir -p "${ARP_STATE%/*}" 2>/dev/null || true
+  chmod 700 "${ARP_STATE%/*}" 2>/dev/null || true
+  awk -F'|' '$1 == "RES" && $5 != "" { print $4 " " $5 }' "$ACCESS_FILE" |
+  while read -r cible mac; do
+    [ -n "$cible" ] && [ -n "$mac" ] || continue
+    # Un réseau entier n'a pas de carte : seule une adresse unique se fige.
+    case "$cible" in */*) continue ;; esac
+    # Dernier rempart, pour un fichier édité à la main : figer une MAC fausse sur la box
+    # ou sur le Pi lui-même couperait le réseau du Pi DÉFINITIVEMENT — plus d'Internet,
+    # plus de mise à jour, plus de VPN pour diagnostiquer, et rien de réparable à
+    # distance. La saisie le refuse déjà ; ici on refuse de l'exécuter.
+    [ "$cible" = "$LAN_GW" ] && continue
+    [ "$cible" = "$LAN_IP" ] && continue
+    if ip neigh replace "$cible" lladdr "$mac" dev "$LAN_IF" nud permanent 2>/dev/null; then
+      # On note ce que NOUS avons figé : au retrait, il ne faut toucher qu'à ça.
+      echo "$cible" >> "$ARP_STATE"
+    fi
+  done
+  return 0
+}
+
+# Retrait fondé sur ce que NOUS avons posé, et non sur ce que déclare le fichier d'accès
+# ni sur tout ce que porte le noyau.
+#
+# Déduire la liste à retirer de l'état VOULU laissait orpheline toute association dont
+# l'adresse venait de changer, dont la MAC venait d'être effacée, ou dont la ressource
+# venait d'être supprimée : elle n'était plus citée nulle part, donc plus jamais retirée.
+# Or une entrée permanente ne se réapprend jamais par ARP, et elle envoie vers une carte
+# inexistante TOUT le trafic du Pi vers cette adresse — y compris celui destiné à
+# l'appareil qui récupérerait ensuite ce bail DHCP.
+#
+# Balayer à l'inverse TOUT ce que le noyau marque « permanent » sur l'interface locale
+# allait trop loin : un administrateur qui fige lui-même la MAC de sa box contre
+# l'usurpation ARP voyait son durcissement effacé au premier rechargement du pare-feu,
+# sans un mot. Ce n'est pas à wg-pi de défaire ce qu'il n'a pas fait.
+#
+# D'où cette liste, écrite par arp_fige : elle dit ce que ce script a figé pendant la
+# session en cours, ce qui couvre les trois cas orphelins ci-dessus sans toucher au reste.
+arp_libere() {
+  [ -n "$LAN_IF" ] || return 0
+  command -v ip >/dev/null 2>&1 || return 0
+  [ -r "$ARP_STATE" ] || return 0
+  while read -r cible; do
+    [ -n "$cible" ] || continue
+    ip neigh del "$cible" dev "$LAN_IF" 2>/dev/null || true
+  done < "$ARP_STATE"
+  rm -f "$ARP_STATE"
+  return 0
+}
+
 base_down() {
   legacy_down
   blanket_del
   v6_block_del
+  arp_libere
   rules -D iptables "$NET4" 2>/dev/null
   [ "$IPV6_NAT" = 1 ] && rules -D ip6tables "$NET6" 2>/dev/null
   return 0
@@ -736,6 +828,8 @@ base_up() {
   elif [ "$IPV6_ON" = 1 ]; then
     v6_block_add
   fi
+  # APRÈS le base_down du début, qui vient de les retirer.
+  arp_fige
   return 0
 }
 
@@ -761,8 +855,14 @@ case "$1" in
   # qu'appelle la migration après une mise à jour : jamais un sous-ensemble des règles,
   # sinon la remédiation affichée serait fausse.
   reload) access_down; base_down; base_up || exit 1; access_up || echo "wg-pi : règles d accès non appliquées (sudo wg-pi access check)" >&2 ;;
+  # Les seules associations figées, sans toucher au pare-feu. « wg-pi resource » l'appelle
+  # dès qu'une adresse matérielle change, pour que le réveil prenne effet TOUT DE SUITE.
+  # Sans ce verbe, la pose n'avait lieu qu'au montage suivant du tunnel : la commande
+  # annonçait un succès que le noyau ignorait, et une MAC corrigée laissait en place
+  # l'ancienne, fausse — donc la machine injoignable alors même qu'on venait de la réparer.
+  arp)  arp_libere; arp_fige ;;
   *)
-    echo "usage : $0 up|down|reload" >&2
+    echo "usage : $0 up|down|reload|arp" >&2
     exit 2
     ;;
 esac
@@ -785,11 +885,19 @@ fw_installed_gen() {
 # l'installation et à la restauration, de sorte qu'une mise à jour laissait en place
 # l'ancien pare-feu et qu'aucune correction de règle n'atteignait jamais les installations
 # existantes.
+# fw_sync [--force] : régénère le pare-feu quand sa génération est périmée. « --force »
+# régénère même à génération égale, pour les cas où ce n est pas la génération qui a changé
+# mais les réglages recopiés DANS le fichier généré (LAN_IF, LAN_GW, LAN_IP).
 fw_sync() {
-  local cur sauve=""
+  local cur sauve="" force=0
+  [[ ${1-} == --force ]] && force=1
   cur=$(fw_installed_gen)
-  (( cur == FW_GEN )) && return 0
-  info "Mise à jour des règles du pare-feu (génération $cur → $FW_GEN)…"
+  (( ! force && cur == FW_GEN )) && return 0
+  if (( force )); then
+    info "Régénération des règles du pare-feu…"
+  else
+    info "Mise à jour des règles du pare-feu (génération $cur → $FW_GEN)…"
+  fi
   # Le nouveau fichier porte la nouvelle génération DÈS SON ÉCRITURE. Si le
   # rechargement échoue ensuite, le laisser en place ferait mentir « fw-sync » et
   # « check », qui se croiraient à jour précisément quand il faut agir. On garde donc
@@ -862,6 +970,65 @@ open_ufw() {
   run "Ouverture du port $WG_PORT/udp dans le pare-feu UFW" ufw allow "$WG_PORT/udp" comment "WireGuard (wg-pi)"
 }
 
+# Les mises à jour de sécurité tournent-elles VRAIMENT ? actif | incoherent | inactif.
+#
+# Même doctrine que pour le filtrage : settings.conf dit ce qui a été DEMANDÉ, le système dit
+# ce qui EST. Trois faits sont nécessaires, et un seul manquant suffit à tout rendre inerte :
+# le paquet installé, la clé APT à 1, et le minuteur d'APT qui seul relit cette clé.
+# La clé est lue par « apt-config », donc sur la fusion de tout /etc/apt/apt.conf.d : un grep
+# sur 20auto-upgrades manquerait un fichier de rang supérieur qui le contredit.
+unattended_state() {
+  local k t
+  dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q "ok installed" ||
+    { echo inactif; return 0; }
+  command -v apt-config >/dev/null 2>&1 || { echo inactif; return 0; }
+  k=$(apt-config dump --format '%v%n' APT::Periodic::Unattended-Upgrade 2>/dev/null)
+  t=$(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || echo inactif)
+  [[ ${k:-0} != 0 && $t == active ]] && { echo actif; return 0; }
+  # « incohérent » veut dire : DEMANDÉ mais inopérant. Le test était un OU, si bien qu un
+  # Pi où l utilisateur venait de faire « maj-auto off » (clé à 0) était déclaré incohérent
+  # parce que le minuteur d apt, livré ACTIF par Debian, tournait toujours. « wg-pi check »
+  # comptait donc un problème juste après avoir obéi, et proposait « maj-auto on » comme
+  # remède à ce que l utilisateur venait de demander.
+  [[ ${k:-0} != 0 ]] && { echo incoherent; return 0; }
+  echo inactif
+}
+
+# Nombre de paquets en attente, d'après le cache LOCAL : aucun accès réseau.
+# « Debug::NoLocking » est obligatoire — le panneau tourne en root, et apt-get ne renonce au
+# verrou en simulation que pour un utilisateur ordinaire : sans cela une simple lecture
+# pourrait attendre qu'unattended-upgrades ait fini.
+pending_upgrades() {
+  local n
+  n=$(LC_ALL=C apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null | grep -c '^Inst ' || true)
+  printf '%s' "${n:-0}"
+}
+
+# Version de wireguard-tools. L'idiome complet, statut compris : un paquet supprimé mais non
+# purgé rendrait tout de même une version.
+wg_tools_version() {
+  local s
+  s=$(dpkg-query -W -f='${Status}|${Version}' wireguard-tools 2>/dev/null) || return 0
+  [[ $s == *"ok installed"* ]] || return 0
+  printf '%s' "${s#*|}"
+}
+
+# Version publiée au dépôt, sans télécharger les 375 Ko du script : « readonly WGPI_VERSION= »
+# est à la ligne 20, donc dans les deux premiers kilo-octets. Une requête de plage suffit.
+# Les CRLF sont retirés : le motif est ancré sur le guillemet de fin, et un fichier en CRLF
+# rendrait une version vide EN SILENCE.
+# N'écrit rien sur la sortie d'erreur de l'appelant : latest_script_url y pose son propre
+# avertissement, que l'on redirige.
+depot_version() {
+  local url v
+  url=$(latest_script_url 2>/dev/null) || return 1
+  [[ -n $url ]] || return 1
+  v=$(curl -fsSL --max-time 10 -r 0-2047 "$url" 2>/dev/null | tr -d '\r' |
+        sed -n 's/^readonly WGPI_VERSION="\(.*\)"$/\1/p' | head -n1)
+  [[ $v =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  printf '%s' "$v"
+}
+
 setup_unattended() {
   ensure_packages unattended-upgrades || return 1
   printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unattended-Upgrade "1";' \
@@ -881,6 +1048,13 @@ setup_unattended() {
     } >"$UNATTENDED_FILE"
     chmod 644 "$UNATTENDED_FILE"
   fi
+  # Les clés APT DEMANDENT la mise à jour ; c est le minuteur du système qui l EXÉCUTE.
+  # Sans cette ligne, « maj-auto on » rendait 0 et annonçait « activées » sur un Pi où le
+  # minuteur avait été désactivé — l état que unattended_state appelle « incohérent », et
+  # dont le diagnostic proposait de sortir... par « maj-auto on ». Le remède ne pouvait pas
+  # agir sur la cause. apt-daily rafraîchit les listes, apt-daily-upgrade installe.
+  systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >>"$LOG_FILE" 2>&1 ||
+    warn "Le minuteur du système n a pas pu être activé : rien ne s installera tout seul."
   ok "Mises à jour de sécurité automatiques activées"
 }
 
@@ -972,9 +1146,18 @@ setup_timers() {
     write_unit wg-pi-upnp.timer "[Unit]" "Description=wg-pi : vérifie l'ouverture du port toutes les 30 minutes" "" \
       "[Timer]" "OnBootSec=2min" "OnUnitActiveSec=30min" "" "[Install]" "WantedBy=timers.target"
   fi
+  # Hors de tout « if » : contrairement à DuckDNS et à UPnP, savoir si une mise à jour existe
+  # ne dépend d'aucun choix d'installation. Le délai aléatoire évite que tous les Pi du monde
+  # interrogent GitHub à la même seconde après une coupure de courant de quartier.
+  write_unit wg-pi-update-check.service "[Unit]" "Description=wg-pi : recherche des mises à jour disponibles" \
+    "Wants=network-online.target" "After=network-online.target" "" \
+    "[Service]" "Type=oneshot" "ExecStart=$BIN_PATH update-check"
+  write_unit wg-pi-update-check.timer "[Unit]" "Description=wg-pi : vérifie les mises à jour une fois par jour" "" \
+    "[Timer]" "OnBootSec=10min" "OnUnitActiveSec=24h" "RandomizedDelaySec=1h" "" "[Install]" "WantedBy=timers.target"
   systemctl daemon-reload
   [[ $DDNS == duckdns ]] && { systemctl enable --now wg-pi-duckdns.timer >>"$LOG_FILE" 2>&1 || warn "Impossible d'activer la mise à jour DuckDNS."; }
   (( UPNP )) && { systemctl enable --now wg-pi-upnp.timer >>"$LOG_FILE" 2>&1 || warn "Impossible d'activer le maintien UPnP."; }
+  systemctl enable --now wg-pi-update-check.timer >>"$LOG_FILE" 2>&1 || warn "Impossible d'activer la vérification des mises à jour."
   return 0
 }
 
@@ -1122,6 +1305,19 @@ client_pubkey() { peers_table | awk -v n="$1" '$1 "" == n "" { print $3 }'; }
 client_names()  { peers_table | awk '{ print $1 }'; }
 client_state()  { peers_table | awk -v n="$1" '$1 "" == n "" { print $4 }'; }
 
+# Mode de routage d'un appareil : ce que SON fichier de configuration lui fait envoyer dans
+# le tunnel. C'est le seul endroit où il est écrit — ni wg0.conf, ni settings.conf, ni
+# access.conf ne le connaissent.
+#
+# Ne JAMAIS le déduire de DEFAULT_ROUTE : ce réglage n'est que la valeur proposée au
+# prochain « wg-pi add », et créer un appareil dans l'autre mode est parfaitement légal.
+# Fichier absent ou illisible : on répond « split », le mode qui ne déclenche aucun
+# avertissement. Se taire vaut mieux qu'alarmer sur une lecture ratée.
+client_route_mode() {
+  grep -q '^AllowedIPs = 0\.0\.0\.0/0' "$CLIENTS_DIR/${1-}.conf" 2>/dev/null && { echo full; return 0; }
+  echo split
+}
+
 # set_client_state <nom> on|off : coupe ou rétablit l'accès d'un appareil sans le supprimer.
 # Désactivé, son bloc [Peer] reste dans wg0.conf (il garde son IP) mais commenté : wg-quick l'ignore.
 set_client_state() {
@@ -1240,6 +1436,13 @@ add_client() {
   export_client "$name"
   ok "Appareil « $name » créé (adresse VPN $WG_NET4.$n)"
   show_client "$name"
+  # reload_wg fait « wg syncconf » : wg-quick ne rejoue pas son PostUp, donc le moteur
+  # d'accès n'est pas réappliqué. Sans cette ligne, le nouvel appareil n'a aucun saut vers
+  # la chaîne de son groupe, tombe sur WGPI-DENY, et ne joint RIEN — alors que le QR code
+  # vient de s'afficher et que tous les diagnostics restent verts.
+  # --deja-valide : la liste des appareils change, mais pas ce que les appareils déjà en
+  # place peuvent joindre. Rien à revalider, donc rien à redemander.
+  access_apply_apres_ecriture --deja-valide
 }
 
 # Dossier ~/wireguard-clients de l'utilisateur qui a lancé sudo (vide si root direct)
@@ -1333,7 +1536,7 @@ wait_handshake() {
 #
 # Sources      : grp:<id>
 # Destinations : internet | maison | pi | res:<id> | grp:<id>
-# Protocoles   : any | tcp | udp | icmp
+# Protocoles   : any | tcp | udp | tcpudp | icmp
 # Sens         : aller (seule la source initie) | deux
 # ----------------------------------------------------------------------------
 
@@ -1379,12 +1582,36 @@ access_group_exists() {
   access_rows GROUP | awk -F'|' -v g="${1-}" '$1 == g { f = 1 } END { exit !f }'
 }
 
+# Ce groupe a-t-il une règle active qui donne Internet ? DEUX destinations le donnent :
+# « internet », et « tout » qui ne pose aucune contrainte de destination. Les oublier l'une
+# ou l'autre ferait un avertissement faux, c'est-à-dire pire que pas d'avertissement.
+# access_rows retire le préfixe de type : l'activité est $2 et la destination $4.
+access_group_has_internet() {
+  # Une ressource peut couvrir tout Internet : « resource add monde 0.0.0.0/0 » est accepté,
+  # et le moteur en fait « -d 0.0.0.0/0 -j ACCEPT ». Ne regarder que les destinations
+  # nommées faisait sonner l avertissement « sans Internet » sur un appareil qui a tout.
+  # Les ressources sont lues d abord, séparées des règles par une ligne « -- » : access_rows
+  # retire le préfixe de type, donc une ressource est id|libellé|cible|mac.
+  { access_rows RES; echo '--'; access_rows POLICY; } | awk -F'|' -v g="grp:${1-}" '
+    $1 == "--" { regles = 1; next }
+    !regles { cible[$1] = $3; next }
+    $2 == 1 && $3 == g && ($4 == "internet" || $4 == "tout") { f = 1 }
+    $2 == 1 && $3 == g && $4 ~ /^res:/ && cible[substr($4, 5)] == "0.0.0.0/0" { f = 1 }
+    END { exit !f }'
+}
+
 access_res_exists() {
   access_rows RES | awk -F'|' -v r="${1-}" '$1 == r { f = 1 } END { exit !f }'
 }
 
 access_res_target() {
   access_rows RES | awk -F'|' -v r="${1-}" '$1 == r { print $3; exit }'
+}
+
+# La MAC est le CINQUIÈME champ du fichier, mais le QUATRIÈME ici : access_rows retire le
+# préfixe de type. Un « print $5 » écrit de mémoire lirait du vide sans rien signaler.
+access_res_mac() {
+  access_rows RES | awk -F'|' -v r="${1-}" '$1 == r { print $4; exit }'
 }
 
 # Libellé d'un groupe, ou son identifiant à défaut.
@@ -1458,7 +1685,7 @@ access_valid_label() {
 }
 
 access_valid_proto() {
-  case ${1-} in any|tcp|udp|icmp) return 0 ;; *) return 1 ;; esac
+  case ${1-} in any|tcp|udp|tcpudp|icmp) return 0 ;; *) return 1 ;; esac
 }
 
 access_valid_dir() {
@@ -1466,6 +1693,27 @@ access_valid_dir() {
 }
 
 # Une cible de ressource : une adresse IPv4 ou un réseau IPv4.
+# Une adresse MAC, et RIEN d'autre : aa:bb:cc:dd:ee:ff. Le séparateur est le deux-points,
+# comme l'écrit « ip neigh », et les tirets de Windows sont acceptés à la saisie puis
+# normalisés — jamais stockés tels quels, sinon deux écritures de la même carte donneraient
+# deux chaînes différentes.
+#
+# La sévérité n'est pas du zèle. access_check ne détectait une barre verticale glissée dans
+# un LIBELLÉ de ressource que parce que quatre champs étaient la seule arité légitime : au
+# cinquième champ, « RES|nas|Le NAS|192.168.1.99|192.168.1.20 » redeviendrait indiscernable
+# d'une ressource munie d'une MAC. C'est ce validateur qui reprend ce rôle, et il ne peut le
+# tenir que s'il refuse une adresse IP.
+access_valid_mac() {
+  [[ ${1-} =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+# aa-bb-... ou AA:BB:... deviennent aa:bb:... Appelé AVANT la validation.
+access_norm_mac() {
+  local m=${1-}
+  m=${m//-/:}
+  printf '%s' "${m,,}"
+}
+
 access_valid_target() {
   local t=${1-}
   if [[ $t == */* ]]; then
@@ -1560,7 +1808,11 @@ access_save() {
         [[ -n $a ]] || continue
         [[ -n ${seen[R$a]:-} ]] && continue
         seen[R$a]=1
-        resources+=("RES|$a|$b|$c")
+        # « ${d:+|$d} » et non « |$d » : sans ressource munie d'une MAC, le fichier doit
+        # rester octet pour octet celui d'avant. Trois tests comparent son contenu littéral,
+        # et surtout une barre vide en fin de ligne serait un cinquième champ — donc une MAC
+        # vide que access_check signalerait à tort sur toutes les installations existantes.
+        resources+=("RES|$a|$b|$c${d:+|$d}")
         ;;
       MEMBER)
         [[ -n $a && -n $b ]] || continue
@@ -2185,6 +2437,12 @@ cmd_remove() {
     ask_yn "Supprimer « $name » ? Il ne pourra plus se connecter." n || { info "Rien n'a été supprimé."; return 0; }
   fi
   remove_client "$name"
+  # Plus important encore que pour un ajout : les adresses du tunnel sont réattribuées.
+  # Sans réapplication, le saut de l'appareil supprimé reste dans le noyau, et le PROCHAIN
+  # appareil qui reçoit la même adresse hérite de ses accès.
+  # --deja-valide : la liste des appareils change, mais pas ce que les appareils déjà en
+  # place peuvent joindre. Rien à revalider, donc rien à redemander.
+  access_apply_apres_ecriture --deja-valide
 }
 
 # cmd_set_state on|off [nom] : rétablit ou coupe l'accès d'un appareil (sans le supprimer)
@@ -2204,6 +2462,11 @@ cmd_set_state() {
   else
     ok "Accès de « $name » rétabli."
   fi
+  # « Coupé » doit l'être dans le noyau aussi, et « rétabli » doit retrouver ses accès :
+  # le moteur ne pose de saut que pour les appareils actifs.
+  # --deja-valide : la liste des appareils change, mais pas ce que les appareils déjà en
+  # place peuvent joindre. Rien à revalider, donc rien à redemander.
+  access_apply_apres_ecriture --deja-valide
 }
 
 # Menu : bascule l'état d'un appareil
@@ -2235,7 +2498,22 @@ cmd_rename() {
     [[ -f $dir/$old.conf ]] && mv -f "$dir/$old.conf" "$dir/$new.conf"
     [[ -f $dir/$old.png ]] && mv -f "$dir/$old.png" "$dir/$new.png"
   done
+  # Les appartenances de groupe citent l'appareil par son NOM. Sans ce renommage, elles
+  # désignent un appareil qui n'existe plus : le moteur ne pose plus le saut vers la chaîne
+  # du groupe — l'appareil perd donc tous ses accès — et la première écriture suivante
+  # d'access.conf les purge pour de bon, sans rien dire. Après le déplacement des fichiers,
+  # pour que la purge d'access_save reconnaisse le nouveau nom.
+  if [[ -f $ACCESS_FILE ]]; then
+    access_cat |
+      awk -F'|' -v OFS='|' -v o="$old" -v nn="$new" \
+        '{ if (NF && $1 == "MEMBER" && $2 == o) $2 = nn; print }' |
+      access_save ||
+        warn "Appartenances de groupe non renommées : vérifiez « sudo wg-pi group list »."
+  fi
   ok "« $old » s'appelle maintenant « $new » (rien à changer sur l'appareil)."
+  # --deja-valide : les appartenances sont les mêmes, sous un autre nom. La politique
+  # approuvée par un humain est inchangée.
+  access_apply_apres_ecriture --deja-valide
 }
 
 cmd_qr() {
@@ -2379,6 +2657,7 @@ cmd_check() {
         ;;
     esac
     access_dns_warn || (( problems++ ))
+    access_route_warn || (( problems++ ))
   else
     info "Aucun cloisonnement entre appareils (sudo wg-pi access show pour en savoir plus)"
   fi
@@ -2388,6 +2667,21 @@ cmd_check() {
     else fail "Mise à jour DuckDNS inactive → sudo systemctl enable --now wg-pi-duckdns.timer"; (( problems++ ))
     fi
   fi
+  # Le minuteur de vérification, et surtout l état RÉEL des mises à jour de sécurité : le
+  # réglage enregistré dit ce qui a été demandé, pas ce qui tourne. Un Pi exposé à Internet
+  # qui n applique plus ses correctifs est le risque le plus discret de toute l installation.
+  if systemctl is-active --quiet wg-pi-update-check.timer; then ok "Recherche des mises à jour active (une fois par jour)"
+  else warn "Recherche des mises à jour inactive → sudo wg-pi fw-sync"
+  fi
+  local attente
+  case $(unattended_state) in
+    actif)      ok "Mises à jour de sécurité automatiques actives" ;;
+    incoherent) fail "Mises à jour de sécurité demandées mais inopérantes : le minuteur du système ne tourne pas → sudo wg-pi maj-auto on"; (( problems++ )) ;;
+    *)          warn "Mises à jour de sécurité automatiques arrêtées → sudo wg-pi maj-auto on" ;;
+  esac
+  attente=$(pending_upgrades)
+  if (( attente > 0 )); then warn "$attente paquet(s) du système en attente → sudo apt full-upgrade"; fi
+  if [[ -f /run/reboot-required ]]; then warn "Un redémarrage est demandé par des mises à jour déjà installées → sudo reboot"; fi
   if (( UPNP )); then
     # Le minuteur était activé à l'installation puis plus jamais vérifié. Or une box qui
     # redémarre efface ses redirections UPnP, et c'est lui qui les repose : sans lui, le
@@ -2466,6 +2760,14 @@ cmd_box() {
       take_lock
       save_settings
       if (( IPV6_NAT )); then write_sysctl; sysctl -q -p "$SYSCTL_FILE" >>"$LOG_FILE" 2>&1; fi
+      # Le pare-feu généré porte LAN_IF, LAN_GW et LAN_IP recopiés à sa génération, et rien
+      # ne les rafraîchissait : fw_sync sort aussitôt quand la génération correspond déjà.
+      # Un Pi passé du Wi-Fi à l Ethernet gardait donc l ancienne interface — le réveil à
+      # distance figeait les MAC sur une carte disparue, en silence — et les deux gardes-fous
+      # qui refusent de figer la passerelle et le Pi lui-même comparaient aux ANCIENNES
+      # adresses, laissant passer la nouvelle passerelle. Figer une MAC fausse sur la
+      # passerelle coupe le réseau du Pi sans retour possible à distance.
+      fw_sync --force || warn "Pare-feu non régénéré : lancez « sudo wg-pi fw-sync »."
       ok "Nouvelle adresse enregistrée"
     fi
     echo
@@ -2623,7 +2925,7 @@ cmd_uninstall() {
   ask_yn "Faire une sauvegarde avant ?" o && cmd_backup
   systemctl disable --now "wg-quick@$WG_IF" >>"$LOG_FILE" 2>&1
   local t wport
-  for t in wg-pi-duckdns wg-pi-upnp; do
+  for t in wg-pi-duckdns wg-pi-upnp wg-pi-update-check; do
     systemctl disable --now "$t.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/$t.service" "$UNIT_DIR/$t.timer"
   done
@@ -2682,6 +2984,11 @@ cmd_update() {
   put_bin "$tmp" || { rm -f "$tmp"; die "Impossible de remplacer $BIN_PATH."; }
   rm -f "$tmp"
   ok "wg-pi mis à jour : v$old → v${new:-?} (vos réglages et appareils ne changent pas)"
+  # Le relevé est périmé, et pas seulement sa moitié locale : son verdict distant dit
+  # encore qu une version plus récente existe. Le laisser faisait afficher au panneau
+  # « 1.9.0 → 1.9.0 disponible » avec son bouton de mise à jour, jusqu à six heures après.
+  # Même raison qu après « maj-auto ».
+  rm -f "$SYS_FILE"
   # La migration doit tourner dans la NOUVELLE version : on passe par le binaire
   # fraîchement installé, et non depuis ce processus qui exécute encore l'ancien script.
   # WGPI_LOCKED évite que l'enfant retente un flock que ce processus détient déjà :
@@ -3026,6 +3333,7 @@ access_group_rules() {   # <groupe>
     n=$(( n + 1 ))
     local detail="$proto"
     [[ $proto == any ]] && detail="tous protocoles"
+    [[ $proto == tcpudp ]] && detail="TCP et UDP"
     [[ -n $ports ]] && detail="$detail $(access_ports_label "$ports")"
     [[ $sens == deux ]] && detail="$detail, dans les deux sens"
     printf '   %s %s\n' "$(pad "$([[ $n -eq 1 ]] && echo "peut joindre" || echo "")" 15)" \
@@ -3082,6 +3390,7 @@ access_show() {
     [[ -n $orphans ]] && txt "${DIM}Appareils dans aucun groupe nommé :$orphans${RESET}" ""
   fi
 
+  access_route_note
   access_listening_note
 }
 
@@ -3133,6 +3442,7 @@ access_check() {
     fi
   fi
   access_dns_warn || problems=$(( problems + 1 ))
+  access_route_warn || problems=$(( problems + 1 ))
 
   n=$(access_rows GROUP | grep -c . || true)
   kv "Groupes" "$n"
@@ -3146,7 +3456,7 @@ access_check() {
   # place le libelle AU MILIEU, une barre verticale y decale la cible, et la ressource
   # designe alors une AUTRE machine sans que rien ne change a l ecran. Le diagnostic est
   # le dernier endroit ou cela peut encore se voir.
-  while IFS="|" read -r id libelle a; do
+  while IFS="|" read -r id libelle a mac; do
     [[ -n $id ]] || continue
     if ! access_valid_target "$a"; then
       fail "Ressource « $id » : « $a » n'est ni une adresse IP ni un réseau. Le fichier a-t-il été modifié à la main ?"
@@ -3154,6 +3464,19 @@ access_check() {
     fi
     if ! access_valid_label "$libelle"; then
       fail "Ressource « $id » : libellé invalide (une barre verticale décalerait la cible)."
+      problems=$(( problems + 1 ))
+    fi
+    # Depuis qu'un cinquième champ existe, c'est CE contrôle qui détecte la barre verticale
+    # glissée dans un libellé : elle décale tout d'un cran et fait atterrir l'adresse réelle
+    # là où une MAC est attendue. Sans lui, la ligne décalée redeviendrait silencieuse.
+    if [[ -n $mac ]] && ! access_valid_mac "$mac"; then
+      fail "Ressource « $id » : « $mac » n'est pas une adresse MAC (attendu aa:bb:cc:dd:ee:ff). Une barre verticale dans le libellé décalerait les champs ainsi."
+      problems=$(( problems + 1 ))
+    fi
+    # Un fichier édité à la main peut porter ce que la saisie refuse. Le pare-feu épargne
+    # déjà ces deux adresses, mais l'utilisateur doit savoir que sa ligne est sans effet.
+    if [[ -n $mac ]] && [[ -n ${LAN_GW:-} && $a == "$LAN_GW" || -n ${LAN_IP:-} && $a == "$LAN_IP" ]]; then
+      fail "Ressource « $id » : une adresse matérielle sur la box ou sur le Pi est ignorée (elle couperait le réseau du Pi si elle était fausse)."
       problems=$(( problems + 1 ))
     fi
   done < <(access_rows RES)
@@ -3240,6 +3563,23 @@ access_chain_grp()  { echo "WGPI-S-$2-$1"; }   # $1 = tampon, $2 = groupe
 # une plage en comptant deux : la limite est contrôlée à la saisie par access_valid_ports,
 # donc ici on se contente de traduire. Les plages s'écrivent « 8000-9000 » côté
 # utilisateur et « 8000:9000 » côté iptables, et la conversion se fait port par port.
+# Les protocoles qu'une règle fait poser, un par ligne.
+#
+# Une ligne iptables ne porte qu'un protocole : « tcpudp » en pose donc DEUX, sous le même
+# identifiant de règle. C'est voulu — un NAS, une imprimante, un service de jeu se décrivent
+# naturellement « TCP et UDP sur ces ports-là », et obliger l'utilisateur à tenir deux règles
+# jumelles à jour en parallèle est une façon sûre de les voir diverger.
+#
+# Fonction séparée de access_match_proto, qui peut légitimement n'émettre AUCUNE ligne
+# (« any » sans ports, qui ne contraint rien) : faire boucler l'appelant sur sa sortie ferait
+# alors disparaître la règle. Ici une ligne sort toujours.
+access_proto_list() {
+  case ${1-} in
+    tcpudp) printf '%s\n' tcp udp ;;
+    *)      printf '%s\n' "${1-}" ;;
+  esac
+}
+
 access_match_proto() {   # <proto> <ports>
   local proto=$1 ports=${2-} item out=""
   [[ $proto == any ]] && { [[ -z $ports ]] && return 0; proto=tcp; }
@@ -3342,7 +3682,7 @@ access_ssh_known() { [[ -n $(access_ssh_ports) ]]; }
 access_rules_plan() {
   local buf=${1:-B} ctdir=${2:-1}
   local fwd deny inch gid name ip g rank
-  local pid pact psrc pdst pproto pports psens m frag
+  local pid pact psrc pdst pproto pports psens m frag pr
   fwd=$(access_chain_fwd "$buf")
   deny=$(access_chain_deny "$buf")
   inch=$(access_chain_in "$buf")
@@ -3411,11 +3751,13 @@ access_rules_plan() {
           pi) continue ;;   # traité dans INPUT
           *) continue ;;
         esac
-        frag=$(access_match_proto "$pproto" "$pports")
-        while read -r m; do
-          [[ -n $m ]] || continue
-          echo "-A $(access_chain_grp "$buf" "$gid") $m $frag -m comment --comment wgpi:pol:$pid -j ACCEPT"
-        done < <(access_match_dest "$pdst")
+        while read -r pr; do
+          frag=$(access_match_proto "$pr" "$pports")
+          while read -r m; do
+            [[ -n $m ]] || continue
+            echo "-A $(access_chain_grp "$buf" "$gid") $m $frag -m comment --comment wgpi:pol:$pid -j ACCEPT"
+          done < <(access_match_dest "$pdst")
+        done < <(access_proto_list "$pproto")
       done < <(access_rows POLICY)
     done
 
@@ -3428,11 +3770,13 @@ access_rules_plan() {
       [[ $pact == 1 ]] || continue
       [[ $psens == deux ]] || continue
       [[ ${pdst#grp:} == "$gid" && $pdst == grp:* ]] || continue
-      frag=$(access_match_proto "$pproto" "$pports")
-      while read -r m; do
-        [[ -n $m ]] || continue
-        echo "-A $(access_chain_grp "$buf" "$gid") $m $frag -m comment --comment wgpi:pol:$pid:retour -j ACCEPT"
-      done < <(access_match_dest "$psrc")
+      while read -r pr; do
+        frag=$(access_match_proto "$pr" "$pports")
+        while read -r m; do
+          [[ -n $m ]] || continue
+          echo "-A $(access_chain_grp "$buf" "$gid") $m $frag -m comment --comment wgpi:pol:$pid:retour -j ACCEPT"
+        done < <(access_match_dest "$psrc")
+      done < <(access_proto_list "$pproto")
     done < <(access_rows POLICY)
   done
 
@@ -3456,13 +3800,15 @@ access_rules_plan() {
     # « tout » inclut le Pi : sinon « accès à tout » serait un mensonge sur le seul point
     # que l'utilisateur vérifie en premier, le panneau web ou SSH.
     [[ $pdst == pi || $pdst == tout ]] || continue
-    frag=$(access_match_proto "$pproto" "$pports")
-    while read -r name; do
-      [[ -n $name ]] || continue
-      ip=$(client_ip "$name")
-      [[ -n $ip ]] || continue
-      echo "-A $inch -s $ip $frag -m comment --comment wgpi:pol:$pid -j ACCEPT"
-    done < <(access_group_devices "${psrc#grp:}")
+    while read -r pr; do
+      frag=$(access_match_proto "$pr" "$pports")
+      while read -r name; do
+        [[ -n $name ]] || continue
+        ip=$(client_ip "$name")
+        [[ -n $ip ]] || continue
+        echo "-A $inch -s $ip $frag -m comment --comment wgpi:pol:$pid -j ACCEPT"
+      done < <(access_group_devices "${psrc#grp:}")
+    done < <(access_proto_list "$pproto")
   done < <(access_rows POLICY)
 
   # JAMAIS d'ACCEPT terminal ici : la chaîne revient, et c'est UFW ou la politique par
@@ -3894,6 +4240,65 @@ access_dns_warn() {
   (( n == 0 ))
 }
 
+# Un appareil qui envoie TOUT son trafic dans le tunnel alors qu'aucun de ses groupes
+# n'autorise Internet. Le symptôme est le plus déroutant qui soit : les noms de sites se
+# résolvent — le DNS de la box est dans le réseau de la maison, donc autorisé — et aucune
+# page ne charge. L'utilisateur conclut que « le VPN est cassé ».
+#
+# Le garde-fou DNS voisin ne voit pas ce cas : il ne s'intéresse qu'aux groupes ayant DÉJÀ
+# une règle Internet. Un groupe qui n'en a aucune passe donc sous son radar, et c'est
+# précisément la configuration qui casse.
+access_route_blocked_devices() {   # écrit : <appareil>|<groupes cités>
+  local name ip pub state g labels has
+  # En mode ouvert rien ne filtre : l'appareil a réellement Internet, avertir serait faux.
+  [[ $(access_mode) == filtre ]] || return 0
+  while read -r name ip pub state; do
+    [[ -n $name ]] || continue
+    [[ $state == off ]] && continue          # un appareil coupé ne se connecte pas : du bruit
+    [[ $(client_route_mode "$name") == full ]] || continue
+    has=0 labels=""
+    # Les appartenances CUMULENT les autorisations : un seul groupe avec Internet suffit.
+    while read -r g; do
+      [[ -n $g ]] || continue
+      access_group_has_internet "$g" && { has=1; break; }
+      labels+="${labels:+, }« $(access_group_label "$g") »"
+    done < <(access_device_groups "$name")
+    (( has )) && continue
+    printf '%s|%s\n' "$name" "$labels"
+  done < <(peers_table)
+  return 0
+}
+
+# UNE SEULE ligne « ⚠ », et elle porte les noms. Le panneau web ne remonte que les lignes
+# commençant par ce signe, les joint par une espace et tronque à 400 caractères : un
+# avertissement par appareil donnerait un pavé collé et coupé au milieu d'un nom.
+# Rend NON NUL quand il a quelque chose à dire, comme access_dns_warn.
+# Avertit SANS jamais devenir le code de retour de l'appelant.
+#
+# En dernière instruction d'une branche de « case », un code non nul se propage à la
+# commande entière. Le panneau web, qui se fie à ce code, prend alors un succès pour une
+# erreur : message de réussite affiché dans le bandeau rouge, fenêtre qui reste ouverte, et
+# surtout pare-feu jamais appliqué. Ce piège a déjà coûté une version ; toutes les écritures
+# passent donc par ici, et jamais par access_route_warn directement.
+access_route_note() { access_route_warn || true; }
+
+access_route_warn() {
+  local name labels n=0 noms=""
+  while IFS='|' read -r name labels; do
+    [[ -n $name ]] || continue
+    n=$(( n + 1 ))
+    (( n <= 3 )) && noms+="${noms:+, }« $name »"
+    txt "   « $name » envoie tout son trafic par la maison, mais ${labels:-aucun de ses groupes} n'autorise pas Internet." \
+        "   Les noms de sites se résoudront et aucune page ne chargera. Deux réparations :" \
+        "     ${BOLD}sudo wg-pi access allow <groupe> tout${RESET}   ouvrir Internet à son groupe" \
+        "     ou recréer l'appareil en « réseau maison », puis réimporter sa configuration"
+  done < <(access_route_blocked_devices)
+  if (( n )); then
+    warn "Sans Internet malgré « tout le trafic » : $noms$( (( n > 3 )) && printf ' et %s autre(s)' "$(( n - 3 ))" )."
+  fi
+  (( n == 0 ))
+}
+
 # --- activation et désactivation --------------------------------------------
 # Nombre de règles enregistrées et actives.
 access_policy_count() { access_rows POLICY | awk -F'|' '$2 == 1' | grep -c . || true; }
@@ -3963,6 +4368,7 @@ cmd_access_on() {
   # Avertissement sur le DNS avant d'appliquer : une fois le filtrage en place, l'utilisateur
   # verrait « Internet » marcher et tous les noms de sites échouer, sans comprendre pourquoi.
   access_dns_warn || echo
+  access_route_warn || echo
 
   local -a opts=()
   if (( sans_filet )); then
@@ -3991,6 +4397,48 @@ txt_confirm() {
   txt "   Sans confirmation de votre part, tout revient à l'état précédent dans 2 minutes." \
       "   Si tout va bien : ${BOLD}sudo wg-pi access confirm${RESET}" \
       "   Si quelque chose ne va plus : ${BOLD}sudo wg-pi access off${RESET} (ou attendez)."
+}
+
+# Applique le pare-feu après une écriture de la CLI. À appeler à la fin de TOUTE commande
+# qui change le jeu de règles effectif : access allow/set/rm, group rm/join/leave/set,
+# resource add/rm.
+#
+# La CLI écrivait sans jamais appliquer : seul le panneau web rappelait « access-apply »
+# après chaque mutation. Avec le filtrage actif, « access rm » annonçait donc « supprimée »
+# et l'accès restait OUVERT dans le noyau jusqu'au prochain montage du tunnel. Pire, les
+# identifiants de règles sont réemployés : après une suppression suivie d'un ajout, le noyau
+# appliquait un « p1 » qui désignait désormais un tout autre accès. Et « access check »,
+# qui comparait le fichier à lui-même, confirmait que tout était cohérent.
+#
+# « --modifie » comme le panneau, et pour la même raison : le jeu de règles appliqué n'est
+# plus celui qu'un humain a approuvé, donc le filet doit jouer pour le NOUVEAU. D'où la
+# demande de confirmation, la même que celle d'« access on ».
+#
+# « --deja-valide » fait l'inverse : il applique SANS effacer la validation humaine, donc
+# sans armer d'annulation et sans rien redemander. À réserver aux changements qui ne
+# touchent pas à ce que les appareils DÉJÀ en place peuvent joindre : ajouter, retirer,
+# renommer, couper ou rétablir un appareil. Sans cette distinction, un simple « wg-pi add »
+# désarmait la confirmation — et l'administrateur qui refermait son portable sans répondre
+# voyait, deux minutes plus tard, TOUT son cloisonnement retomber en mode ouvert.
+#
+# Sans tunnel, rien à faire : c'est son prochain montage qui posera les règles.
+access_apply_apres_ecriture() {
+  [[ $(access_mode) == filtre ]] || return 0
+  wg_running || return 0
+  local -a opts=(--modifie)
+  [[ ${1-} == --deja-valide ]] && opts=()
+  # Le verrou est déjà tenu par la commande d'écriture. « local » le signale à
+  # cmd_access_apply, qui ne le reprend donc pas : son « exec 9> » relâcherait et
+  # reprendrait le même verrou, pour rien.
+  local WGPI_LOCKED=1
+  echo
+  cmd_access_apply "${opts[@]+"${opts[@]}"}" || return 1
+  ok "Pare-feu réappliqué. État lu dans le noyau : $(access_kernel_state)."
+  if access_rollback_armed; then
+    warn "${BOLD}Vérifiez tout de suite que vos appareils fonctionnent encore.${RESET}"
+    txt_confirm
+  fi
+  return 0
 }
 
 cmd_access_off() {
@@ -4123,7 +4571,7 @@ access_json_devices() {   # <groupe>
 }
 
 access_json() {
-  local gid glabel rid rlabel rtarget p first=1
+  local gid glabel rid rlabel rtarget rmac p first=1
   printf '{"mode":"%s","noyau":"%s","confirme":%s,"groupes":[' \
     "$(access_mode)" "$(access_kernel_state_safe)" \
     "$(if access_confirmed; then echo true; else echo false; fi)"
@@ -4141,12 +4589,12 @@ access_json() {
 
   printf '],"ressources":['
   first=1
-  while IFS='|' read -r rid rlabel rtarget; do
+  while IFS='|' read -r rid rlabel rtarget rmac; do
     [[ -n $rid ]] || continue
     (( first )) || printf ','
     first=0
-    printf '{"id":"%s","libelle":"%s","cible":"%s"}' \
-      "$(json_esc "$rid")" "$(json_esc "$rlabel")" "$(json_esc "$rtarget")"
+    printf '{"id":"%s","libelle":"%s","cible":"%s","mac":"%s"}' \
+      "$(json_esc "$rid")" "$(json_esc "$rlabel")" "$(json_esc "$rtarget")" "$(json_esc "$rmac")"
   done < <(access_rows RES)
 
   printf '],"ecoute":['
@@ -4157,6 +4605,18 @@ access_json() {
     first=0
     printf '%s' "$p"
   done < <(access_listening_ports)
+
+  # Les appareils pris entre deux réglages contradictoires. Résolu ICI et non dans le
+  # panneau : la même question se pose en ligne de commande, et deux implémentations de la
+  # même règle finissent toujours par diverger. Le panneau affiche, il ne juge pas.
+  printf '],"avertissements":['
+  first=1
+  while IFS='|' read -r rid rlabel; do
+    [[ -n $rid ]] || continue
+    (( first )) || printf ','
+    first=0
+    printf '{"appareil":"%s","groupes":"%s"}' "$(json_esc "$rid")" "$(json_esc "$rlabel")"
+  done < <(access_route_blocked_devices)
   printf ']}'
 }
 
@@ -4264,6 +4724,8 @@ cmd_group() {
       { access_cat | access_drop GROUP "$id" | awk -F'|' -v g="$id" '!(NF && $1 == "MEMBER" && $3 == g)'; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
       ok "Groupe « $id » supprimé."
+      access_route_note
+      access_apply_apres_ecriture
       ;;
     join|ajoute)
       take_lock
@@ -4274,6 +4736,8 @@ cmd_group() {
       access_group_exists "$grp" || die "Aucun groupe « $grp » (créez-le : sudo wg-pi group add $grp)."
       { access_cat; echo "MEMBER|$dev|$grp"; } | access_save || die "Écriture de $ACCESS_FILE impossible."
       ok "« $dev » fait maintenant partie de : $(access_device_groups "$dev" | paste -sd' ' -)"
+      access_route_note
+      access_apply_apres_ecriture
       ;;
     leave|retire)
       take_lock
@@ -4282,6 +4746,8 @@ cmd_group() {
       access_is_all "$grp" && die "« $ACCESS_ALL » est automatique : un appareil ne peut pas en sortir."
       access_cat | access_drop_member "$dev" "$grp" | access_save || die "Écriture de $ACCESS_FILE impossible."
       ok "« $dev » ne fait plus partie de « $grp »."
+      access_route_note
+      access_apply_apres_ecriture
       ;;
     set|definir)
       take_lock
@@ -4299,6 +4765,8 @@ cmd_group() {
         done
       } | access_save || die "Écriture de $ACCESS_FILE impossible."
       ok "Groupes de « $dev » : $(access_device_groups "$dev" | paste -sd' ' -)"
+      access_route_note
+      access_apply_apres_ecriture
       ;;
     *)
       die "Action inconnue : group $action (list, add, rm, join, leave, set)"
@@ -4309,16 +4777,16 @@ cmd_group() {
 # --- ressources de la maison ------------------------------------------------
 cmd_resource() {
   load_settings
-  local action=${1-} id target libelle="" a l t
+  local action=${1-} id target libelle="" mac="" a l t m
   [[ -n $action ]] && shift
   case $action in
     ""|list|liste)
       title "Ressources de la maison"
       local n=0
-      while IFS='|' read -r id l t; do
+      while IFS='|' read -r id l t m; do
         [[ -n $id ]] || continue
         n=$(( n + 1 ))
-        kv "$(pad "$id" 16)$l" "$t"
+        kv "$(pad "$id" 16)$l" "$t${m:+   réveil : $m}"
       done < <(access_rows RES)
       if (( n == 0 )); then
         echo
@@ -4341,14 +4809,57 @@ cmd_resource() {
       if [[ -n ${LAN_NET:-} ]] && ! cidr_overlap "${target%/*}/32" "$LAN_NET"; then
         warn "« $target » n'est pas dans le réseau de la maison ($LAN_NET) : la règle risque d'être sans effet."
       fi
-      for a in "$@"; do libelle=$(opt_value "$a" libelle); [[ -n $libelle ]] && break; done
+      local existait=0 vu_mac=0
+      access_res_exists "$id" && existait=1
+      # « resource add » remplace en place. Sans reprise de l'existant, redonner une adresse
+      # sans repasser --mac effacerait le réveil en silence — et le panneau web, dont le
+      # formulaire renvoie tous ses champs, le ferait à chaque enregistrement.
+      (( existait )) && mac=$(access_res_mac "$id")
+      # Valeur REPRISE du fichier, et non saisie par l'utilisateur : si elle est abîmée
+      # — fichier édité à la main, sauvegarde ancienne — on l'abandonne en silence plutôt
+      # que de refuser la commande. Sinon une ligne corrompue deviendrait irréparable par
+      # l'outil même qui sert à la réparer. C'est la règle qu'access_save applique déjà
+      # aux références mortes : on purge à l'écriture, on ne meurt pas dessus.
+      if [[ -n $mac ]] && ! access_valid_mac "$mac"; then mac=""; fi
+      # Boucle SANS « break » : celle d'origine sortait dès le libellé trouvé et n'aurait
+      # jamais lu --mac. On distingue aussi « --mac= » (effacer) de « option absente » (garder).
+      for a in "$@"; do
+        case $a in
+          --libelle=*) libelle=${a#*=} ;;
+          --mac=*)     mac=${a#*=}; vu_mac=1 ;;
+          *) die "Option inconnue : « $a » (--libelle, --mac)." ;;
+        esac
+      done
       access_valid_label "$libelle" ||
         die "Libelle invalide : au plus 60 caracteres, sans barre verticale ni caractere de controle."
       [[ -n $libelle ]] || libelle=$id
-      local existait=0
-      access_res_exists "$id" && existait=1
-      { access_cat | access_drop RES "$id"; echo "RES|$id|$libelle|$target"; } | access_save ||
+      if [[ -n $mac ]]; then
+        mac=$(access_norm_mac "$mac")
+        access_valid_mac "$mac" ||
+          die "Adresse MAC invalide : « $mac ». Attendu six octets, par exemple aa:bb:cc:dd:ee:ff."
+        # Figer une association, c'est dire au noyau de ne plus jamais redemander. Une
+        # erreur d'un seul octet sur la box rendrait le Pi incapable de joindre sa
+        # passerelle : plus d'Internet, plus de DNS dynamique, plus de mise à jour, et
+        # plus de VPN pour venir réparer. Rien ne se récupère à distance. On refuse donc,
+        # au lieu d'avertir : ces trois cibles n'ont de toute façon aucune raison d'être
+        # réveillées.
+        if [[ $target == */* ]]; then
+          die "Un réseau entier n'a pas de carte réseau : « --mac » ne vaut que pour une adresse unique."
+        fi
+        if [[ -n ${LAN_GW:-} && $target == "$LAN_GW" ]]; then
+          die "« $target » est votre box. Figer son adresse matérielle couperait l'accès Internet du Pi si elle était fausse, sans réparation possible à distance."
+        fi
+        if [[ -n ${LAN_IP:-} && $target == "$LAN_IP" ]]; then
+          die "« $target » est le Pi lui-même : il n'a pas besoin d'être réveillé."
+        fi
+        if [[ -n ${LAN_NET:-} ]] && ! cidr_overlap "$target/32" "$LAN_NET"; then
+          die "« $target » n'est pas dans le réseau de la maison ($LAN_NET) : une adresse matérielle n'y aurait aucun effet."
+        fi
+      fi
+      { access_cat | access_drop RES "$id"; echo "RES|$id|$libelle|$target${mac:+|$mac}"; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
+      (( vu_mac )) && [[ -z $mac ]] && info "Réveil à distance retiré de « $id »."
+      arp_resync
       if (( existait )); then
         # Toutes les règles « res:<nom> » suivent la nouvelle adresse sans changer d'un
         # caractère à l'écran : le dire est le seul moyen que ce ne soit pas une surprise.
@@ -4361,6 +4872,7 @@ cmd_resource() {
         ok "Ressource « $libelle » ($target) enregistrée sous le nom « $id »."
       fi
       txt "   Pour y donner accès : ${BOLD}sudo wg-pi access allow <groupe> res:$id${RESET}"
+      access_apply_apres_ecriture
       ;;
     rm|remove|supprimer)
       take_lock
@@ -4371,7 +4883,11 @@ cmd_resource() {
       used=$(access_rows POLICY | awk -F'|' -v r="res:$id" '$4 == r { printf " %s", $1 }')
       [[ -n $used ]] && die "La ressource « $id » est utilisée par la ou les règles :$used. Supprimez-les d'abord."
       access_cat | access_drop RES "$id" | access_save || die "Écriture de $ACCESS_FILE impossible."
+      # Avant tout message : l'association figée de la ressource disparue doit partir avec
+      # elle, sinon elle survit à tout et détourne le trafic du Pi vers cette adresse.
+      arp_resync
       ok "Ressource « $id » supprimée."
+      access_apply_apres_ecriture
       ;;
     *)
       die "Action inconnue : resource $action (list, add, rm)"
@@ -4398,7 +4914,7 @@ access_valider_regle() {   # <groupe> <destination> <proto> <ports> <sens>
     res:*) access_res_exists "${dest#res:}" || die "Aucune ressource « ${dest#res:} »." ;;
     grp:*) access_is_all "${dest#grp:}" || access_group_exists "${dest#grp:}" || die "Aucun groupe « ${dest#grp:} »." ;;
   esac
-  access_valid_proto "$proto" || die "Protocole invalide : « $proto » (any, tcp, udp, icmp)."
+  access_valid_proto "$proto" || die "Protocole invalide : « $proto » (any, tcp, udp, tcpudp, icmp)."
   access_valid_dir "$sens" || die "Sens invalide : « $sens » (aller, deux)."
   access_valid_two_way "$sens" "$dest" ||
     die "« --sens=deux » n'a de sens que vers un groupe (grp:<nom>).
@@ -4406,8 +4922,8 @@ Vers Internet, la maison ou une ressource, le trafic qui revient ne passe pas pa
 il dépend de votre box et d'UFW, et wg-pi ne peut rien en promettre."
   access_valid_ports "$ports" ||
     die "Liste de ports invalide : « $ports ». Exemples : 445 ou 445,5000-5001. Au plus 15 ports, une plage en comptant deux."
-  [[ -n $ports && $proto != tcp && $proto != udp ]] &&
-    die "Des ports n'ont de sens qu'avec --proto=tcp ou --proto=udp."
+  [[ -n $ports && $proto != tcp && $proto != udp && $proto != tcpudp ]] &&
+    die "Des ports n'ont de sens qu'avec --proto=tcp, --proto=udp ou --proto=tcpudp."
   return 0
 }
 
@@ -4427,7 +4943,7 @@ cmd_access() {
         n=$(( n + 1 ))
         printf '   %s %s\n' "${BOLD}$(pad "$id" 5)${RESET}" "$libelle"
         printf '         %s → %s\n' "Le groupe « $(access_group_label "${src#grp:}") »" "$(access_dest_label "$dst")"
-        printf '         %s, %s, %s\n' "$proto" "$(access_ports_label "$ports")" \
+        printf '         %s, %s, %s\n' "$([[ $proto == tcpudp ]] && echo "TCP et UDP" || echo "$proto")" "$(access_ports_label "$ports")" \
           "$([[ $sens == deux ]] && echo "dans les deux sens" || echo "la source initie")"
       done < <(access_rows POLICY)
       (( n == 0 )) && txt "Aucune règle. Tous vos appareils peuvent tout joindre (mode « $(access_mode) »)."
@@ -4454,6 +4970,7 @@ Destinations : tout, internet, maison, pi, res:<ressource>, grp:<groupe>"
       { access_cat; echo "POLICY|$id|1|grp:$src|$dst|$proto|$ports|$sens|$libelle"; } | access_save ||
         die "Écriture de $ACCESS_FILE impossible."
       ok "Règle $id enregistrée : $libelle"
+      access_route_note
       # « if » et NON « [[ … ]] && … » : en dernière instruction d'une branche de « case »,
       # un test faux devient le code de retour de cmd_access. Avec le filtrage déjà actif,
       # « access allow » sortait donc en ERREUR après avoir correctement enregistré la règle.
@@ -4463,6 +4980,7 @@ Destinations : tout, internet, maison, pi, res:<ressource>, grp:<groupe>"
       if [[ $(access_mode) == ouvert ]]; then
         txt "   ${DIM}Le filtrage n'est pas encore actif : cette règle est enregistrée mais ne change rien pour l'instant.${RESET}"
       fi
+      access_apply_apres_ecriture
       ;;
     set|modifier|edit)
       # Sans ceci, changer un seul port obligeait à supprimer la règle puis à la ressaisir
@@ -4507,9 +5025,11 @@ Les identifiants sont donnés par : sudo wg-pi access list"
         done < <(access_cat)
       } | access_save || die "Écriture de $ACCESS_FILE impossible."
       ok "Règle $id modifiée : $libelle"
+      access_route_note
       if [[ $(access_mode) == ouvert ]]; then
         txt "   ${DIM}Le filtrage n'est pas encore actif : cette règle est enregistrée mais ne change rien pour l'instant.${RESET}"
       fi
+      access_apply_apres_ecriture
       ;;
     rm|remove|supprimer)
       take_lock
@@ -4519,6 +5039,8 @@ Les identifiants sont donnés par : sudo wg-pi access list"
         die "Aucune règle « $id »."
       access_cat | access_drop POLICY "$id" | access_save || die "Écriture de $ACCESS_FILE impossible."
       ok "Règle « $id » supprimée."
+      access_route_note
+      access_apply_apres_ecriture
       ;;
     check|verifie)
       access_check
@@ -4544,9 +5066,105 @@ Les identifiants sont donnés par : sudo wg-pi access list"
 # Aligne le pare-feu installé sur la version du script. Appelée automatiquement par
 # « wg-pi update », et proposée par le diagnostic quand une mise à jour venue d'une version
 # antérieure n'a pas pu le faire : cette version-là ne connaissait pas cette commande.
+# Relevé des mises à jour, en JSON, pour le panneau comme pour le terminal.
+#
+# Il est MIS EN CACHE parce que le panneau interroge son état en boucle : une requête vers
+# GitHub et un fork d'apt à chaque relevé mettraient un Raspberry Pi à genoux. Deux
+# horodatages, parce que les deux moitiés n'ont ni le même coût ni les mêmes pannes : ce qui
+# se lit localement vaut un quart d'heure, ce qui demande le réseau vaut six heures.
+#
+# N'ÉCRIT RIEN d'autre que du JSON : ni ok, ni warn, ni info — ils vont tous sur la sortie
+# standard, et la moindre ligne parasite ferait échouer la lecture côté Python.
+cmd_sys_json() {
+  load_settings
+  local force=0 maintenant ts=0 majts=0 ancien="" v dispo etat
+  [[ ${1-} == --rafraichir ]] && force=1
+  maintenant=$(date +%s)
+  if [[ -r $SYS_FILE ]]; then
+    ancien=$(cat "$SYS_FILE" 2>/dev/null)
+    ts=$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' <<<"$ancien")
+    majts=$(sed -n 's/.*"maj_ts":\([0-9]*\).*/\1/p' <<<"$ancien")
+  fi
+  if (( ! force )) && [[ -n $ancien ]] && (( maintenant - ${ts:-0} < 900 )); then
+    printf '%s' "$ancien"
+    return 0
+  fi
+  # La moitié distante n'est refaite que si elle est vraiment périmée, même quand la moitié
+  # locale l'est : interroger GitHub toutes les quinze minutes serait inutile et impoli.
+  dispo=$(sed -n 's/.*"maj_version":"\([^"]*\)".*/\1/p' <<<"$ancien")
+  etat=$(sed -n 's/.*"maj_etat":"\([^"]*\)".*/\1/p' <<<"$ancien")
+  if (( force )) || (( maintenant - ${majts:-0} > 21600 )) || [[ ${etat:-inconnu} == inconnu ]]; then
+    majts=$maintenant
+    if v=$(depot_version); then
+      dispo=$v
+      # « inconnu » n'est pas « à jour » : l'adresse de repli peut servir une version en
+      # cache jusqu'à cinq minutes, et ne pas savoir doit se dire.
+      if version_lt "$WGPI_VERSION" "$v"; then etat=neuf; else etat=ajour; fi
+    else
+      dispo="" etat=inconnu
+      # Périmé plus vite en cas d'échec : une coupure réseau ne doit pas geler le verdict
+      # pendant six heures.
+      majts=$(( maintenant - 20700 ))
+    fi
+  fi
+  local reboot=false
+  [[ -f /run/reboot-required ]] && reboot=true
+  install -d -m 700 "$SYS_DIR" 2>/dev/null || true
+  local json
+  json=$(printf '{"ts":%s,"wgpi":"%s","wireguard":"%s","auto":"%s","demande":%s,"paquets":%s,"reboot":%s,"maj_ts":%s,"maj_version":"%s","maj_etat":"%s"}' \
+    "$maintenant" "$(json_esc "$WGPI_VERSION")" "$(json_esc "$(wg_tools_version)")" \
+    "$(unattended_state)" "$( (( UNATTENDED )) && echo true || echo false)" \
+    "$(pending_upgrades)" "$reboot" "${majts:-0}" "$(json_esc "$dispo")" "$(json_esc "${etat:-inconnu}")")
+  printf '%s' "$json" | atomic_write "$SYS_FILE" 600 2>/dev/null || true
+  printf '%s' "$json"
+}
+
+# Appelée par le minuteur quotidien : rafraîchit le relevé, sans rien afficher.
+cmd_update_check() { cmd_sys_json --rafraichir >/dev/null; }
+
+# wg-pi maj-auto on|off : les mises à jour de sécurité du système.
+#
+# UNATTENDED n'était fixé qu'à l'installation : ensuite, rien ne permettait de les activer,
+# de les couper, ni même de savoir si elles tournaient vraiment.
+cmd_maj_auto() {
+  load_settings
+  take_lock
+  case ${1-} in
+    on|activer)
+      setup_unattended || die "Les mises à jour automatiques n'ont pas pu être activées."
+      UNATTENDED=1
+      save_settings
+      ;;
+    off|desactiver)
+      # On réécrit le fichier avec les clés à zéro au lieu de le supprimer : c'est un fichier
+      # de configuration du paquet, que dpkg restaurerait ou dont il demanderait le sort à la
+      # prochaine mise à jour d'apt.
+      # La liste des paquets continue d être rafraîchie : cette clé-là ne commande aucune
+      # installation, et la mettre à zéro figeait le compteur « paquets en attente » du
+      # panneau et de « wg-pi check » — on cesserait de savoir ce qui manque, au moment
+      # précis où plus rien ne s installe tout seul.
+      printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unattended-Upgrade "0";' \
+        >/etc/apt/apt.conf.d/20auto-upgrades
+      chmod 644 /etc/apt/apt.conf.d/20auto-upgrades
+      UNATTENDED=0
+      save_settings
+      warn "Mises à jour de sécurité automatiques désactivées. Pensez à faire « sudo apt full-upgrade » régulièrement."
+      ;;
+    *) die "Action inconnue : maj-auto ${1-} (on, off)" ;;
+  esac
+  rm -f "$SYS_FILE"   # le relevé est périmé : la prochaine lecture le refera
+  return 0
+}
+
 cmd_fw_sync() {
   load_settings
   [[ -n ${WGPI_LOCKED:-} ]] || take_lock
+  # Les minuteurs font partie de la migration, pas seulement le pare-feu. « update » ne
+  # rappelle jamais setup_timers — seuls l'installation, « upnp on » et « endpoint » le font —
+  # donc sans cette ligne un minuteur ajouté par une nouvelle version ne serait jamais posé
+  # sur les installations existantes, et personne ne s'en apercevrait. fw_sync, lui, sort
+  # immédiatement quand la génération correspond : il ne peut pas porter cette tâche.
+  setup_timers
   fw_sync
 }
 
@@ -4566,8 +5184,7 @@ cmd_json() {
   printf '"pubkey":"%s","lan_ip":"%s","lan_net":"%s","default_route":"%s","now":%s,"peers":[' \
     "$SERVER_PUBKEY" "$LAN_IP" "$LAN_NET" "$DEFAULT_ROUTE" "$(date +%s)"
   while read -r name ip pub state; do
-    mode="split"
-    grep -q '^AllowedIPs = 0\.0\.0\.0/0' "$CLIENTS_DIR/$name.conf" 2>/dev/null && mode="full"
+    mode=$(client_route_mode "$name")
     ip6=""
     (( IPV6_ON )) && ip6="${WG_NET6}${ip##*.}"
     enabled=true
@@ -4597,6 +5214,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import ssl
 import subprocess
 import sys
@@ -4624,6 +5242,41 @@ ACCES_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
 DEST_RE = re.compile(r"tout|internet|maison|pi|(?:res|grp):[A-Za-z0-9_][A-Za-z0-9_-]{0,14}")
 PORTS_RE = re.compile(r"[0-9]{1,5}(?:-[0-9]{1,5})?(?:,[0-9]{1,5}(?:-[0-9]{1,5})?)*")
 CIBLE_RE = re.compile(r"[0-9a-fA-F:.]{2,45}(?:/[0-9]{1,3})?")
+# Les tirets sont acceptés ici — Windows écrit les MAC ainsi — et le CLI normalise en
+# deux-points avant d'écrire. Côté bash, access_valid_mac est plus strict : il refuse une
+# adresse IP, parce que c'est lui qui détecte une barre verticale glissée dans un libellé.
+MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
+
+
+def valider_regle(body):
+    """Contrôle de FORME d'une règle. Rend (champs, erreur) ; erreur vaut None si tout va bien.
+
+    Rend un dictionnaire de champs et NON une liste d'arguments : la création n'ajoute
+    --ports et --libelle que s'ils sont renseignés, alors que la modification les passe
+    toujours, même vides — c'est le seul moyen d'annuler une restriction depuis le
+    panneau. Une fonction qui rendrait des arguments effacerait cette différence.
+
+    Le contrôle de FOND reste celui du CLI : lui seul connaît les groupes, les ressources
+    et le budget de ports du pare-feu."""
+    src = str(body.get("source", "")).strip()
+    dst = str(body.get("destination", "")).strip()
+    proto = str(body.get("proto", "any")).strip() or "any"
+    ports = str(body.get("ports", "")).strip()
+    sens = str(body.get("sens", "aller")).strip() or "aller"
+    lib = str(body.get("libelle", "")).strip()
+    if not ACCES_ID_RE.fullmatch(src):
+        return None, "Groupe source invalide."
+    if not DEST_RE.fullmatch(dst):
+        return None, "Destination invalide."
+    if proto not in ("any", "tcp", "udp", "tcpudp", "icmp"):
+        return None, "Protocole invalide."
+    if sens not in ("aller", "deux"):
+        return None, "Sens invalide."
+    if ports and not PORTS_RE.fullmatch(ports):
+        return None, "Liste de ports invalide. Exemples : 445 ou 445,5000-5001."
+    if not libelle_ok(lib):
+        return None, "Libellé invalide : au plus 60 caractères, sans barre verticale."
+    return {"src": src, "dst": dst, "proto": proto, "ports": ports, "sens": sens, "lib": lib}, None
 REGLE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")
 
 
@@ -5057,6 +5710,8 @@ border:2px solid var(--card)}
 .name{font-weight:700;font-size:15px}
 .badge{font-size:11.5px;font-weight:600;padding:0 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted)}
 .badge.off{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.badge.alerte{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.alerte-texte{color:var(--bad)}
 .info{min-width:0}
 .l2{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;margin-top:2px}
 .ips{color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -5149,6 +5804,10 @@ APP_JS = r"""
     copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a1 1 0 0 1 1-1h10"/></svg>',
     close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
     phone: '<svg viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 17h2"/></svg>',
+    /* Deux curseurs sur des rails : ni le demi-disque de « auto », ni le disque rayonnant de
+       « sun », qui sont les deux états du bouton voisin. Aucun attribut de tracé : le CSS
+       impose déjà la taille, l'absence de remplissage et l'épaisseur du trait. */
+    rouage: '<svg viewBox="0 0 24 24"><path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="7" cy="16" r="2"/></svg>',
     laptop: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/></svg>',
     acces: '<svg viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.2-2.9 7.6-7 8.5-4.1-.9-7-4.3-7-8.5V6l7-3z"/><path d="m9 12 2 2 4-4"/></svg>'
   };
@@ -5391,18 +6050,22 @@ APP_JS = r"""
     dests.forEach(function (d, j) {
       var y = yOf(j, dests.length);
       groupes.forEach(function (g) {
-        var f = (g.flux || []).filter(function (x) { return x.dest === d; })[0];
-        if (!f) { return; }
+        var fs = fluxVers(g, d);
+        if (!fs.length) { return; }
+        var f = fs[0];
         var cls = "map-link pol " + mapGroupClass(groupes, g.id);
-        /* Epaisseur : ports listes contre tous les ports. Gros tuyau = large ouvert. */
-        if (!f.ports) { cls += " wide"; }
-        if (f.sens !== "deux") { cls += " oneway"; }
+        /* Epaisseur : ports listes contre tous les ports. Gros tuyau = large ouvert.
+           Avec plusieurs regles, c est la plus large qui decide : une seule ouverture sans
+           ports suffit a rendre le tuyau large. */
+        if (fs.some(function (x) { return !x.ports; })) { cls += " wide"; }
+        /* Sens unique seulement si AUCUNE des regles ne va dans les deux sens. */
+        if (!fs.some(function (x) { return x.sens === "deux"; })) { cls += " oneway"; }
         var path = svgEl("path", cls);
         path.setAttribute("d", mapPath(MAP_X_PI + 16, yPi, MAP_X_DEST - 8, y));
         path.setAttribute("data-grp", g.id);
         path.setAttribute("data-dest", d);
         var titre = svgEl("title");
-        titre.textContent = g.libelle + " vers " + f.label + " (" + fluxTexte(f) + ")";
+        titre.textContent = g.libelle + " vers " + f.label + " (" + fluxTexteListe(fs) + ")";
         path.appendChild(titre);
         liens.appendChild(path);
       });
@@ -5468,8 +6131,7 @@ APP_JS = r"""
          feraient se chevaucher leurs pastilles. */
       var ports = [];
       groupes.forEach(function (g) {
-        var f = (g.flux || []).filter(function (x) { return x.dest === d; })[0];
-        if (f) { ports.push(f.ports ? f.ports : "tout"); }
+        fluxVers(g, d).forEach(function (f) { ports.push(f.ports ? f.ports : "tout"); });
       });
       if (ports.length) {
         n.appendChild(svgText(MAP_X_DEST + 14, y + 13, "ports", ports.join(" / "), "start"));
@@ -5591,6 +6253,14 @@ APP_JS = r"""
   /* Répond à la seule question que se pose vraiment un non-technicien : « qu'est-ce que
      la tablette de ma fille peut joindre ? ». Le panneau n'évalue rien — il expanse
      groupe → appareils, ce qui est de l'affichage, et lit des flux déjà résolus en bash. */
+  /* Cet appareil envoie-t-il tout son trafic dans le tunnel sans qu'aucun de ses groupes
+     n'autorise Internet ? La réponse vient de bash, qui la calcule déjà pour « wg-pi check ».
+     Le panneau ne la recalcule pas : deux implémentations de la même règle divergeraient,
+     et c'est exactement la panne que ce cloisonnement sert à éviter. */
+  function appareilSansInternet(nom) {
+    return (acces().avertissements || []).some(function (a) { return a.appareil === nom; });
+  }
+
   function groupesNommes(p) {
     return (p.groupes || []).filter(function (g) { return g !== "tous"; });
   }
@@ -5709,6 +6379,45 @@ APP_JS = r"""
      inerte ; sous node elle permet d'EXÉCUTER le rendu, et pas seulement de le parser.
      C'est ce qui attrape une variable non déclarée, qu'un simple « node --check » laisse
      passer et qui ne casserait qu'au premier rafraîchissement, chez l'utilisateur. */
+  /* Modèles de règles. Chacun ne porte QUE le protocole, les ports et un libellé : la
+     destination reste le choix de l utilisateur, qui seul sait si Moonlight vise le PC du
+     salon ou toute la maison, et le sens est verrouillé ailleurs selon la destination.
+
+     Certains en posent DEUX. Ce n est pas de l ergonomie : une règle ne porte qu un seul
+     protocole, et les ports TCP de Moonlight ne sont pas ses ports UDP. */
+  var MODELES_REGLE = [
+    {cle: "moonlight", titre: "Moonlight", aide: "Jeu en flux depuis un PC de la maison",
+     regles: [{proto: "tcp", ports: "47984,47989,48010", libelle: "Moonlight (TCP)"},
+              {proto: "udp", ports: "47998-48000,48010", libelle: "Moonlight (UDP)"}]},
+    {cle: "plex", titre: "Plex", aide: "Serveur multimédia",
+     regles: [{proto: "tcp", ports: "32400", libelle: "Plex"},
+              {proto: "udp", ports: "32410,32412,32413,32414", libelle: "Plex (découverte)"}]},
+    {cle: "nas", titre: "NAS", aide: "Partage de fichiers Windows (SMB)",
+     regles: [{proto: "tcp", ports: "445,139", libelle: "NAS (partage Windows)"}]},
+    {cle: "jeu", titre: "Jeu en réseau", aide: "Mêmes ports en TCP et en UDP : une seule règle",
+     regles: [{proto: "tcpudp", ports: "27015,27036", libelle: "Jeu en réseau"}]},
+    {cle: "imprimante", titre: "Imprimante", aide: "Impression réseau",
+     regles: [{proto: "tcp", ports: "631,9100,515", libelle: "Imprimante"}]},
+    {cle: "bureau", titre: "Bureau à distance", aide: "RDP ou VNC",
+     regles: [{proto: "tcp", ports: "3389,5900", libelle: "Bureau à distance"}]},
+    {cle: "domotique", titre: "Home Assistant", aide: "Sur une machine de la maison : les services du Pi sont déjà joignables",
+     regles: [{proto: "tcp", ports: "8123", libelle: "Home Assistant"}]},
+    {cle: "reveil", titre: "Réveil à distance", aide: "Wake-on-LAN. La ressource visée doit porter une adresse MAC",
+     regles: [{proto: "udp", ports: "9", libelle: "Réveil (Wake-on-LAN)"}]}
+  ];
+
+  /* Remplit le formulaire, et rend le nombre de règles que le modèle posera.
+     L ORDRE EST OBLIGATOIRE : majSens vide le champ des ports dès que le protocole n est
+     ni TCP ni UDP. Écrire les ports avant le protocole les perdrait en silence. */
+  function remplirModele(m, ch) {
+    var r0 = m.regles[0];
+    ch.proto.value = r0.proto;
+    ch.maj();
+    ch.ports.value = r0.ports;
+    if (!ch.lib.value) { ch.lib.value = r0.libelle; }
+    return m.regles.length;
+  }
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       renderAcces: renderAcces,
@@ -5724,6 +6433,9 @@ APP_JS = r"""
       fluxSortants: fluxSortants,
       fluxEntrants: fluxEntrants,
       groupesNommes: groupesNommes,
+      appareilSansInternet: appareilSansInternet,
+      MODELES_REGLE: MODELES_REGLE,
+      remplirModele: remplirModele,
       destRang: destRang,
       fluxTexte: fluxTexte,
       humanRate: humanRate,
@@ -5746,10 +6458,27 @@ APP_JS = r"""
     return d.indexOf("res:") === 0 ? 5 : 6;
   }
   function fluxTexte(f) {
-    var t = f.proto === "any" ? "tout" : f.proto;
+    /* « tcpudp » vient du fichier : ce n est ni du français ni un mot que l utilisateur a
+       tapé. La liste des règles disait déjà « TCP et UDP » ; la matrice, la carte et la
+       fiche d appareil affichaient le jeton brut, dans le même écran. */
+    var t = f.proto === "any" ? "tout" : (f.proto === "tcpudp" ? "TCP et UDP" : f.proto);
     if (f.ports) { t += " " + f.ports; }
     if (f.sens === "deux") { t += " ⇄"; }
     return t;
+  }
+
+  /* TOUTES les règles d un groupe vers une destination, et non la première.
+     Un modèle comme Moonlight pose deux règles vers la même destination, une par
+     protocole : n en montrer qu une faisait annoncer par la carte et par la matrice un
+     cloisonnement plus étroit que le vrai. Sur l onglet Accès la liste des règles juste en
+     dessous rattrapait le coup ; sur la carte, il n y a rien à côté. */
+  function fluxVers(g, d) {
+    return (g.flux || []).filter(function (x) { return x.dest === d; });
+  }
+
+  /* Le texte de plusieurs règles vers une même destination, dans l ordre des règles. */
+  function fluxTexteListe(fs) {
+    return fs.map(fluxTexte).join(" + ");
   }
   function renderAcces() {
     var a = state.acces || {}, sect = $("p-acc");
@@ -5819,12 +6548,13 @@ APP_JS = r"""
         th.title = (g.appareils || []).join(", ");
         tr.appendChild(th);
         cols.forEach(function (d) {
-          var f = (g.flux || []).filter(function (x) { return x.dest === d; })[0];
+          var fs = fluxVers(g, d);
+          var f = fs[0];
           var td = el("td");
           if (f) {
             td.className = "yes";
-            td.appendChild(el("span", null, fluxTexte(f)));
-            td.title = f.titre || "";
+            td.appendChild(el("span", null, fluxTexteListe(fs)));
+            td.title = fs.map(function (x) { return x.titre || ""; }).join(" · ");
           } else {
             td.className = "no";
             td.setAttribute("aria-label", "aucune règle");
@@ -5884,7 +6614,10 @@ APP_JS = r"""
     var info = el("div", "info"), l1 = el("div", "l1");
     r.nameEl = el("span", "name"); r.mode = el("span", "badge"); r.off = el("span", "badge off", "Désactivé");
     r.grp = el("span", "badge grp");
-    l1.append(r.nameEl, r.mode, r.grp, r.off);
+    /* Collée au mode qu'elle contredit, et SANS data-admin : la règle de masquage du
+       compte de consultation cacherait l'information à celui qui en a le plus besoin. */
+    r.alerte = el("span", "badge alerte");
+    l1.append(r.nameEl, r.mode, r.alerte, r.grp, r.off);
     r.ips = el("span", "ips mono"); r.status = el("span", "status");
     var l2 = el("div", "l2"); l2.append(r.ips, r.status);
     info.append(l1, l2);
@@ -5924,6 +6657,14 @@ APP_JS = r"""
     r.el.classList.toggle("disabled", !p.enabled);
     r.el.classList.toggle("online", p.connected);
     r.mode.textContent = p.mode === "full" ? "Tout le trafic" : "Réseau maison";
+    var muet = appareilSansInternet(p.name);
+    r.alerte.hidden = !muet;
+    if (muet) {
+      r.alerte.textContent = "sans Internet";
+      r.alerte.title = "Cet appareil envoie tout son trafic par la maison, mais aucun de ses "
+        + "groupes n a le droit de joindre Internet : les noms de sites se résoudront et "
+        + "aucune page ne chargera.";
+    }
     r.mode.title = p.mode === "full" ? "Tout le trafic de l'appareil passe par la maison" : "Seul l'accès au réseau de la maison passe par le VPN";
     r.off.hidden = p.enabled;
     /* La pastille ne montre que les groupes NOMMÉS : « tous » contient tout le monde, donc
@@ -6177,8 +6918,11 @@ APP_JS = r"""
   }
   function libelleProto(f) {
     if (f.proto === "any" || !f.proto) { return "tous les ports"; }
-    if (!f.ports) { return f.proto.toUpperCase(); }
-    return f.proto.toUpperCase() + " " + f.ports;
+    /* « TCPUDP » ne veut rien dire pour qui lit : une règle qui porte les deux protocoles
+       se nomme comme on la décrit à voix haute. */
+    var nom = f.proto === "tcpudp" ? "TCP et UDP" : f.proto.toUpperCase();
+    if (!f.ports) { return nom; }
+    return nom + " " + f.ports;
   }
   /* « data-admin » va sur le BOUTON de retrait, jamais sur la pastille : posé sur la
      pastille, il masquait le nom de l'appareil lui-même, et un compte de consultation
@@ -6267,7 +7011,10 @@ APP_JS = r"""
     }
     res.forEach(function (r) {
       var tuile = el("div", "tile"), tete = el("div");
-      tete.append(el("b", null, r.libelle), el("div", "sub mono", r.cible + " · " + r.id));
+      /* La MAC n est affichée que si elle existe : une mention « réveil : — » sur chaque
+         ressource ferait du bruit chez tous ceux qui ne s en servent pas. */
+      tete.append(el("b", null, r.libelle),
+                  el("div", "sub mono", r.cible + " · " + r.id + (r.mac ? " · réveil " + r.mac : "")));
       var fin = el("div", "push");
       fin.append(boutonTexte("Modifier", "ghost", function () { ouvrirNouvelleRessource(r); }),
                  boutonTexte("Supprimer", "ghost danger", function () { ouvrirSupprRessource(r); }));
@@ -6357,6 +7104,10 @@ APP_JS = r"""
   /* « r » absent : création. « r » présent : modification de cette ressource-là. Un seul
      formulaire pour les deux, sinon les deux copies divergent au premier champ ajouté. */
   function ouvrirNouvelleRessource(r) {
+    /* Une ressource se reconnaît à son identifiant, et non au simple fait d'être un objet :
+       un appelant distrait — un auditeur de clic câblé directement, par exemple — passerait
+       autre chose, et la fenêtre basculerait en modification d'une ressource inexistante. */
+    if (!r || !r.id) { r = null; }
     openDialog(r ? "Modifier la ressource" : "Nouvelle ressource", function (b) {
       var f = el("form", "form");
       var nom = champ("res-id", "Nom court", "1 à 15 caractères : lettres, chiffres, - et _.", r ? r.id : "",
@@ -6369,6 +7120,10 @@ APP_JS = r"""
       cible.input.required = true; cible.input.placeholder = "192.168.1.20";
       var lib = champ("res-lib", "Libellé affiché", "Facultatif.", r ? r.libelle : "");
       lib.input.maxLength = 60; lib.input.placeholder = "ex. Le NAS";
+      var mac = champ("res-mac", "Réveil à distance",
+                      "Facultatif. L adresse MAC de la machine, pour la réveiller depuis le VPN.",
+                      r ? (r.mac || "") : "");
+      mac.input.maxLength = 17; mac.input.placeholder = "aa:bb:cc:dd:ee:ff";
       var err = errorBox(), act = actionsBar("Annuler", r ? "Enregistrer" : "Créer la ressource", "primary");
       /* Combien de règles suivront l adresse sans que leur ligne change d un caractère. */
       var cites = 0;
@@ -6382,14 +7137,14 @@ APP_JS = r"""
           ? cites + " règles visent cette ressource : elles pointeront toutes vers la nouvelle adresse."
           : "Une règle vise cette ressource : elle pointera vers la nouvelle adresse."));
       }
-      f.append(nom.bloc, cible.bloc, lib.bloc, err, act.bar);
+      f.append(nom.bloc, cible.bloc, lib.bloc, mac.bloc, err, act.bar);
       f.addEventListener("submit", function (e) {
         e.preventDefault();
         if (act.ok.disabled) { return; }
         act.ok.disabled = true; err.hidden = true;
         api("POST", r ? "/api/ressources/" + encodeURIComponent(r.id) + "/edit" : "/api/ressources",
             {id: nom.input.value.trim(), cible: cible.input.value.trim(),
-             libelle: lib.input.value.trim()})
+             libelle: lib.input.value.trim(), mac: mac.input.value.trim()})
           .then(function (d) {
             if (f.isConnected) { closeDialog(); }
             apresEcriture(d, r ? "Ressource modifiée" : "Ressource créée");
@@ -6420,7 +7175,10 @@ APP_JS = r"""
      manipule — : modification de cette règle-là. Ajouter un port obligeait sinon à supprimer
      la règle et à ressaisir toute la liste de ports de mémoire. */
   function ouvrirNouvelleRegle(x) {
-    var r = (x && x.flux) || null;
+    /* Même précaution que pour les ressources : une règle à modifier se reconnaît à son
+       flux ET à l'identifiant de ce flux, que la route /api/regles/<id>/edit exige. */
+    var r = (x && x.flux && x.flux.id) ? x.flux : null;
+    var modeleChoisi = null;
     openDialog(r ? "Modifier la règle d accès" : "Nouvelle règle d accès", function (b) {
       var f = el("form", "form");
       var sources = groupesTous().map(function (g) { return {valeur: g.id, texte: g.libelle}; });
@@ -6435,7 +7193,10 @@ APP_JS = r"""
       var dst = liste("reg-dst", "Peut joindre quoi ?", destinationsPossibles(), r ? r.dest : "internet");
       var proto = liste("reg-proto", "Protocole", [
         {valeur: "any", texte: "Tous (et tous les ports)"},
-        {valeur: "tcp", texte: "TCP"}, {valeur: "udp", texte: "UDP"}, {valeur: "icmp", texte: "ICMP (ping)"}
+        {valeur: "tcp", texte: "TCP"}, {valeur: "udp", texte: "UDP"},
+        /* Une seule règle, deux lignes de pare-feu. Évite d'en tenir deux à jour en
+           parallèle, ce qui est la façon la plus sûre de les voir diverger. */
+        {valeur: "tcpudp", texte: "TCP et UDP"}, {valeur: "icmp", texte: "ICMP (ping)"}
       ], r ? r.proto : "any");
       var ports = champ("reg-ports", "Ports", "Avec TCP ou UDP. Exemples : 445 ou 445,5000-5001. Vide = tous.", r ? r.ports : "");
       ports.input.placeholder = "445,5000-5001";
@@ -6459,29 +7220,65 @@ APP_JS = r"""
           ? "Les deux sens : chacun des deux groupes peut appeler l autre."
           : "Réservé aux destinations « Groupe ». Ailleurs, le trafic de retour ne repasse pas "
             + "par le VPN : il dépend de votre box, et wg-pi ne peut rien en promettre.";
-        var avecPorts = proto.select.value === "tcp" || proto.select.value === "udp";
+        var avecPorts = proto.select.value === "tcp" || proto.select.value === "udp"
+          || proto.select.value === "tcpudp";
         ports.input.disabled = !avecPorts;
         if (!avecPorts) { ports.input.value = ""; }
         ports.aide.textContent = avecPorts
           ? "Exemples : 445 ou 445,5000-5001. Laissez vide pour tous les ports."
-          : "Choisissez d abord TCP ou UDP : les autres protocoles n ont pas de ports.";
+          : "Choisissez d abord TCP, UDP ou les deux : les autres protocoles n ont pas de ports.";
       }
       dst.select.addEventListener("change", majSens);
       proto.select.addEventListener("change", majSens);
       majSens();
       var err = errorBox(), act = actionsBar("Annuler", r ? "Enregistrer" : "Créer la règle", "primary");
+      /* Uniquement à la création : appliquer un modèle à une règle existante écraserait
+         les ports que l utilisateur vient précisément d ouvrir la fenêtre pour corriger. */
+      if (!r) {
+        var barre = el("div", "chips");
+        var noteM = el("div", "hint", "Facultatif : remplit le protocole et les ports pour vous.");
+        MODELES_REGLE.forEach(function (m) {
+          barre.append(boutonTexte(m.titre, "ghost", function () {
+            modeleChoisi = m;
+            var k = remplirModele(m, {proto: proto.select, ports: ports.input,
+                                      lib: lib.input, maj: majSens});
+            noteM.textContent = m.aide + (k > 1
+              ? " — deux règles seront créées : " + m.regles[0].proto.toUpperCase()
+                + " et " + m.regles[1].proto.toUpperCase() + ", les ports n étant pas les mêmes."
+              : "");
+          }));
+        });
+        f.append(el("div", "field", "Modèles"), barre, noteM);
+      }
       f.append(grille, lib.bloc, err, act.bar);
       f.addEventListener("submit", function (e) {
         e.preventDefault();
         if (act.ok.disabled) { return; }
         act.ok.disabled = true; err.hidden = true;
-        api("POST", r ? "/api/regles/" + encodeURIComponent(r.id) + "/edit" : "/api/regles",
-            {source: src.select.value, destination: dst.select.value,
-             proto: proto.select.value, ports: ports.input.value.trim(),
-             sens: sens.select.value, libelle: lib.input.value.trim()})
+        var champs = {source: src.select.value, destination: dst.select.value,
+                      proto: proto.select.value, ports: ports.input.value.trim(),
+                      sens: sens.select.value, libelle: lib.input.value.trim()};
+        /* Le lot n est employé que si le formulaire correspond ENCORE au modèle cliqué :
+           dès que l utilisateur retouche le protocole ou les ports, il ne verrait pas ce
+           que contient la seconde règle, et en ajouter une à son insu serait pire que de
+           lui en faire créer deux. */
+        var lot = (!r && modeleChoisi && modeleChoisi.regles.length > 1
+                   && champs.proto === modeleChoisi.regles[0].proto
+                   && champs.ports === modeleChoisi.regles[0].ports)
+          ? modeleChoisi.regles.map(function (m) {
+              return {source: champs.source, destination: champs.destination,
+                      proto: m.proto, ports: m.ports, sens: champs.sens,
+                      libelle: champs.libelle === modeleChoisi.regles[0].libelle
+                        ? m.libelle : champs.libelle};
+            })
+          : null;
+        api("POST",
+            lot ? "/api/regles/lot"
+                : (r ? "/api/regles/" + encodeURIComponent(r.id) + "/edit" : "/api/regles"),
+            lot ? {regles: lot} : champs)
           .then(function (d) {
             if (f.isConnected) { closeDialog(); }
-            apresEcriture(d, r ? "Règle modifiée" : "Règle créée");
+            apresEcriture(d, r ? "Règle modifiée" : (lot ? "Règles créées" : "Règle créée"));
           }).catch(function (x) { showError(f, err, act.ok, x); });
       });
       b.append(f);
@@ -6661,8 +7458,13 @@ APP_JS = r"""
   /* ---- Barre d'outils ---- */
   $("new").addEventListener("click", openNew);
   $("grp-new").addEventListener("click", ouvrirNouveauGroupe);
-  $("res-new").addEventListener("click", ouvrirNouvelleRessource);
-  $("rule-new").addEventListener("click", ouvrirNouvelleRegle);
+  /* Enveloppées, et non passées directement : addEventListener appelle son auditeur avec
+     l'objet Event en PREMIER argument. Depuis que ces deux fonctions acceptent un
+     paramètre — la ressource ou la règle à modifier — un câblage direct leur livrait
+     l'Event à sa place, un objet bien vrai : le bouton « Nouvelle ressource » ouvrait
+     « Modifier la ressource », nom verrouillé et vide, vers /api/ressources/undefined/edit. */
+  $("res-new").addEventListener("click", function () { ouvrirNouvelleRessource(); });
+  $("rule-new").addEventListener("click", function () { ouvrirNouvelleRegle(); });
   $("acc-switch").addEventListener("click", ouvrirBascule);
   $("search").addEventListener("input", function (e) { query = e.target.value; if (state) { renderList(); } });
   $("sort").addEventListener("change", function (e) { sortKey = e.target.value; if (state) { renderList(); } });
@@ -6670,6 +7472,84 @@ APP_JS = r"""
     if (!state || !navigator.clipboard) { return; }
     navigator.clipboard.writeText(state.server.pubkey).then(function () { toast("Clé publique copiée"); });
   });
+  /* ---- Mises à jour ---- */
+  function ligneInfo(libelle, valeur, alerte) {
+    var l = el("div", "regle");
+    l.append(el("span", "chip plain", libelle));
+    l.append(el("b", alerte ? "alerte-texte" : null, valeur));
+    return l;
+  }
+
+  function ouvrirReglages() {
+    openDialog("Mises à jour", function (b) {
+      var corps = el("div");
+      corps.append(el("p", "hint", "Relevé en cours…"));
+      b.append(corps);
+      api("GET", "/api/systeme").then(function (d) {
+        /* Une reponse tronquee ou inattendue ne doit pas afficher « undefined » : ce mot ne
+           veut rien dire pour qui lit, et il masque la vraie panne. */
+        if (!d || !d.wgpi) {
+          corps.textContent = "";
+          corps.append(el("p", "hint", "Relevé illisible. En ligne de commande : sudo wg-pi check"));
+          return;
+        }
+        corps.textContent = "";
+        /* L avertissement EN PREMIER quand il y en a un : il conditionne la lecture de
+           tout le reste, et surtout le bouton de mise à jour plus bas. */
+        if (d.par_vpn) {
+          var av = el("div", "alert");
+          av.textContent = "Vous êtes connecté à travers le VPN. Mettre wg-pi à jour recharge "
+            + "le pare-feu : vous risquez de vous couper vous-même en pleine opération. "
+            + "Faites-le plutôt depuis votre réseau à la maison, ou avec un clavier sur le Pi.";
+          corps.append(av);
+        }
+        if (d.reboot) {
+          var rb = el("div", "alert");
+          rb.textContent = "Un redémarrage est demandé par des mises à jour déjà installées.";
+          corps.append(rb);
+        }
+        var neuf = d.maj_etat === "neuf";
+        corps.append(ligneInfo("wg-pi", d.wgpi + (neuf ? "  →  " + d.maj_version + " disponible" : ""), neuf));
+        if (d.maj_etat === "inconnu") {
+          corps.append(el("div", "hint", "La version publiée n a pas pu être vérifiée : le Pi n a "
+            + "peut-être pas accès à Internet."));
+        }
+        corps.append(ligneInfo("WireGuard", d.wireguard || "inconnue"));
+        corps.append(ligneInfo("Paquets du système en attente", String(d.paquets),
+                               d.paquets > 0));
+        var auto = d.auto === "actif";
+        corps.append(ligneInfo("Mises à jour de sécurité automatiques",
+          auto ? "actives" : (d.auto === "incoherent" ? "demandées, mais inopérantes" : "arrêtées"),
+          !auto));
+        if (d.auto === "incoherent") {
+          corps.append(el("div", "hint", "Le réglage est posé mais le minuteur du système ne "
+            + "tourne pas : rien ne s installe. Réactivez-les pour remettre les deux d accord."));
+        }
+        if (!d.admin) { return; }
+        var barre = el("div", "chips");
+        barre.append(boutonTexte(auto ? "Arrêter les mises à jour auto" : "Activer les mises à jour auto",
+          auto ? "ghost danger" : "ghost", function () {
+            api("POST", "/api/auto-updates", {action: auto ? "off" : "on"})
+              .then(function () { closeDialog(); ouvrirReglages(); })
+              .catch(function (x) { toast(x && x.message ? x.message : String(x), true); });
+          }));
+        if (neuf) {
+          barre.append(boutonTexte("Mettre wg-pi à jour", "primary", function () {
+            api("POST", "/api/update", {}).then(function () {
+              closeDialog();
+              toast("Mise à jour lancée. Le panneau va redémarrer dans un instant.");
+            }).catch(function (x) { toast(x && x.message ? x.message : String(x), true); });
+          }));
+        }
+        corps.append(barre);
+      }).catch(function (x) {
+        corps.textContent = "";
+        corps.append(el("p", "hint", "Relevé indisponible : " + (x && x.message ? x.message : x)));
+      });
+    });
+  }
+  if ($("reglages")) { $("reglages").addEventListener("click", function () { ouvrirReglages(); }); }
+
   $("logout").addEventListener("click", function () {
     api("POST", "/api/logout", {}).catch(function () {}).then(function () { window.location.href = "/login"; });
   });
@@ -6713,6 +7593,7 @@ def app_page(sess):
 <a class="brand" href="/">{LOGO}<b>wg-pi</b><small>VPN WireGuard®</small></a>
 <div class="tools">
 <button type="button" class="icon-btn" id="theme" aria-label="Changer de thème"></button>
+<button type="button" class="icon-btn" id="reglages" data-icon="rouage" title="Mises à jour" aria-label="Mises à jour"></button>
 <button type="button" class="btn ghost" id="logout" data-icon="logout"><span class="hide-sm">Déconnexion</span></button>
 </div></div></header>
 <main class="wrap">
@@ -6814,6 +7695,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ip = ip.ipv4_mapped
         return any(ip in net for net in ALLOWED_NETS)
 
+    def vient_du_vpn(self):
+        """Cette requête arrive-t-elle PAR le tunnel ?
+
+        Mettre wg-pi à jour recharge le pare-feu. Lancé depuis le panneau par quelqu'un qui
+        y accède à travers le VPN, le bouton coupe donc la connexion de celui qui l'a pressé,
+        en pleine opération. Mieux vaut l'avertir avant.
+
+        On compare au réseau du TUNNEL, et surtout pas à ALLOWED_NETS, qui contient
+        10.0.0.0/8 tout entier et étiquetterait « VPN » n'importe quel réseau local privé.
+        Le serveur est lui-même le point de terminaison TLS et ne lit aucun en-tête
+        X-Forwarded : l'adresse du client est donc la vraie."""
+        try:
+            base = get_state().get("server", {})
+            reseau = base.get("net") or ""
+            if not reseau:
+                return False
+            return ipaddress.ip_address(self.client_address[0]) in ipaddress.ip_network(reseau)
+        except Exception:
+            # Large VOLONTAIREMENT : get_state() lit « wg-pi json », qui lève RuntimeError
+            # dès que la commande échoue ou dépasse son délai — un Pi chargé, beaucoup
+            # d'appareils, un accès concurrent au fichier d'accès. Avec une liste fermée,
+            # cette RuntimeError remontait jusqu'à do_GET : la requête se terminait sans
+            # aucune réponse HTTP, et la fenêtre « Mises à jour » restait sur « Relevé en
+            # cours… » pour toujours. Ne pas savoir si l'on passe par le VPN ne vaut pas
+            # de perdre tout le relevé : on se contente de ne pas avertir.
+            return False
+
     def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
@@ -6879,6 +7787,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(200, get_state())
             except Exception as e:  # état illisible : on le signale à la page plutôt que de planter
                 return self.send_json(500, {"error": str(e)})
+        # Relevé des mises à jour. Route SÉPARÉE de /api/state, qui est interrogé en boucle :
+        # le relevé n'est lu qu'à l'ouverture de la fenêtre, et le CLI le met lui-même en
+        # cache. Accessible au compte de consultation : savoir que son Pi a vingt paquets de
+        # sécurité en retard ne demande aucun droit d'écriture.
+        if path == "/api/systeme":
+            r = run_wgpi("sys-json", timeout=120)
+            if r.returncode != 0:
+                return self.send_json(500, {"error": message_erreur(r)})
+            try:
+                d = json.loads(r.stdout)
+            except ValueError:
+                return self.send_json(500, {"error": "Relevé des mises à jour illisible."})
+            d["par_vpn"] = self.vient_du_vpn()
+            d["admin"] = sess.get("role") == "admin"
+            return self.send_json(200, d)
         m = re.fullmatch(r"/device/([A-Za-z0-9_-]{1,15})/(conf|qr)", path)
         if m:
             # Les deux seuls GET à protéger : le fichier .conf et le QR code contiennent la
@@ -6997,6 +7920,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": "Appareil invalide."})
             quoi = "ajouté au" if action == "join" else "retiré du"
             return self.mutate_acces(("group", action, dev, gid), f"« {dev} » {quoi} groupe « {gid} »")
+        if path == "/api/auto-updates":
+            action = str(body.get("action", "")).strip()
+            if action not in ("on", "off"):
+                return self.send_json(400, {"error": "Action inconnue."})
+            r = run_wgpi("maj-auto", action, timeout=300)
+            if r.returncode != 0:
+                return self.send_json(400, {"error": message_erreur(r)})
+            log(f"{self.client_address[0]} : mises à jour automatiques {action}")
+            # On renvoie l'état RELU, et non un simple accusé : la fenêtre ne se rafraîchit
+            # pas toute seule, et annoncer « activé » sans vérifier serait reprendre le
+            # défaut que cette fenêtre existe justement pour corriger.
+            s = run_wgpi("sys-json", "--rafraichir", timeout=120)
+            try:
+                return self.send_json(200, json.loads(s.stdout))
+            except ValueError:
+                return self.send_json(200, {"ok": True})
+        if path == "/api/update":
+            # DÉTACHÉ, et ce n'est pas un détail : « wg-pi update » redémarre le service du
+            # panneau, qui tuerait son propre groupe de processus — donc la mise à jour en
+            # cours. Une unité transitoire a son propre groupe et y survit. Le délai d'attente
+            # de run_wgpi mentirait de toute façon bien avant la fin.
+            if not shutil.which("systemd-run"):
+                return self.send_json(409, {"error": "Mise à jour impossible depuis le panneau sur ce système. "
+                                                     "En ligne de commande : sudo wg-pi update"})
+            try:
+                subprocess.run(["systemd-run", "--quiet", "--collect",
+                                "--unit=wg-pi-update", WGPI, "update"],
+                               capture_output=True, timeout=20, check=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                return self.send_json(409, {"error": "La mise à jour n'a pas pu être lancée : " + str(e)})
+            log(f"{self.client_address[0]} : mise à jour de wg-pi lancée")
+            return self.send_json(200, {"ok": True, "lancee": True})
         if path == "/api/ressources":
             rid = str(body.get("id", "")).strip()
             cible = str(body.get("cible", "")).strip()
@@ -7014,7 +7969,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if any(r.get("id") == rid for r in acces_vue().get("ressources", [])):
                 return self.send_json(409, {"error": f"Une ressource « {rid} » existe déjà. "
                                                      f"Supprimez-la d'abord si vous voulez la faire pointer ailleurs."})
+            mac = str(body.get("mac", "")).strip()
+            if mac and not MAC_RE.fullmatch(mac):
+                return self.send_json(400, {"error": "Adresse MAC invalide (attendu aa:bb:cc:dd:ee:ff)."})
             args = ["resource", "add", rid, cible] + (["--libelle=" + lib] if lib else [])
+            if mac:
+                args.append("--mac=" + mac)
             return self.mutate_acces(args, f"ressource « {rid} » créée")
         m = re.fullmatch(r"/api/ressources/([A-Za-z0-9_][A-Za-z0-9_-]{0,14})/delete", path)
         if m:
@@ -7034,27 +7994,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": "Adresse invalide (exemples : 192.168.1.20 ou 192.168.1.64/28)."})
             if not libelle_ok(lib):
                 return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
-            args = ["resource", "add", rid, cible] + (["--libelle=" + lib] if lib else [])
+            mac = str(body.get("mac", "")).strip()
+            if mac and not MAC_RE.fullmatch(mac):
+                return self.send_json(400, {"error": "Adresse MAC invalide (attendu aa:bb:cc:dd:ee:ff)."})
+            # « --mac= » est passé MÊME VIDE, contrairement à la création : le formulaire
+            # renvoie tous ses champs, donc vider la case est le seul moyen de retirer un
+            # réveil. Un envoi conditionnel rendrait ce retrait impossible depuis le panneau.
+            args = ["resource", "add", rid, cible, "--mac=" + mac] + (["--libelle=" + lib] if lib else [])
             return self.mutate_acces(args, f"ressource « {rid} » modifiée")
+        # Un modèle de règle en pose parfois DEUX : Moonlight a besoin de TCP et d'UDP, et
+        # ce ne sont pas les mêmes ports — une règle ne porte qu'un protocole. Les envoyer
+        # en deux requêtes appliquerait le pare-feu deux fois, réarmerait deux minuteurs et
+        # demanderait deux confirmations pour un seul clic. Ici tout est écrit, puis appliqué
+        # une seule fois.
+        if path == "/api/regles/lot":
+            lot = body.get("regles")
+            if not isinstance(lot, list) or not 1 <= len(lot) <= 4:
+                return self.send_json(400, {"error": "Lot de règles invalide."})
+            # Tout valider AVANT d'écrire quoi que ce soit : un lot à moitié posé laisserait
+            # une règle orpheline que l'utilisateur n'a pas demandée.
+            prepares = []
+            for brut in lot:
+                if not isinstance(brut, dict):
+                    return self.send_json(400, {"error": "Lot de règles invalide."})
+                champs, err = valider_regle(brut)
+                if err:
+                    return self.send_json(400, {"error": err})
+                prepares.append(champs)
+            averts, faites = [], 0
+            for c in prepares:
+                args = ["access", "allow", c["src"], c["dst"], "--proto=" + c["proto"],
+                        "--sens=" + c["sens"]]
+                if c["ports"]:
+                    args.append("--ports=" + c["ports"])
+                if c["lib"]:
+                    args.append("--libelle=" + c["lib"])
+                a, err = self.ecrire_acces(args, f"règle « {c['src']} vers {c['dst']} » créée")
+                if err:
+                    # On s'arrête et on N'APPLIQUE PAS : le pare-feu reste intact, et ce qui
+                    # a été écrit n'est qu'une ligne visible dans la liste, supprimable.
+                    return self.send_json(409, {"error": err + (
+                        f" {faites} règle(s) du modèle ont déjà été enregistrées." if faites else "")})
+                faites += 1
+                if a:
+                    averts.append(a)
+            return self.appliquer_acces(" ".join(averts)[:400])
         if path == "/api/regles":
-            src = str(body.get("source", "")).strip()
-            dst = str(body.get("destination", "")).strip()
-            proto = str(body.get("proto", "any")).strip() or "any"
-            ports = str(body.get("ports", "")).strip()
-            sens = str(body.get("sens", "aller")).strip() or "aller"
-            lib = str(body.get("libelle", "")).strip()
-            if not ACCES_ID_RE.fullmatch(src):
-                return self.send_json(400, {"error": "Groupe source invalide."})
-            if not DEST_RE.fullmatch(dst):
-                return self.send_json(400, {"error": "Destination invalide."})
-            if proto not in ("any", "tcp", "udp", "icmp"):
-                return self.send_json(400, {"error": "Protocole invalide."})
-            if sens not in ("aller", "deux"):
-                return self.send_json(400, {"error": "Sens invalide."})
-            if ports and not PORTS_RE.fullmatch(ports):
-                return self.send_json(400, {"error": "Liste de ports invalide. Exemples : 445 ou 445,5000-5001."})
-            if not libelle_ok(lib):
-                return self.send_json(400, {"error": "Libellé invalide : au plus 60 caractères, sans barre verticale."})
+            champs, err = valider_regle(body)
+            if err:
+                return self.send_json(400, {"error": err})
+            src, dst = champs["src"], champs["dst"]
+            proto, ports = champs["proto"], champs["ports"]
+            sens, lib = champs["sens"], champs["lib"]
             args = ["access", "allow", src, dst, "--proto=" + proto, "--sens=" + sens]
             if ports:
                 args.append("--ports=" + ports)
@@ -7077,7 +8068,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lib = str(body.get("libelle", "")).strip()
             if not DEST_RE.fullmatch(dst):
                 return self.send_json(400, {"error": "Destination invalide."})
-            if proto not in ("any", "tcp", "udp", "icmp"):
+            if proto not in ("any", "tcp", "udp", "tcpudp", "icmp"):
                 return self.send_json(400, {"error": "Protocole invalide."})
             if sens not in ("aller", "deux"):
                 return self.send_json(400, {"error": "Sens invalide."})
@@ -7116,12 +8107,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         vue mentirait, ce qui est pire que de ne rien afficher. La réapplication arme le
         retour arrière de deux minutes de wg-pi — c'est voulu : une règle maladroite posée
         à distance se défait toute seule au lieu de couper l'accès pour de bon."""
+        avert, erreur = self.ecrire_acces(args, what)
+        if erreur is not None:
+            return self.send_json(400, {"error": erreur})
+        return self.appliquer_acces(avert)
+
+    def ecrire_acces(self, args, what):
+        """Écrit par le CLI, sans toucher au pare-feu. Rend (avertissement, erreur)."""
         r = run_wgpi(*args)
         invalidate()
         if r.returncode != 0:
-            return self.send_json(400, {"error": message_erreur(r)})
+            return None, message_erreur(r)
         log(f"{self.client_address[0]} : {what}")
-        avert = avertissements(r.stdout)
+        return avertissements(r.stdout), None
+
+    def appliquer_acces(self, avert):
+        """Repousse les règles dans le noyau, UNE SEULE FOIS pour un lot d'écritures.
+
+        Chaque application reconstruit toutes les chaînes, reprend un instantané et
+        réarme le minuteur d'annulation de deux minutes. Deux écritures enchaînées
+        feraient donc tout cela deux fois, pour une seule action de l'utilisateur — et
+        le second instantané ne contiendrait plus l'état d'avant, mais l'état
+        intermédiaire : le filet de sécurité ne ramènerait plus là où l'on croit."""
         if not acces_actif():
             return self.send_json(200, {"ok": True, "applique": False, "avertissement": avert})
         # --modifie : ce n'est plus la configuration validée, il faut la revalider.
@@ -7306,7 +8313,9 @@ Utilisation : sudo wg-pi [commande]
   group set <appareil> <g1,g2,...>
                         fixer la liste des groupes d'un appareil (vide = aucun)
   resource list         appareils de la maison déclarés (NAS, Home Assistant…)
-  resource add <nom> <ip|réseau> [--libelle="..."]
+  resource add <nom> <ip|réseau> [--libelle="..."] [--mac=aa:bb:cc:dd:ee:ff]
+                        déclarer une machine, changer son adresse, ou lui donner
+                        une MAC pour le réveil à distance (Wake-on-LAN)
   resource rm <nom>
   access show           ce que chaque groupe peut joindre
   access list           les règles, une par une
@@ -7405,6 +8414,9 @@ main() {
     web)                     cmd_web "$@" ;;
     web-serve)               cmd_web_serve ;;
     json)                    cmd_json ;;
+    sys-json)                cmd_sys_json "$@" ;;
+    update-check)            cmd_update_check ;;
+    maj-auto)                cmd_maj_auto "$@" ;;
     fw-sync)                 cmd_fw_sync ;;
     access-apply)            cmd_access_apply "$@" ;;
     access-rollback)         cmd_access_rollback ;;

@@ -5,7 +5,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 rc=0
-for t in lint helpers access cli-access engine apply json ui role detect-reachability firewall heredoc; do
+for t in lint helpers access cli-access engine apply json python ui role detect-reachability firewall heredoc; do
   # Appel par « bash » et non « ./ » : ce depot est alimente par depot manuel, et
   # l upload web de GitHub ne conserve pas le bit executable. Ne rien en faire
   # dependre evite un echec en « Permission denied » des le premier envoi.

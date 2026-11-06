@@ -26,11 +26,31 @@ function makeEl(tag) {
     insertBefore: function (c) { return e.appendChild(c); },
     removeChild: function (c) { e.children = e.children.filter(function (x) { return x !== c; }); return c; },
     remove: function () { if (e.parentNode) { e.parentNode.removeChild(e); } },
+    _ecouteurs: Object.create(null),
     setAttribute: function (k, v) { e.attributes[k] = String(v); },
     getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(e.attributes, k) ? e.attributes[k] : null; },
     removeAttribute: function (k) { delete e.attributes[k]; },
-    addEventListener: function () {},
-    removeEventListener: function () {},
+    /* Les ecouteurs sont RETENUS, et non jetes : sans eux, aucun test ne peut declencher
+       une soumission de formulaire ni un clic, et tout le cablage du panneau reste hors
+       de portee — on ne peut verifier que les fonctions appelees directement. */
+    addEventListener: function (type, fn) {
+      (e._ecouteurs[type] = e._ecouteurs[type] || []).push(fn);
+    },
+    removeEventListener: function (type, fn) {
+      e._ecouteurs[type] = (e._ecouteurs[type] || []).filter(function (f) { return f !== fn; });
+    },
+    /* Appelle les ecouteurs du type demande, dans l ordre d enregistrement. L evenement
+       recu porte « preventDefault » parce que tous les gestionnaires du panneau
+       commencent par l appeler. */
+    dispatchEvent: function (ev) {
+      var e2 = ev || {};
+      if (!e2.type) { return true; }
+      e2.target = e2.target || e;
+      e2.preventDefault = e2.preventDefault || function () { e2.defaultPrevented = true; };
+      e2.stopPropagation = e2.stopPropagation || function () {};
+      (e._ecouteurs[e2.type] || []).slice().forEach(function (f) { f.call(e, e2); });
+      return !e2.defaultPrevented;
+    },
     insertAdjacentHTML: function () {},
     /* Resout les selecteurs d attribut de la forme [data-xxx], les seuls utilises
        par le code teste. Suffisant pour rendre le mode focus de la carte verifiable. */
@@ -158,10 +178,26 @@ function install(ids) {
     setItem: function (k, v) { this._d[k] = String(v); },
     removeItem: function (k) { delete this._d[k]; }
   });
-  poser("fetch", function () { return Promise.reject(new Error("aucun reseau dans les tests")); });
+    /* Le fetch ENREGISTRE ce qu on lui demande, et continue d echouer par defaut : les
+     tests existants comptent sur ce refus. Un test qui veut suivre une ecriture jusqu au
+     bout pose « env.reponse » avant de declencher. */
+  const requetes = [];
+  const etat = {reponse: null};
+  poser("fetch", function (url, opts) {
+    const o = opts || {};
+    requetes.push({url: String(url), method: o.method || "GET",
+                   body: o.body ? JSON.parse(o.body) : null,
+                   entetes: o.headers || {}});
+    if (!etat.reponse) { return Promise.reject(new Error("aucun reseau dans les tests")); }
+    const r = etat.reponse;
+    return Promise.resolve({
+      ok: r.ok !== false, status: r.status || 200,
+      json: function () { return Promise.resolve(r.data || {}); }
+    });
+  });
   /* setInterval neutralise : le code du panneau en installe un au chargement. */
   poser("setInterval", function () { return 0; });
-  return {doc: doc, registry: registry};
+  return {doc: doc, registry: registry, requetes: requetes, etat: etat};
 }
 
 module.exports = {install: install, makeEl: makeEl, textOf: textOf, findAll: findAll};
