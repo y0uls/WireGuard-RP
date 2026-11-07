@@ -32,6 +32,7 @@ problèmes, pas le premier.
 | `firewall.sh` | le pare-feu généré : sa syntaxe, sa structure, et son **exécution** sous commandes simulées |
 | `heredoc.sh` | le code embarqué compile, aucune fonction n'y est déclarée deux fois, et aucun texte affiché n'a perdu son apostrophe |
 | `run-all.sh` | enchaîne tout et renvoie un code de sortie non nul si une étape a échoué |
+| `ci-local.sh` | rejoue les cinq étapes de la CI — outils requis, fins de ligne, syntaxe, ShellCheck, suite |
 
 `VERBOSE=1 bash test/detect-reachability.sh` affiche en plus la phrase d'explication rendue à
 l'utilisateur pour chaque cas : c'est le moyen le plus rapide de relire les messages en
@@ -67,11 +68,22 @@ diffère sur trois points : **Node 22** (et non 18), un utilisateur **non privil
 **`sshd` installé**. Les trois ont déjà causé des échecs. Pour rejouer la CI à l'identique :
 
 ```bash
-docker run --rm -v "$PWD:/repo:ro" node:22-bookworm-slim bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null && apt-get -qq install -y --no-install-recommends shellcheck python3 iproute2 iptables openssh-server iputils-ping unattended-upgrades >/dev/null && useradd -m runner && mkdir -p /src && cp -r /repo/wg-pi.sh /repo/test /src/ && chown -R runner /src && su runner -c "cd /src && for t in helpers access cli-access engine apply json python ui role detect-reachability firewall heredoc; do bash ./test/\$t.sh >/dev/null 2>&1 && echo \"OK   \$t\" || echo \"ECHEC \$t\"; done"'
+docker run --rm -v "$PWD:/repo:ro" node:22-bookworm-slim bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null && apt-get -qq install -y --no-install-recommends shellcheck python3 git iproute2 iptables openssh-server iputils-ping unattended-upgrades >/dev/null && useradd -m runner && mkdir -p /src && cp -r /repo/wg-pi.sh /repo/README.md /repo/LICENSE /repo/test /repo/docs /repo/.github /repo/.gitattributes /src/ && cd /src && git init -q . && git config user.email a@b && git config user.name a && git add -A >/dev/null && git commit -qm x >/dev/null && chown -R runner /src && su runner -c "cd /src && bash test/ci-local.sh"'
 ```
 
-La liste des étapes est exactement celle de l'étape « Tests unitaires » du workflow ; `lint`
-n'y figure pas parce que la CI lance `shellcheck` dans une étape à part.
+`git` est installé **exprès** : le contrôle des fins de ligne du workflow s'appuie sur
+`git ls-files` pour savoir quels fichiers sont déposés.
+
+Il n'y a plus de liste d'étapes à recopier : le workflow lance `test/run-all.sh`, qui porte
+la liste **une seule fois**. Les deux avaient déjà divergé — `test/python.sh` a existé
+plusieurs jours sans que la CI le lance.
+
+> [!IMPORTANT]
+> Le workflow commence par une étape **« Outils requis »** qui échoue si `node`, `python3`
+> ou `shellcheck` manque. Ce n'est pas du zèle : sans `node`, `ui.sh` et `heredoc.sh` ne
+> tombent pas, ils **sautent** et rendent 0. Mesuré en retirant `node` du runner : la suite
+> annonce « VÉRIFICATION : tout est passé » et sort en 0, avec **257 assertions évaporées**
+> — une CI verte qui n'a rien vérifié du panneau.
 
 `iputils-ping` et `unattended-upgrades` sont installés **exprès** : ce sont eux qui ont révélé
 des tests qui affirmaient un fait de la machine au lieu de le simuler. Le runner les a, une
