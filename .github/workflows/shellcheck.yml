@@ -1,21 +1,47 @@
-name: ShellCheck
+name: Vérification
 
 on:
   push:
   pull_request:
 
 jobs:
-  shellcheck:
+  verification:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
+      # Les outils sont EXIGÉS, pas espérés.
+      #
+      # ui.sh et heredoc.sh ne TOMBENT pas quand node manque : ils SAUTENT (« node absent,
+      # vérification du JavaScript ignorée ») et rendent 0. La suite concluait alors
+      # « VÉRIFICATION : tout est passé » en ayant laissé de côté plus de deux cent
+      # cinquante assertions — le pire résultat possible, puisqu'il est vert. Même piège
+      # pour python3 (json.sh, python.sh) et pour shellcheck (lint.sh).
+      - name: Outils requis
+        run: |
+          manque=0
+          for o in bash node python3 shellcheck; do
+            if command -v "$o" >/dev/null 2>&1; then
+              printf '  ✔ %-11s %s\n' "$o" "$("$o" --version 2>&1 | head -n1)"
+            else
+              echo "::error::« $o » est absent du runner : des tests seraient silencieusement sautés."
+              manque=1
+            fi
+          done
+          exit $manque
+
+      # Un seul fichier en CRLF ne s'exécute pas sur le Pi. Le contrôle ne portait que sur
+      # wg-pi.sh : un fichier de test déposé depuis Windows passait sans un mot.
       - name: Fins de ligne Unix (LF)
         run: |
-          if grep -q "$(printf '\r')" wg-pi.sh; then
-            echo "::error file=wg-pi.sh::Le fichier contient des fins de ligne Windows (CRLF) : il ne s'exécutera pas sur le Pi."
-            exit 1
-          fi
+          rc=0
+          while IFS= read -r f; do
+            if grep -q "$(printf '\r')" "$f"; then
+              echo "::error file=$f::Fins de ligne Windows (CRLF) : ce fichier ne s'exécutera pas sur le Pi."
+              rc=1
+            fi
+          done < <(git ls-files '*.sh' '*.js' '*.md' '*.yml')
+          exit $rc
 
       - name: Syntaxe bash
         run: bash -n wg-pi.sh
@@ -23,17 +49,11 @@ jobs:
       - name: ShellCheck
         run: shellcheck -S warning wg-pi.sh
 
-      - name: Tests unitaires
-        run: |
-          bash ./test/helpers.sh
-          bash ./test/access.sh
-          bash ./test/cli-access.sh
-          bash ./test/engine.sh
-          bash ./test/apply.sh
-          bash ./test/json.sh
-          bash ./test/python.sh
-          bash ./test/ui.sh
-          bash ./test/role.sh
-          bash ./test/detect-reachability.sh
-          bash ./test/firewall.sh
-          bash ./test/heredoc.sh
+      # UNE SEULE liste de tests, celle de run-all.sh.
+      #
+      # Elle était recopiée ici, et les deux avaient déjà divergé : test/python.sh a existé
+      # plusieurs jours sans que la CI le lance. Ajouter un fichier de test ne doit demander
+      # de le déclarer qu'à un seul endroit. run-all.sh exécute d'ailleurs TOUTES les étapes
+      # même si l'une échoue, pour donner la liste complète des problèmes et non le premier.
+      - name: Suite de tests
+        run: bash ./test/run-all.sh
