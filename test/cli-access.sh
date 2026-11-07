@@ -24,8 +24,11 @@ sed -e "s|^readonly STATE_DIR=.*|readonly STATE_DIR='$TMP/etc'|" \
     -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE='$TMP/log'|" \
     -e "s|^readonly SYS_DIR=.*|readonly SYS_DIR='$TMP/run'|" \
     -e "s|^readonly SYS_FILE=.*|readonly SYS_FILE='$TMP/run/systeme.json'|" \
+    -e "s|^readonly REBOOT_FILE=.*|readonly REBOOT_FILE='$TMP/reboot-required'|" \
     "$SCRIPT" > "$TMP/full.sh"
-for marqueur in "STATE_DIR='$TMP/etc'" "WG_DIR='$TMP/wg'" "LOCK_FILE='$TMP/lock'" "SYS_FILE='$TMP/run/systeme.json'"; do
+# Le marqueur de redirection est verifie comme les autres : un « sed » qui ne mord plus
+# ferait ecrire le test dans le VRAI /run, ce que la suite promet de ne jamais faire.
+for marqueur in "STATE_DIR='$TMP/etc'" "WG_DIR='$TMP/wg'" "LOCK_FILE='$TMP/lock'" "SYS_FILE='$TMP/run/systeme.json'" "REBOOT_FILE='$TMP/reboot-required'"; do
   grep -q "$marqueur" "$TMP/full.sh" || { echo "Redirection manquante : $marqueur" >&2; exit 2; }
 done
 if [[ $(tail -n1 "$TMP/full.sh") == 'main "$@"' ]]; then
@@ -213,6 +216,31 @@ eq "cible invalide refusée" "$(runok cmd_resource add imprimante pas-une-ip)" n
 eq "réseau accepté" "$(runok cmd_resource add cameras 192.168.1.64/28)" oui
 eq "hors réseau de la maison : averti mais accepté" "$(run cmd_resource add ailleurs 10.9.9.9 | grep -c 'risque')" "1"
 
+echo "-- une cible aux bits d hote non nuls est refusee"
+# « 192.168.1.20/24 » est exactement ce qu on recopie depuis les reglages reseau de sa
+# machine. Le noyau masque les bits d hote : la regle ouvrait les 254 machines du reseau,
+# box comprise, pendant que tout l affichage montrait « 192.168.1.20/24 ».
+eq "le reseau mal ecrit est refuse" "$(runok cmd_resource add nas2 192.168.1.20/24)" non
+# Le refus doit NOMMER les deux lectures : sans cela l utilisateur ne sait pas quoi taper.
+eq "le refus nomme la machine seule" "$(run cmd_resource add nas2 192.168.1.20/24 | grep -c '« 192.168.1.20 »')" "1"
+eq "le refus nomme le reseau entier" "$(run cmd_resource add nas2 192.168.1.20/24 | grep -c '192.168.1.0/24')" "1"
+eq "rien n a ete ecrit" "$(rows | grep -c '^RES|nas2')" "0"
+# Les formes correctes restent acceptees, y compris celles dont les bits d hote SONT nuls.
+eq "un reseau correct passe" "$(runok cmd_resource add bloc2 192.168.1.64/28)" oui
+eq "une machine en /32 passe" "$(runok cmd_resource add seul 192.168.1.23/32)" oui
+eq "0.0.0.0/0 reste accepte" "$(runok cmd_resource add monde 0.0.0.0/0)" oui
+# La fonction elle-meme, cas par cas : c est elle que « access check » reutilise.
+eq "bits d hote detectes" "$(runok access_target_host_bits 192.168.1.20/24)" oui
+eq "reseau propre : non" "$(runok access_target_host_bits 192.168.1.0/24)" non
+eq "adresse nue : non" "$(runok access_target_host_bits 192.168.1.20)" non
+eq "/32 : non" "$(runok access_target_host_bits 192.168.1.20/32)" non
+eq "/0 propre : non" "$(runok access_target_host_bits 0.0.0.0/0)" non
+eq "/0 sale : oui" "$(runok access_target_host_bits 1.2.3.4/0)" oui
+# Une cible qui n est pas une adresse du tout n a pas « des bits d hote » : c est une autre
+# faute, deja signalee a part. Confondre les deux donnerait deux messages pour une erreur.
+eq "cible absurde : non" "$(runok access_target_host_bits pas-une-ip/24)" non
+eq "cible vide : non" "$(runok access_target_host_bits)" non
+
 echo "-- règles d accès"
 eq "autorisation simple" "$(runok cmd_access allow invites internet)" oui
 eq "règle enregistrée avec un identifiant" "$(rows | grep -c '^POLICY|p1|')" "1"
@@ -364,7 +392,24 @@ echo "-- ecriture pendant que le filtrage tourne deja"
 } > "$ACC"
 eq "autorisation acceptee avec le filtrage actif" "$(runok cmd_access allow admin tout)" oui
 eq "et la regle est bien enregistree" "$(rows | grep -c "^POLICY")" "1"
-eq "suppression acceptee avec le filtrage actif" "$(runok cmd_access rm p1)" oui
+# Avec le filtrage actif, la DERNIERE regle ne se supprime pas : zero regle, c est tout
+# couper. cmd_access_apply refusait bien d appliquer, mais la suppression avait deja eu
+# lieu — la regle disparaissait du fichier, l ANCIENNE restait dans le noyau, et l ecran
+# affichait une erreur rouge. On refuse donc AVANT d ecrire.
+eq "la derniere regle active est protegee" "$(runok cmd_access rm p1)" non
+eq "elle est toujours dans le fichier" "$(rows | grep -c '^POLICY|p1|')" "1"
+eq "et le refus nomme la seule action qui a du sens" "$(run cmd_access rm p1 | grep -c 'access off')" "1"
+# Une regle qui n est PAS la derniere se supprime normalement.
+silent cmd_access allow admin internet
+eq "deux regles maintenant" "$(rows | grep -c '^POLICY')" "2"
+eq "la premiere se supprime" "$(runok cmd_access rm p1)" oui
+eq "et il en reste une" "$(rows | grep -c '^POLICY')" "1"
+# Hors filtrage, rien ne protege la derniere : il n y a rien a couper.
+silent cmd_access off
+eq "hors filtrage, la derniere se supprime" "$(runok cmd_access rm p2)" oui
+eq "le fichier est vide de regles" "$(rows | grep -c '^POLICY')" "0"
+{ echo "V|1"; echo "MODE|filtre"; echo "GROUP|admin|Administration"; } > "$ACC"
+silent cmd_access allow admin tout
 eq "creation de groupe acceptee avec le filtrage actif" "$(runok cmd_group add salon)" oui
 eq "creation de ressource acceptee avec le filtrage actif" "$(runok cmd_resource add nas3 192.168.1.30)" oui
 # Le rappel « pas encore actif » serait un mensonge quand le filtrage tourne.
@@ -683,6 +728,134 @@ eq "et aucun avertissement ne sonne" "$(run access_route_warn | grep -c 'tout so
 } > "$ACC"
 eq "une ressource ordinaire ne donne pas Internet" "$(runok access_group_has_internet adm)" non
 
+
+echo "-- une cible deja enregistree avec des bits d hote"
+# Un access.conf ecrit par une version anterieure, ou a la main, peut en contenir. Le
+# pare-feu ouvre deja tout le reseau : l ecran doit dire la meme chose que le noyau.
+{
+  echo "V|1"; echo "MODE|filtre"; echo "GROUP|inv|Invites"
+  echo "MEMBER|telephone|inv"
+  echo "RES|nas|Le NAS|192.168.99.20/24"
+  echo "POLICY|p1|1|grp:inv|res:nas|tcp|445|aller|Partage"
+} > "$ACC"
+eq "la cible lue est normalisee" "$(run access_res_target nas)" "192.168.99.0/24"
+eq "le plan pose la regle que le noyau appliquera" "$(run access_match_dest res:nas)" "-d 192.168.99.0/24"
+eq "le diagnostic le signale" "$(run access_check | grep -c 'ouvre tout le réseau')" "1"
+eq "et il propose la correction" "$(run access_check | grep -c 'resource add nas 192.168.99.20')" "1"
+# Une ressource saine ne doit evidemment rien declencher.
+{
+  echo "V|1"; echo "MODE|filtre"; echo "GROUP|inv|Invites"
+  echo "MEMBER|telephone|inv"
+  echo "RES|nas|Le NAS|192.168.1.20"
+  echo "POLICY|p1|1|grp:inv|res:nas|tcp|445|aller|Partage"
+} > "$ACC"
+eq "une ressource saine ne declenche rien" "$(run access_check | grep -c 'ouvre tout le réseau')" "0"
+eq "et sa cible sort telle quelle" "$(run access_res_target nas)" "192.168.1.20"
+
+echo
+
+echo
+echo "-- les reseaux locaux du Pi, lus dans le systeme"
+# « internet » n excluait que LAN_NET. Un Pi qui heberge Pi-hole ou Home Assistant porte
+# aussi des ponts Docker, et peut avoir une seconde carte ou un VLAN : tout cela restait
+# joignable depuis un groupe cense n avoir qu Internet. La liste est donc lue dans le
+# systeme — et ici dans un FAUX « ip », pour que le test ne mesure pas la machine.
+# LAN_NET est pose a la main : « source » seul ne charge pas les reglages, et sans lui le
+# test ne mesurerait que le faux « ip » au lieu des deux sources que la fonction fond.
+nets() { ( source "$SRC"; LAN_NET=192.168.1.0/24; PATH=$SBIN:$OUTILS; access_local_nets ) 2>/dev/null; }
+# « ip » doit distinguer « addr show » de « route show » : les reseaux que le Pi ROUTE sans
+# y avoir d adresse — un second routeur, le VLAN invites de la box — ne sont visibles que
+# dans la table de routage, et ils etaient entierement laisses dehors.
+IPADDR=$TMP/ip-addr IPROUTE=$TMP/ip-route
+: > "$IPADDR"; : > "$IPROUTE"
+faux_ip() {
+  { echo "#!/bin/sh"
+    echo "case \"\$*\" in"
+    echo "  *route*) cat '$IPROUTE' ;;"
+    echo "  *) cat '$IPADDR' ;;"
+    echo "esac"
+    echo "exit 0"
+  } > "$SBIN/ip"
+  chmod +x "$SBIN/ip"
+}
+faux ip 0 "1: lo    inet 127.0.0.1/8 scope host lo" "2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0" "3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0" "4: br-9f12ab    inet 172.18.0.1/16 brd 172.18.255.255 scope global br-9f12ab" "5: wg0    inet 10.8.0.1/24 scope global wg0" "6: eth0.20@eth0    inet 10.10.0.5/16 brd 10.10.255.255 scope global eth0.20"
+# Comparaison multi-ligne directe : la cible doit etre lisible dans le message d echec.
+eq "la maison, les deux ponts Docker et le VLAN" "$(nets)" "192.168.1.0/24
+172.17.0.0/16
+172.18.0.0/16
+10.10.0.0/16"
+# wg0 est le tunnel lui-meme : l ecarter de « internet » couperait le pair-a-pair, qui est
+# deja traite par « ! -o wg0 ». Et « lo » n est pas un reseau local au sens du filtrage.
+eq "le tunnel n y est pas" "$(nets | grep -c '^10.8.0')" "0"
+eq "la boucle locale n y est pas" "$(nets | grep -c '^127')" "0"
+# LAN_NET vient des reglages, pas de « ip » : il doit figurer meme quand la commande manque,
+# sinon une seule absence d outil rendrait « Internet seulement » plus large que promis.
+sans ip
+eq "sans la commande ip, la maison reste exclue" "$(nets)" "192.168.1.0/24"
+# Un doublon — la meme adresse vue deux fois, ce qui arrive avec une IP secondaire sur la
+# meme carte — ne doit pas poser deux fois la meme regle.
+faux ip 0 "2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0" "2: eth0    inet 192.168.1.51/24 brd 192.168.1.255 scope global eth0:1"
+eq "les doublons sont fondus" "$(nets)" "192.168.1.0/24"
+# Une sortie que « ip » ne produirait jamais ne doit pas faire entrer n importe quoi dans
+# le plan : le moteur garantit qu aucun argument emis ne contient d espace.
+faux ip 0 "2: eth0    inet pas-une-adresse/24 scope global eth0" "3: eth1    inet 192.168.7.9/0 scope global eth1" "4: eth2    inet 192.168.8.9/99 scope global eth2"
+eq "les lignes absurdes sont ignorees" "$(nets)" "192.168.1.0/24"
+
+echo
+echo "-- les reseaux que le Pi ROUTE sans y avoir d adresse"
+# Un VLAN invites ou IoT derriere la box, un second routeur, un maillage Wi-Fi : le Pi n y
+# a aucune adresse, donc « ip addr » ne les montre pas, et « Internet seulement » les
+# laissait joignables. « maison » ne couvre que LAN_NET : rien d autre ne les atteignait.
+faux_ip
+printf '%s\n' "2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0" > "$IPADDR"
+printf '%s\n' "default via 192.168.1.1 dev eth0" \
+  "192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.50" \
+  "192.168.2.0/24 via 192.168.1.9 dev eth0" > "$IPROUTE"
+eq "le VLAN route est ecarte lui aussi" "$(nets)" "192.168.1.0/24
+192.168.2.0/24"
+# La route par DEFAUT est le chemin vers Internet : l ecarter viderait la destination de
+# tout son sens.
+eq "la route par defaut n entre pas" "$(nets | grep -c '^default')" "0"
+# Une route vers un reseau PUBLIC est un chemin vers Internet, pas un reseau local.
+printf '%s\n' "default via 192.168.1.1 dev eth0" \
+  "9.9.9.0/24 via 192.168.1.1 dev eth0" \
+  "10.77.0.0/16 via 192.168.1.9 dev eth0" > "$IPROUTE"
+eq "un reseau public route reste Internet" "$(nets | grep -c '^9[.]9[.]9')" "0"
+eq "un reseau prive route est local" "$(nets | grep -c '^10[.]77')" "1"
+# Et le tunnel lui-meme ne compte pas : il est deja traite par « ! -o wg0 ».
+printf '%s\n' "10.8.0.0/24 dev wg0 proto kernel scope link src 10.8.0.1" > "$IPROUTE"
+eq "les routes du tunnel sont ignorees" "$(nets | grep -c '^10[.]8[.]0')" "0"
+# La fonction de classement, cas par cas.
+prive() { ( source "$SRC"; access_net_prive "$1" && echo oui || echo non ); }
+eq "10/8 est prive"        "$(prive 10.0.0.0/8)" oui
+eq "172.16/12 aussi"       "$(prive 172.18.0.0/16)" oui
+eq "192.168/16 aussi"      "$(prive 192.168.2.0/24)" oui
+eq "la plage operateur aussi" "$(prive 100.64.0.0/10)" oui
+eq "le lien-local aussi"    "$(prive 169.254.0.0/16)" oui
+eq "9.9.9.9 est public"     "$(prive 9.9.9.0/24)" non
+eq "172.32 est public"      "$(prive 172.32.0.0/16)" non
+eq "une adresse nue est acceptee" "$(prive 192.168.4.4)" oui
+eq "et une absurdite est refusee" "$(prive pas-une-ip)" non
+
+echo "-- une interface restee DOWN n a pas de reseau joignable"
+# « ip addr show up » ne rend que les interfaces montees : nommer le reseau d une carte
+# eteinte n ajoutait qu une regle morte dans la chaine. Le faux « ip » recoit ici
+# l argument « up » et c est a lui de filtrer, comme le vrai.
+{ echo "#!/bin/sh"
+  echo "case \"\$*\" in"
+  echo "  *route*) cat '$IPROUTE' ;;"
+  echo "  *\"addr show up\"*) cat '$IPADDR' ;;"
+  echo "  *) cat '$IPADDR'; echo '9: eth9    inet 192.168.44.1/24 scope global eth9' ;;"
+  echo "esac"
+  echo "exit 0"
+} > "$SBIN/ip"
+chmod +x "$SBIN/ip"
+printf '%s\n' "2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0" > "$IPADDR"
+: > "$IPROUTE"
+eq "la carte eteinte n est pas ecartee" "$(nets | grep -c '^192[.]168[.]44')" "0"
+eq "et la carte montee l est" "$(nets)" "192.168.1.0/24"
+sans ip
+
 echo
 echo "-- mises a jour de securite : les trois reponses possibles"
 # Le panneau n affiche « actives » ou « arretees » que d apres ce seul mot. Celui qui compte
@@ -778,12 +951,236 @@ eq "depot injoignable : la sortie reste du JSON pur" "$(printf '%s' "$SJ3" | cut
 eq "ne pas savoir se dit" "$(printf '%s' "$SJ3" | grep -c "${q}maj_etat$q:${q}inconnu$q")" "1"
 eq "et aucune version n est inventee" "$(printf '%s' "$SJ3" | grep -c "${q}maj_version$q:$q$q")" "1"
 
+echo
+echo "-- resource add : le libelle de l existant est repris"
+# La commande que le diagnostic affiche pour corriger une cible — et l exemple « une
+# machine a change d adresse » du README — ne repassent pas --libelle. Le libelle etait
+# donc remplace par l identifiant, en silence. Or c est le seul texte que l utilisateur
+# lit : dans le panneau, dans chaque titre de regle, en tete de colonne de la matrice.
+{ echo "V|1"; echo "MODE|ouvert"; } > "$ACC"
+silent cmd_resource add nas 192.168.1.20 --libelle="Le NAS" --mac=aa:bb:cc:dd:ee:ff
+eq "la ressource est posee" "$(rows | grep '^RES|nas')" "RES|nas|Le NAS|192.168.1.20|aa:bb:cc:dd:ee:ff"
+# Exactement la commande du README, sans --libelle :
+silent cmd_resource add nas 192.168.1.25
+eq "le libelle survit au changement d adresse" "$(rows | grep '^RES|nas')" "RES|nas|Le NAS|192.168.1.25|aa:bb:cc:dd:ee:ff"
+# Et --libelle le remplace toujours quand il est donne.
+silent cmd_resource add nas 192.168.1.26 --libelle="Le nouveau NAS"
+eq "--libelle reste maitre" "$(rows | grep '^RES|nas')" "RES|nas|Le nouveau NAS|192.168.1.26|aa:bb:cc:dd:ee:ff"
+# Une creation garde le repli sur l identifiant.
+silent cmd_resource add imprimante 192.168.1.30
+eq "sans libelle, une creation prend l identifiant" "$(rows | grep '^RES|imprimante')" "RES|imprimante|imprimante|192.168.1.30"
+
+echo "-- le titre d une regle ne fige plus l adresse de la ressource"
+# Il etait calcule une fois avec l adresse du moment, puis grave. cmd_resource promet
+# pourtant en commentaire que « toutes les regles res:<nom> suivent la nouvelle adresse
+# sans changer d un caractere a l ecran » : la destination suivait, le titre non, et
+# « access list » affichait deux adresses differentes pour la MEME regle.
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|fam|La famille"; echo "MEMBER|telephone|fam"
+  echo "RES|nas|Le NAS|192.168.1.20"; } > "$ACC"
+silent cmd_access allow fam res:nas --proto=tcp --ports=445
+eq "le titre ne porte aucune adresse" "$(rows | grep '^POLICY|p1|' | cut -d'|' -f9)" "La famille → Le NAS"
+silent cmd_resource add nas 192.168.1.25 --libelle="Le NAS"
+eq "apres le demenagement, le titre est toujours juste" "$(rows | grep '^POLICY|p1|' | cut -d'|' -f9)" "La famille → Le NAS"
+# Une seule adresse a l ecran, et c est la bonne.
+eq "access list ne montre qu une adresse" "$(run cmd_access list | grep -c '192.168.1.20')" "0"
+eq "et c est la nouvelle" "$(run cmd_access list | grep -c '192.168.1.25')" "1"
+# « maison » non plus ne fige le reseau dans le titre.
+silent cmd_access allow fam maison
+eq "le titre de maison reste stable" "$(rows | grep '^POLICY|p2|' | cut -d'|' -f9)" "La famille → Le réseau de la maison"
+
+echo "-- le diagnostic complet signale aussi la cible trop large"
+# La boucle ne vivait que dans « access check », alors que le README presente
+# « sudo wg-pi check » comme le diagnostic complet et le met en avant partout.
+{ echo "V|1"; echo "MODE|ouvert"; echo "RES|nas|Le NAS|192.168.99.20/24"; } > "$ACC"
+eq "access_hostbits_warn le dit" "$(run access_hostbits_warn | grep -c 'ouvre tout le réseau')" "1"
+eq "et nomme la correction" "$(run access_hostbits_warn | grep -c 'resource add nas 192.168.99.20')" "1"
+eq "il rend non nul quand il signale" "$(runok access_hostbits_warn)" non
+eq "la version note avale le code" "$(runok access_hostbits_note)" oui
+{ echo "V|1"; echo "MODE|ouvert"; echo "RES|nas|Le NAS|192.168.99.20"; } > "$ACC"
+eq "une cible saine ne declenche rien" "$(run access_hostbits_warn | grep -c 'ouvre tout')" "0"
+eq "et il rend 0" "$(runok access_hostbits_warn)" oui
+
+echo "-- --mac sur un /32 : c est une machine unique"
+# access_target_host_bits, ecrite pour trancher entre « une machine » et « un reseau »,
+# classe « /32 » comme machine unique. cmd_resource refusait toute barre oblique : le
+# produit portait deux definitions contradictoires, et c etait la plus ancienne qui
+# parlait a l utilisateur.
+{ echo "V|1"; echo "MODE|ouvert"; } > "$ACC"
+eq "un /32 avec une MAC est accepte" "$(runok cmd_resource add nas 192.168.1.20/32 --mac=aa:bb:cc:dd:ee:ff)" oui
+# Et la cible est enregistree comme une adresse nue : les garde-fous voisins comparent
+# des adresses, et « ip neigh » n accepte pas de prefixe.
+eq "et la cible est rangee sans le /32" "$(rows | grep '^RES|nas')" "RES|nas|nas|192.168.1.20|aa:bb:cc:dd:ee:ff"
+eq "un vrai reseau reste refuse" "$(runok cmd_resource add bloc 192.168.1.64/28 --mac=aa:bb:cc:dd:ee:ff)" non
+eq "et le refus parle d adresse unique" "$(run cmd_resource add bloc 192.168.1.64/28 --mac=aa:bb:cc:dd:ee:ff | grep -c 'adresse unique')" "1"
+
+echo "-- le garde-fou DNS part avec les ecritures, pas seulement avec le diagnostic"
+# Il n avait que trois appelants : « check », « access check » et « access on ». Or le
+# panneau web n apprend un avertissement que par les lignes « ⚠ » de la commande qu il
+# vient de lancer : poser la regle piege depuis le navigateur coupait donc toute
+# resolution de noms sans un mot.
+sed -i "s/^CLIENT_DNS=.*/CLIENT_DNS=192.168.1.1/" "$TMP/etc/settings.conf"
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|inv|Invites"; echo "MEMBER|telephone|inv"; } > "$ACC"
+eq "access allow avertit sur le DNS" "$(run cmd_access allow inv internet | grep -c 'aucun nom de site')" "1"
+eq "et il nomme l appareil bloque" "$(run cmd_access allow inv internet | grep -c 'telephone')" "1"
+# Un avertissement ne doit JAMAIS devenir un echec : c est le piege que ce projet a deja
+# paye deux fois.
+eq "et la commande reussit quand meme" "$(runok cmd_access allow inv internet)" oui
+# Une fois le DNS couvert, le silence revient.
+silent cmd_access allow inv maison
+eq "DNS couvert : plus d avertissement" "$(run cmd_access allow inv pi --proto=tcp --ports=443 | grep -c 'aucun nom de site')" "0"
+sed -i "s/^CLIENT_DNS=.*/CLIENT_DNS=1.1.1.1/" "$TMP/etc/settings.conf"
+
+echo
+echo "-- le releve local : ce que l utilisateur vient de faire doit se voir"
+# Signale depuis l usage reel : « j avais 2 mises a jour systeme que j ai faites, pourtant
+# il me dit encore que j ai des mises a jour sur l interface web apres les avoir faites. Il
+# fallait que je redemarre... dommage que ca ne me le disait pas aussi sur l interface. »
+# Le panneau servait le bloc ENTIER depuis le cache de quinze minutes : le compte de
+# paquets ET le redemarrage demande avec.
+faux dpkg-query 0 "install ok installed|1.0.20210914-1"
+faux apt-config 0 "1"
+faux systemctl 0 "active"
+faux apt-get 0 "Inst libc6 [2.36-9] (2.36-9+deb12u7 Debian-Security:12/stable [armhf])"
+faux_curl 9.9.9
+rm -f "$TMP/run/systeme.json" "$TMP/reboot-required"
+SL0=$(runsys cmd_sys_json)
+eq "le cache part avec un paquet en attente" "$(printf '%s' "$SL0" | grep -c "${q}paquets$q:1")" "1"
+# L utilisateur installe ses mises a jour : apt n a plus rien a proposer, et le systeme
+# demande un redemarrage.
+faux apt-get 0 ""
+: > "$TMP/reboot-required"
+# Le cache tel quel : il mentirait sur les paquets...
+eq "le cache garde son compte de paquets" "$(runsys cmd_sys_json | grep -c "${q}paquets$q:1")" "1"
+# ...mais PAS sur le redemarrage, qui est un simple test de fichier et ne coute rien.
+eq "le redemarrage, lui, est toujours frais" "$(runsys cmd_sys_json | grep -c "${q}reboot$q:true")" "1"
+# Et « --local » refait toute la moitie locale : c est ce que la fenetre du panneau demande.
+SL1=$(runsys cmd_sys_json --local)
+eq "--local voit les paquets installes" "$(printf '%s' "$SL1" | grep -c "${q}paquets$q:0")" "1"
+eq "--local voit le redemarrage demande" "$(printf '%s' "$SL1" | grep -c "${q}reboot$q:true")" "1"
+# ...et il ne touche PAS au reseau : la moitie distante reste celle du cache. Le depot
+# annonce maintenant 1.0.0, donc un appel reel aurait change maj_version.
+faux_curl 1.0.0
+eq "--local garde la moitie distante en cache" \
+   "$(runsys cmd_sys_json --local | grep -c "${q}maj_version$q:${q}9[.]9[.]9$q")" "1"
+# La preuve directe : sans curl du tout, « --local » doit quand meme rendre un relevé
+# complet. S il interrogeait le depot, la version annoncee tomberait a vide.
+sans curl
+eq "--local n a pas besoin de curl" \
+   "$(runsys cmd_sys_json --local | grep -c "${q}maj_version$q:${q}9[.]9[.]9$q")" "1"
+faux_curl 1.0.0
+# --rafraichir, lui, reinterroge bien.
+eq "--rafraichir reinterroge le depot" \
+   "$(runsys cmd_sys_json --rafraichir | grep -c "${q}maj_version$q:${q}1[.]0[.]0$q")" "1"
+# Le redemarrage repart quand le fichier disparait (un vrai redemarrage l efface).
+rm -f "$TMP/reboot-required"
+eq "apres le redemarrage, plus de demande" "$(runsys cmd_sys_json --local | grep -c "${q}reboot$q:false")" "1"
+eq "et le cache ne la ressuscite pas" "$(runsys cmd_sys_json | grep -c "${q}reboot$q:false")" "1"
+# Le verbe que la route du panneau appelle. Ce qui compte n est pas sa forme mais ce qu il
+# RAFRAICHIT : c est lui que /api/systeme appelle, et le remplacer par un « cmd_sys_json »
+# nu rendrait au panneau le cache perime — le defaut meme que l utilisateur a signale.
+: > "$TMP/reboot-required"
+faux apt-get 0 "Inst libc6 [2.36-9] (2.36-9+deb12u7 Debian-Security:12/stable [armhf])"
+rm -f "$TMP/run/systeme.json"
+runsys cmd_sys_json >/dev/null          # un cache frais, avec un paquet en attente
+faux apt-get 0 ""                       # l utilisateur installe ses mises a jour
+# Le cache d abord, car « --local » le REECRIT : interroge apres, il rendrait la valeur
+# fraiche et la comparaison ne dirait plus rien.
+eq "le relevé en cache les annonce encore" "$(runsys cmd_sys_json | grep -c "${q}paquets$q:1")" "1"
+eq "sys-local, lui, voit les paquets installes" "$(runsys cmd_sys_local | grep -c "${q}paquets$q:0")" "1"
+eq "sys-local rend du JSON" "$(runsys cmd_sys_local | cut -c1)" "{"
+eq "sys-local rend 0" "$(runsysok cmd_sys_local)" oui
+rm -f "$TMP/reboot-required"
+faux apt-get 0 "Inst libc6 [2.36-9] (2.36-9+deb12u7 Debian-Security:12/stable [armhf])"
+faux_curl 9.9.9
+
 # Il ne doit jamais echouer, meme quand toutes les sondes echouent.
 sans dpkg-query; sans apt-config; sans apt-get; sans systemctl; sans curl
 eq "le releve rend toujours 0" "$(runsysok cmd_sys_json)" oui
 eq "le rafraichissement aussi" "$(runsysok cmd_sys_json --rafraichir)" oui
+eq "et le releve local aussi" "$(runsysok cmd_sys_json --local)" oui
+eq "toutes sondes muettes : du JSON local quand meme" "$(runsys cmd_sys_json --local | cut -c1)" "{"
 eq "toutes sondes muettes : du JSON quand meme" "$(runsys cmd_sys_json --rafraichir | cut -c1)" "{"
 eq "update-check ne dit rien" "$(runsys cmd_update_check)" ""
+
+echo
+echo "-- group leave verifie avant de confirmer"
+# « join » verifie l appareil ET le groupe ; « leave » ne verifiait RIEN. Une faute de
+# frappe reecrivait un fichier identique et annoncait quand meme le retrait — puis
+# reappliquait en mode « modifie », ce qui EFFACE la validation humaine et rearme
+# l annulation de deux minutes : faute de reponse, tout le cloisonnement retombait.
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|conf|Confiance"; echo "MEMBER|telephone|conf"; } > "$ACC"
+eq "un appareil inconnu est refuse" "$(runok cmd_group leave fantome conf)" non
+eq "et le refus le nomme" "$(run cmd_group leave fantome conf | grep -c 'fantome')" "1"
+eq "un groupe inconnu est refuse" "$(runok cmd_group leave telephone absent)" non
+# Un retrait qui n a rien a retirer le DIT, et ne touche a rien.
+eq "un retrait sans objet le dit" "$(run cmd_group leave pc-salon conf | grep -c 'ne fait déjà pas partie')" "1"
+eq "et il ne pretend pas avoir retire" "$(run cmd_group leave pc-salon conf | grep -c 'ne fait plus partie')" "0"
+eq "il rend 0 quand meme" "$(runok cmd_group leave pc-salon conf)" oui
+eq "et il ne touche pas au fichier" "$(rows | grep -c '^MEMBER')" "1"
+# Le vrai retrait, lui, marche.
+eq "un vrai retrait est accepte" "$(runok cmd_group leave telephone conf)" oui
+eq "et il retire" "$(rows | grep -c '^MEMBER')" "0"
+
+echo "-- le panneau applique le pare-feu UNE seule fois"
+# appliquer_acces, cote Python, applique lui-meme une seule fois pour tout un lot : sa
+# docstring explique pourquoi (« le second instantane ne contiendrait plus l etat d avant,
+# mais l etat intermediaire »). Depuis que la CLI applique apres chaque ecriture, une
+# regle posee depuis le navigateur etait appliquee DEUX fois, et l instantane de secours
+# pris APRES que la regle etait en vigueur.
+{ echo "V|1"; echo "MODE|filtre"; echo "GROUP|g|G"; echo "MEMBER|telephone|g"; } > "$ACC"
+eq "sans le drapeau, la CLI applique" "$(trace cmd_access allow g internet)" "applique --modifie"
+tracesans() { ( export WGPI_SANS_APPLY=1; trace "$@" ); }
+{ echo "V|1"; echo "MODE|filtre"; echo "GROUP|g|G"; echo "MEMBER|telephone|g"; } > "$ACC"
+eq "avec le drapeau, elle laisse la main au panneau" "$(tracesans cmd_access allow g internet)" ""
+# Mais elle ECRIT quand meme : c est seulement l application qui est deleguee.
+eq "et la regle est bien enregistree" "$(rows | grep -c '^POLICY')" "1"
+
+echo "-- upnp off ne supprime plus la redirection"
+# « off » veut dire « ne la renouvelle plus tout seul », pas « coupe le VPN maintenant ».
+# La branche faisait « upnpc -d », qui SUPPRIME la redirection : la commande censee rendre
+# la main coupait l acces depuis l exterieur, sans le dire, et le README promet l inverse.
+faux upnpc 0 "ok"
+MOUCHARD_UPNP=$TMP/upnpc-appels
+{ echo "#!/bin/sh"; echo "echo \"\$*\" >> \"$MOUCHARD_UPNP\""; echo "exit 0"; } > "$SBIN/upnpc"
+chmod +x "$SBIN/upnpc"
+: > "$MOUCHARD_UPNP"
+# $SBIN en TETE du PATH reel, et non a la place : cmd_upnp passe par take_lock, donc par
+# flock, qui n est pas dans la liste des faux outils. Le confiner entierement faisait mourir
+# la commande avant d atteindre le code teste, et l assertion passait pour cette raison.
+upnpoff() { ( source "$SRC"; TTY=""; AUTO=1; PATH=$SBIN:$PATH; cmd_upnp off ) 2>&1; }
+# L ouverture doit etre DECLAREE automatique, sinon la commande sort sur « deja manuelle »
+# et ne touche jamais au code teste.
+sed -i "s/^UPNP=.*/UPNP=1/" "$TMP/etc/settings.conf"
+SORTIE_UPNP=$(upnpoff)
+eq "aucune suppression de redirection" "$(grep -c -- ' -d ' "$MOUCHARD_UPNP" 2>/dev/null; :)" "0"
+eq "et le message le dit" "$(printf '%s' "$SORTIE_UPNP" | grep -c 'pas touchée')" "1"
+eq "il annonce la desactivation" "$(printf '%s' "$SORTIE_UPNP" | grep -c 'Ouverture automatique désactivée')" "1"
+eq "et le reglage est enregistre" "$(grep -c '^UPNP=0' "$TMP/etc/settings.conf")" "1"
+sans upnpc
+
+echo "-- une regle desactivee ne doit pas passer pour un acces"
+# Le champ « actif » etait lu et jamais teste : une regle desactivee s affichait exactement
+# comme un acces autorise. Le moteur, lui, ne la pose pas — l ecran annoncait donc un acces
+# qui n existe pas.
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|g|Salon"; echo "MEMBER|telephone|g"
+  echo "POLICY|p1|1|grp:g|internet|any||aller|Internet"
+  echo "POLICY|p2|0|grp:g|maison|any||aller|La maison, desactivee"; } > "$ACC"
+eq "la regle desactivee est marquee" "$(run access_show | grep -c 'DÉSACTIVÉE')" "1"
+eq "et l active ne l est pas" "$(run access_show | grep -c 'Internet.*DÉSACTIVÉE')" "0"
+eq "le moteur ne la pose pas" "$(run access_rules_plan B 1 | grep -c 'wgpi:pol:p2')" "0"
+
+echo "-- supprimer un appareil emporte ses appartenances"
+# access_save purge les references mortes, mais seulement a la PROCHAINE ecriture
+# d acces : d ici la la ligne MEMBER survit, et « wg-pi add » sous le meme nom — un nom
+# que l utilisateur choisit, donc qu il reemploie — rendait au nouvel appareil TOUS les
+# acces de l ancien, sans un mot.
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|conf|Confiance"; echo "MEMBER|telephone|conf"
+  echo "MEMBER|pc-salon|conf"; } > "$ACC"
+eq "deux appartenances au depart" "$(rows | grep -c '^MEMBER')" "2"
+silent cmd_remove telephone --yes
+eq "celle de l appareil supprime est partie" "$(rows | grep -c '^MEMBER|telephone|')" "0"
+eq "celle de l autre est intacte" "$(rows | grep -c '^MEMBER|pc-salon|')" "1"
+eq "et le groupe existe toujours" "$(rows | grep -c '^GROUP|conf|')" "1"
 
 echo
 echo "  $pass réussi(s), $fail échoué(s)"

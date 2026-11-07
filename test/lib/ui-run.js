@@ -288,6 +288,12 @@ eq("un second clic rétablit tout (destination)", app.mapFocusKey(), null);
 /* --- cas limites ----------------------------------------------------------- */
 box = renderCarte(accesCarte, []);
 eq("aucun appareil : aucune carte", stub.findAll(box, "SVG").length, 0);
+/* Et pas un volet BLANC pour autant : les quatre autres vues ont toutes leur texte de
+   vide, celle-ci sortait avant d en poser un. */
+contient("aucun appareil : un texte de vide", stub.textOf(box), "Aucun appareil");
+/* La legende decrivait alors des traits et des pointilles absents du volet. */
+eq("aucun appareil : la legende se tait", env.doc.getElementById("map-legend").hidden, true);
+eq("et elle est videe", env.doc.getElementById("map-legend").textContent, "");
 try {
   renderCarte({}, pairs);
   ok("une carte sans règles ne lève pas");
@@ -640,13 +646,33 @@ const moon = app.MODELES_REGLE.filter(function (m) { return m.cle === "moonlight
 eq("Moonlight annonce deux règles", app.remplirModele(moon, champsFaux), 2);
 eq("le protocole est posé en premier", champsFaux.proto.value, "tcp");
 eq("et les ports survivent à la remise à jour", champsFaux.ports.value, "47984,47989,48010");
-eq("un libellé est proposé", champsFaux.lib.value, "Moonlight (TCP)");
+/* Deux regles partagent un seul libelle : « Moonlight (TCP) » collerait « (TCP) » sur la
+   regle UDP. C est le nom du service qui est propose. */
+eq("un libellé est proposé", champsFaux.lib.value, "Moonlight");
 
 /* Un libelle deja saisi par l utilisateur ne doit pas etre ecrase : c est le sien. */
 const dejaRempli = {proto: {value: "any"}, ports: {value: ""}, lib: {value: "Le mien"},
                     maj: function () {}};
 app.remplirModele(moon, dejaRempli);
 eq("un libellé déjà saisi est respecté", dejaRempli.lib.value, "Le mien");
+
+/* MAIS le libelle pose par un PRECEDENT clic de modele n est pas celui de l utilisateur.
+   Signale a l usage : « si je change d'exemple ca change pas le libélé, ca garde le
+   premier ». On creait donc une regle intitulee « NAS (partage Windows) » ouvrant les
+   ports de Moonlight. L objet doit survivre d un clic au suivant pour s en souvenir : un
+   objet neuf a chaque fois, ce qu il etait, ne se souvient de rien. */
+const nas = app.MODELES_REGLE.filter(function (m) { return m.cle === "nas"; })[0];
+const enchaine = {proto: {value: "any"}, ports: {value: ""}, lib: {value: ""},
+                  maj: function () {}, libAuto: ""};
+app.remplirModele(nas, enchaine);
+eq("le premier modèle propose son libellé", enchaine.lib.value, "NAS (partage Windows)");
+app.remplirModele(moon, enchaine);
+eq("le second modèle remplace ce libellé", enchaine.lib.value, "Moonlight");
+eq("et ses ports suivent aussi", enchaine.ports.value, "47984,47989,48010");
+/* Et des que l utilisateur ecrit le sien, il est intouchable, meme apres un autre clic. */
+enchaine.lib.value = "Mon salon";
+app.remplirModele(nas, enchaine);
+eq("un libellé saisi après un modèle reste intact", enchaine.lib.value, "Mon salon");
 
 /* « -m multiport » ne va pas au-dela de 15 ports, une plage en comptant pour deux. Un
    modele qui depasserait serait refuse a l ecriture, donc au clic — et le defaut ne se
@@ -690,6 +716,11 @@ eq("et leurs deux listes de ports diffèrent vraiment", memesPorts.length, 0);
    couvert par rien : quelle route part, avec quel corps, et dans quels cas. C est pourtant
    la decision la plus delicate du formulaire — un lot envoye a tort cree une regle que
    l utilisateur n a pas vue, un lot non envoye lui en fait creer deux a la main. */
+function boutonTexte(racine, libelle) {
+  return stub.findAll(racine, "BUTTON").filter(function (x) {
+    return stub.textOf(x) === libelle;
+  })[0];
+}
 function soumettre(modele, retouche) {
   env.requetes.length = 0;
   env.etat.reponse = {status: 200, data: {ok: true}};
@@ -705,9 +736,7 @@ function soumettre(modele, retouche) {
   form.dispatchEvent({type: "change", target: selDe(b, "reg-dst")});
   if (modele) {
     /* On clique le bouton du modele, par son libelle : c est ce que fait l utilisateur. */
-    const bouton = stub.findAll(b, "BUTTON").filter(function (x) {
-      return stub.textOf(x) === modele;
-    })[0];
+    const bouton = boutonTexte(b, modele);
     if (!bouton) { return {erreur: "bouton « " + modele + " » introuvable"}; }
     bouton.dispatchEvent({type: "click"});
   }
@@ -742,20 +771,90 @@ eq("avec le protocole du modele", rSimple.body && rSimple.body.proto, "tcp");
 const rRien = soumettre(null);
 eq("sans modele, route ordinaire", rRien.url, "/api/regles");
 
-/* LE point delicat : des que l utilisateur retouche le protocole ou les ports, il ne voit
-   plus ce que contient la seconde regle. En ajouter une a son insu serait pire que de lui
-   en faire creer deux. Le lot est donc abandonne. */
+/* Retoucher la premiere ligne ne doit PAS faire disparaitre la seconde : elle est a
+   l ecran, l utilisateur la voit et peut la retirer lui-meme s il n en veut pas. C est
+   tout l interet de lignes visibles plutot que de regles filles implicites — avant, une
+   retouche annulait en silence une regle que l utilisateur croyait avoir demandee. */
 const rRetouchePorts = soumettre("Moonlight", function (b) {
   inpDe(b, "reg-ports").value = "47984";
 });
-eq("des ports retouches abandonnent le lot", rRetouchePorts.url, "/api/regles");
-eq("et la regle envoyee porte les ports de l utilisateur",
-   rRetouchePorts.body && rRetouchePorts.body.ports, "47984");
+eq("des ports retouches gardent la seconde regle", rRetouchePorts.url, "/api/regles/lot");
+eq("la premiere porte les ports de l utilisateur",
+   (rRetouchePorts.body && rRetouchePorts.body.regles || [{}])[0].ports, "47984");
+eq("et la seconde ceux du modele",
+   (rRetouchePorts.body && rRetouchePorts.body.regles || [{}, {}])[1].ports, "47998-48000,48010");
 
 const rRetoucheProto = soumettre("Moonlight", function (b) {
-  selDe(b, "reg-proto").value = "udp";
+  selDe(b, "reg-proto").value = "icmp";
 });
-eq("un protocole retouche abandonne le lot aussi", rRetoucheProto.url, "/api/regles");
+eq("un protocole retouche garde aussi la seconde", rRetoucheProto.url, "/api/regles/lot");
+eq("et la premiere suit le choix de l utilisateur",
+   (rRetoucheProto.body && rRetoucheProto.body.regles || [{}])[0].proto, "icmp");
+
+/* Et il peut la retirer : le lot redevient une regle simple. */
+const rRetiree = soumettre("Moonlight", function (b) {
+  boutonTexte(b, "Retirer cette règle").dispatchEvent({type: "click"});
+});
+eq("retirer la seconde ligne redonne une regle simple", rRetiree.url, "/api/regles");
+
+/* --- le « + » : plusieurs regles dans UNE fenetre -------------------------- */
+/* La demande d origine : « configurer les 2 direct dans la meme modal pour eviter de
+   valider 1 puis reouvrir pour le 2eme ». */
+const rPlus = soumettre(null, function (b) {
+  boutonTexte(b, "+ Ajouter une règle").dispatchEvent({type: "click"});
+  selDe(b, "reg-proto").value = "tcp";
+  inpDe(b, "reg-ports").value = "8080";
+  selDe(b, "reg-proto-sup-1").value = "udp";
+  inpDe(b, "reg-ports-sup-1").value = "9000-9001";
+});
+eq("une ligne ajoutee a la main part en lot", rPlus.url, "/api/regles/lot");
+eq("avec les deux regles", (rPlus.body && rPlus.body.regles || []).length, 2);
+eq("la premiere telle que saisie",
+   (rPlus.body && rPlus.body.regles || [{}])[0].proto + " " + (rPlus.body.regles[0].ports),
+   "tcp 8080");
+eq("la seconde telle que saisie",
+   (rPlus.body && rPlus.body.regles || [{}, {}])[1].proto + " " + (rPlus.body.regles[1].ports),
+   "udp 9000-9001");
+/* Le groupe, la destination et le sens sont partages : une regle vers une AUTRE
+   destination est une autre regle, pas une variante de celle-ci. */
+eq("les deux partagent la destination",
+   (rPlus.body && rPlus.body.regles || [{}, {}]).map(function (x) { return x.destination; }).join(","),
+   "res:moon,res:moon");
+eq("et le groupe source",
+   (rPlus.body && rPlus.body.regles || [{}, {}]).map(function (x) { return x.source; }).join(","),
+   "gaming,gaming");
+
+/* Les ports d une ligne ajoutee suivent la meme regle que ceux de la premiere : ICMP n a
+   pas de ports, et les laisser saisissables ferait croire le contraire. */
+const rSupIcmp = soumettre(null, function (b) {
+  boutonTexte(b, "+ Ajouter une règle").dispatchEvent({type: "click"});
+  const p = selDe(b, "reg-proto-sup-1");
+  inpDe(b, "reg-ports-sup-1").value = "9000";
+  p.value = "icmp";
+  p.dispatchEvent({type: "change"});
+});
+eq("un protocole sans ports vide la ligne ajoutee",
+   (rSupIcmp.body && rSupIcmp.body.regles || [{}, {}])[1].ports, "");
+
+/* Quatre regles au plus : c est la borne de la route de lot. La fenetre s arrete donc la
+   plutot que de laisser envoyer un lot que le serveur refusera. */
+app.setState({
+  acces: {groupes: [G("gaming", "Gaming", ["telephone"])], ressources: []},
+  peers: [{name: "telephone"}], server: {}, time: 11
+});
+app.ouvrirNouvelleRegle();
+const bMax = env.doc.getElementById("dlg-body");
+const plusBtn = boutonTexte(bMax, "+ Ajouter une règle");
+eq("le + est disponible au depart", plusBtn.disabled, false);
+plusBtn.dispatchEvent({type: "click"});
+plusBtn.dispatchEvent({type: "click"});
+plusBtn.dispatchEvent({type: "click"});
+eq("il se desactive a la quatrieme regle", plusBtn.disabled, true);
+eq("et il le dit", stub.textOf(bMax).indexOf("Quatre règles au plus") >= 0, true);
+eq("trois lignes ont bien ete ajoutees",
+   stub.findAll(bMax, "SELECT").filter(function (s) {
+     return String(s.id).indexOf("reg-proto-sup-") === 0;
+   }).length, 3);
 
 /* Un libelle que l utilisateur a ecrit lui-meme doit se retrouver sur les DEUX regles du
    lot : sinon la seconde porterait un nom qu il n a pas choisi. */
@@ -775,6 +874,328 @@ eq("portee par le protocole double", rJeu.body && rJeu.body.proto, "tcpudp");
 eq("et ses ports survivent au verrouillage des champs",
    rJeu.body && rJeu.body.ports, "27015,27036");
 
-console.log("");
-console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");
-process.exit(fail === 0 ? 0 : 1);
+/* --- le bandeau de confirmation ne doit pas se reconstruire a chaque releve --- */
+/* Le releve tourne toutes les deux secondes. Reconstruire ce bandeau a chaque fois vole
+   le focus du clavier et, surtout, remet a zero le « disabled » qu envoiUnique vient de
+   poser sur « Tout va bien, confirmer » : la garde anti-double-envoi etait annulee par le
+   releve suivant. */
+function confirmBox(mode, confirme) {
+  app.setState({acces: {mode: mode, noyau: mode === "filtre" ? "actif" : "inactif",
+                        confirme: confirme, groupes: [], ressources: [], ecoute: []},
+                peers: [], server: {}, time: 20});
+  app.renderConfirmation();
+  return env.doc.getElementById("acc-confirm");
+}
+const bc1 = confirmBox("filtre", false);
+const bouton1 = stub.findAll(bc1, "BUTTON")[0];
+eq("le bandeau porte son bouton", bouton1 && stub.textOf(bouton1), "Tout va bien, confirmer");
+eq("et il est visible", bc1.hidden, false);
+/* Deuxieme releve, etat IDENTIQUE : le meme noeud doit survivre. */
+bouton1.disabled = true;
+confirmBox("filtre", false);
+const bouton2 = stub.findAll(env.doc.getElementById("acc-confirm"), "BUTTON")[0];
+eq("un releve a l identique ne reconstruit pas le bouton", bouton2 === bouton1, true);
+eq("la garde anti-double-envoi survit au releve", bouton2.disabled, true);
+/* Et un changement REEL doit bien passer : sinon la garde cacherait l information. */
+const bc3 = confirmBox("filtre", true);
+eq("une fois confirme, le bandeau disparait", bc3.hidden, true);
+eq("et il est vide", stub.findAll(bc3, "BUTTON").length, 0);
+const bc4 = confirmBox("filtre", false);
+eq("et il revient si la confirmation retombe", bc4.hidden, false);
+eq("avec un bouton neuf, actif", stub.findAll(bc4, "BUTTON")[0].disabled, false);
+/* Hors filtrage, il n a rien a dire. */
+eq("hors filtrage : masque", confirmBox("ouvert", false).hidden, true);
+
+/* --- « Tout le trafic » est un acces ENTRANT vers chaque appareil ----------- */
+/* Le moteur traduit « tout » en « -d 0.0.0.0/0 », qui contient le reseau du tunnel : une
+   telle regle laisse donc ce groupe joindre CHAQUE appareil du VPN, sur tous les ports.
+   fluxEntrants ne regardait que les destinations « groupe », et la fiche de chaque
+   appareil affirmait « Aucun autre appareil n a de regle vers lui ». */
+const accesTout = {
+  mode: "filtre", noyau: "actif", ressources: [], ecoute: [],
+  groupes: [G("admin", "Administration", ["pc-salon"], [F("p1", "tout", "Tout le trafic")]),
+            G("fam", "Famille", ["telephone"], [])]
+};
+app.setState({acces: accesTout,
+              peers: [P("telephone", ["fam"]), P("pc-salon", ["admin"])],
+              server: {}, time: 40});
+const entTel = app.fluxEntrants("telephone");
+eq("« tout le trafic » est un acces entrant", entTel.length, 1);
+eq("et il nomme le groupe qui l a", entTel[0] && entTel[0].groupe.id, "admin");
+/* Un appareil DU groupe ne se joint pas lui-meme : l annoncer serait du bruit. */
+eq("un appareil du groupe ne se compte pas", app.fluxEntrants("pc-salon").length, 0);
+/* Et les destinations qui ne sont ni « tout » ni un groupe restent hors sujet. */
+const accesRes = {
+  mode: "filtre", noyau: "actif", ecoute: [],
+  ressources: [{id: "nas", libelle: "NAS", cible: "192.168.1.20"}],
+  groupes: [G("admin", "Administration", ["pc-salon"],
+              [F("p1", "res:nas", "NAS"), F("p2", "internet", "Internet")])]
+};
+app.setState({acces: accesRes,
+              peers: [P("telephone", []), P("pc-salon", ["admin"])],
+              server: {}, time: 41});
+eq("une ressource n est pas un acces entrant", app.fluxEntrants("telephone").length, 0);
+
+/* --- le focus de la carte ne survit pas a l appareil vise ------------------- */
+/* Le focus retient une cle. Si l appareil vise disparait, plus aucun noeud ne recoit la
+   classe « sel » : le CSS laisse TOUTE la carte a 12 % d opacite, sans un mot, et il n y a
+   meme plus rien a cliquer pour en sortir. */
+const pairsFocus = [P("telephone", ["fam"], 0, 0, true, true), P("pc-salon", ["fam"], 0, 0, true, true)];
+const accesFocus = {
+  mode: "filtre", noyau: "actif", ressources: [], ecoute: [],
+  groupes: [G("fam", "Famille", ["telephone", "pc-salon"], [F("p1", "internet", "Internet")])]
+};
+renderCarte(accesFocus, pairsFocus);
+let svgF = stub.findAll(env.doc.getElementById("map-box"), "SVG")[0];
+app.mapClick(noeudCarte(svgF, "data-dev", "telephone"));
+eq("le focus est pose", app.mapFocusKey(), "dev:telephone");
+/* L appareil vise disparait — supprime, ou simplement renomme. On redessine SANS passer
+   par renderCarte, qui commence par remettre le focus a zero : sinon l assertion
+   passerait quoi qu il arrive. */
+app.setState({acces: accesFocus, peers: [P("pc-salon", ["fam"], 0, 0, true, true)],
+              server: {}, time: 42});
+app.renderMap();
+eq("un focus orphelin est oublie", app.mapFocusKey(), null);
+svgF = stub.findAll(env.doc.getElementById("map-box"), "SVG")[0];
+eq("et la carte n est plus estompee", String(svgF.getAttribute("class")).indexOf("focus"), -1);
+/* Un focus qui designe encore quelque chose survit, lui. */
+renderCarte(accesFocus, pairsFocus);
+svgF = stub.findAll(env.doc.getElementById("map-box"), "SVG")[0];
+app.mapClick(noeudCarte(svgF, "data-dev", "telephone"));
+/* Sans passer par renderCarte, qui commence par remettre le focus a zero. */
+app.setState({acces: accesFocus, peers: pairsFocus, server: {}, time: 43});
+app.renderMap();
+eq("un focus encore valide est garde", app.mapFocusKey(), "dev:telephone");
+app.mapReset();
+
+/* --- le bandeau de redemarrage --------------------------------------------- */
+/* « Un redemarrage est demande » ne se voyait que dans la fenetre « Mises a jour », qu il
+   faut ouvrir expres. Il voyage maintenant avec l etat, donc il se dit sur tous les
+   ecrans. Signale depuis l usage reel : l utilisateur a du le decouvrir avec « wg-pi
+   check » apres avoir installe ses mises a jour. */
+function etatAvecReboot(reboot) {
+  app.setState({reboot: reboot, peers: [], server: {}, time: 30,
+                acces: {mode: "ouvert", noyau: "inactif", groupes: [], ressources: [], ecoute: []}});
+  app.renderRedemarrage();
+  return env.doc.getElementById("reboot-note");
+}
+const rb1 = etatAvecReboot(true);
+eq("le bandeau se montre", rb1.hidden, false);
+contient("et il dit ce qui se passe", rb1.textContent, "Un redémarrage du Pi est demandé");
+contient("et pourquoi cela compte", rb1.textContent, "ancienne version");
+/* Le panneau savait le DIRE mais pas le FAIRE : il fallait un terminal. */
+const btnReboot = boutonTexte(rb1, "Redémarrer le Pi");
+eq("le bandeau porte le bouton qui repare", !!btnReboot, true);
+/* Marque « data-admin » : la regle de masquage du theme le retire pour un compte de
+   consultation, que la route refuserait de toute facon. */
+eq("et il est marque reserve a l administrateur",
+   btnReboot && btnReboot.getAttribute("data-admin"), "");
+/* Un clic OUVRE une confirmation, il ne redemarre pas : un bandeau permanent qui
+   redemarrerait au premier clic de travers serait un piege. */
+env.requetes.length = 0;
+env.etat.reponse = {status: 200, data: {ok: true}};
+btnReboot.dispatchEvent({type: "click"});
+eq("un clic ne redemarre pas tout de suite", env.requetes.length, 0);
+const dlgReboot = env.doc.getElementById("dlg-body");
+/* Le titre vit hors de #dlg-body, que le faux DOM est seul a materialiser : on verifie
+   donc la confirmation sur son CORPS, qui est ce que l utilisateur lit avant de cliquer. */
+contient("il demande confirmation", stub.textOf(dlgReboot), "VPN sera coupé");
+contient("et dit que le panneau revient", stub.textOf(dlgReboot), "reviendra tout seul");
+const formReboot = stub.findAll(dlgReboot, "FORM")[0];
+formReboot.dispatchEvent({type: "submit"});
+eq("la confirmation poste vers la route de redemarrage",
+   (env.requetes[0] || {}).url, "/api/reboot");
+eq("en POST", (env.requetes[0] || {}).method, "POST");
+eq("avec le jeton anti-CSRF",
+   typeof ((env.requetes[0] || {}).entetes || {})["X-CSRF-Token"], "string");
+/* Un second envoi pendant que le premier est en vol dupliquerait la demande. */
+env.requetes.length = 0;
+formReboot.dispatchEvent({type: "submit"});
+eq("et un second envoi est avale", env.requetes.length, 0);
+/* Un releve a l identique ne doit pas le reecrire : « role=status » est relu par un lecteur
+   d ecran a chaque modification, et le releve tourne toutes les deux secondes. */
+rb1.textContent = rb1.textContent + "|temoin";
+etatAvecReboot(true);
+eq("un releve a l identique ne le reecrit pas",
+   env.doc.getElementById("reboot-note").textContent.indexOf("|temoin") >= 0, true);
+/* Et il disparait quand le redemarrage a eu lieu. */
+const rb2 = etatAvecReboot(false);
+eq("apres le redemarrage, il se cache", rb2.hidden, true);
+eq("et il est vide", rb2.textContent, "");
+const rb3 = etatAvecReboot(true);
+eq("et il revient si un nouveau paquet le demande", rb3.hidden, false);
+/* Un etat sans la cle du tout — un « wg-pi json » d une version anterieure, pendant une
+   mise a jour — ne doit pas afficher le bandeau. */
+app.setState({peers: [], server: {}, time: 31,
+              acces: {mode: "ouvert", noyau: "inactif", groupes: [], ressources: [], ecoute: []}});
+app.renderRedemarrage();
+eq("une cle absente ne reveille pas le bandeau",
+   env.doc.getElementById("reboot-note").hidden, true);
+
+/* --- le titre de l onglet du navigateur ------------------------------------- */
+/* Il annoncait « Appareils · wg-pi » quelle que soit la section : deux fenetres ouvertes
+   sur deux sections etaient indiscernables dans la barre d onglets, dans l historique et
+   dans un favori. */
+const TITRES = {app: "Appareils · wg-pi", grp: "Groupes · wg-pi", acc: "Accès · wg-pi",
+                map: "Carte · wg-pi", srv: "Serveur · wg-pi"};
+Object.keys(TITRES).forEach(function (cle) {
+  app.montrerOnglet(cle);
+  eq("onglet " + cle + " : le titre suit", env.doc.title, TITRES[cle]);
+});
+/* Une cle inconnue — un localStorage abime — retombe sur la premiere section, titre compris. */
+app.montrerOnglet("nimporte-quoi");
+eq("une section inconnue retombe sur Appareils", env.doc.title, "Appareils · wg-pi");
+
+/* --- les trois cas qui demandent d ATTENDRE une reponse ---------------------- */
+/* Tout ce qui precede est synchrone. Ici le code sous test traite une REPONSE : il faut
+   donc laisser tourner les microtaches entre chaque etape. Le resume final part a la fin
+   de la chaine, sinon il serait affiche avant que ces cas soient joues. */
+function tic() { return new Promise(function (r) { setTimeout(r, 0); }); }
+function etatServeur(time, mode, reboot) {
+  return {time: time, peers: [], server: {}, role: "admin", reboot: !!reboot,
+          acces: {mode: mode, noyau: mode === "filtre" ? "actif" : "inactif",
+                  confirme: true, groupes: [], ressources: [], ecoute: []}};
+}
+function releve(time, mode, reboot) {
+  env.etat.reponse = {status: 200, data: etatServeur(time, mode, reboot)};
+  app.poll();
+  return tic();
+}
+
+/* Le stub pose « document.hidden = true » pour que la boucle du panneau sorte toute
+   seule au chargement. Ici on veut justement qu elle travaille. */
+env.doc.hidden = false;
+
+Promise.resolve()
+  /* [defaut] Un releve dont l horodatage a RECULE etait jete, et tous les suivants avec
+     lui pendant toute la duree du recul : le panneau se figeait en affirmant « Filtrage
+     actif » alors que le serveur disait le contraire. Rien ne le signalait, la requete
+     ayant reussi. L horloge d un Pi sans pile recule a chaque demarrage. */
+  .then(function () { return releve(1000, "filtre"); })
+  .then(function () {
+    eq("le premier releve est applique",
+       env.doc.getElementById("acc-state").textContent, "Filtrage actif");
+    return releve(400, "ouvert");
+  })
+  .then(function () {
+    eq("un releve dont l horloge a recule est applique quand meme",
+       env.doc.getElementById("acc-state").textContent, "Aucun cloisonnement");
+    eq("et aucune alerte reseau n est levee", env.doc.getElementById("alert").hidden, true);
+    /* Et l horloge qui repart en avant ne doit evidemment rien casser. */
+    return releve(1200, "filtre");
+  })
+  .then(function () {
+    eq("l horloge qui repart en avant passe aussi",
+       env.doc.getElementById("acc-state").textContent, "Filtrage actif");
+  })
+  /* Le bandeau de redemarrage, par le CHEMIN REEL : le releve. Les cas plus haut
+     appellent renderRedemarrage a la main, ce qui laissait son branchement dans
+     update() sans aucune couverture — le retirer ne faisait rien tomber. */
+  .then(function () {
+    env.doc.getElementById("reboot-note").hidden = true;
+    env.doc.getElementById("reboot-note").textContent = "";
+    return releve(1300, "filtre", true);
+  })
+  .then(function () {
+    const note = env.doc.getElementById("reboot-note");
+    eq("un releve qui annonce un redemarrage montre le bandeau", note.hidden, false);
+    contient("et il dit quoi faire", note.textContent, "redémarrage du Pi");
+    return releve(1400, "filtre", false);
+  })
+  .then(function () {
+    eq("et le releve suivant le retire", env.doc.getElementById("reboot-note").hidden, true);
+  })
+  /* [defaut] La fenetre « Mises a jour » n avait aucune garde d envoi unique : un double
+     clic lancait la mise a jour, puis affichait en rouge qu elle avait echoue — la route
+     refusant une seconde unite systemd du meme nom. Le pire des messages possibles. */
+  .then(function () {
+    env.etat.reponse = {status: 200, data: {wgpi: "1.8.0", maj_etat: "neuf",
+      maj_version: "1.9.0", wireguard: "1.0.20210914", paquets: 0, auto: "actif",
+      admin: true, par_vpn: false, reboot: false}};
+    app.ouvrirReglages();
+    return tic();
+  })
+  .then(function () {
+    const corps = env.doc.getElementById("dlg-body");
+    const maj = boutonTexte(corps, "Mettre wg-pi à jour");
+    eq("le bouton de mise a jour est propose", !!maj, true);
+    if (!maj) { return; }
+    env.requetes.length = 0;
+    maj.dispatchEvent({type: "click"});
+    maj.dispatchEvent({type: "click"});
+    maj.dispatchEvent({type: "click"});
+    const posts = env.requetes.filter(function (r) { return r.url === "/api/update"; });
+    eq("trois clics ne lancent qu une seule mise a jour", posts.length, 1);
+    eq("et le bouton est desactive des le premier", maj.disabled, true);
+    return tic();
+  })
+  .then(function () {
+    /* Le second bouton de la meme fenetre, celui des mises a jour automatiques. */
+    env.etat.reponse = {status: 200, data: {wgpi: "1.8.0", maj_etat: "a_jour",
+      wireguard: "1.0", paquets: 0, auto: "arrete", admin: true,
+      par_vpn: false, reboot: false}};
+    app.ouvrirReglages();
+    return tic();
+  })
+  .then(function () {
+    const corps = env.doc.getElementById("dlg-body");
+    const bascule = boutonTexte(corps, "Activer les mises à jour auto");
+    eq("la bascule des mises a jour auto est proposee", !!bascule, true);
+    if (!bascule) { return; }
+    env.requetes.length = 0;
+    bascule.dispatchEvent({type: "click"});
+    bascule.dispatchEvent({type: "click"});
+    const posts = env.requetes.filter(function (r) { return r.url === "/api/auto-updates"; });
+    eq("deux clics ne basculent qu une fois", posts.length, 1);
+    eq("et la bascule est desactivee des le premier", bascule.disabled, true);
+  })
+  /* [defaut] Les deux .then appelaient closeDialog() — et pour l un ouvrirReglages() —
+     sans verifier que c etait encore LEUR fenetre. Partout ailleurs dans le panneau ce
+     geste est garde par « if (f.isConnected) », dix fois. openDialog commence par vider le
+     corps du dialogue : rouvrir « Mises a jour » depuis un .then effacait donc la fenetre
+     que l utilisateur venait d ouvrir, et le formulaire qu il y remplissait. */
+  .then(function () {
+    env.etat.reponse = {status: 200, data: {wgpi: "1.8.0", maj_etat: "neuf",
+      maj_version: "1.9.0", wireguard: "1.0", paquets: 0, auto: "actif",
+      admin: true, par_vpn: false, reboot: false}};
+    app.ouvrirReglages();
+    return tic();
+  })
+  .then(function () {
+    /* C est la BASCULE qui remplace la fenetre : son .then rouvre « Mises a jour », et
+       openDialog commence par VIDER le corps du dialogue — quel qu il soit. Le bouton de
+       mise a jour, lui, ne fait que fermer. */
+    const bascule = boutonTexte(env.doc.getElementById("dlg-body"), "Arrêter les mises à jour auto");
+    if (!bascule) { ko("la bascule a disparu"); return; }
+    /* La reponse n arrive pas tout de suite : l utilisateur ouvre autre chose entre-temps. */
+    let resoudre;
+    const vrai = global.fetch;
+    global.fetch = function () {
+      return new Promise(function (r) {
+        resoudre = function () { r({ok: true, status: 200, json: function () { return Promise.resolve({ok: true}); }}); };
+      });
+    };
+    bascule.dispatchEvent({type: "click"});
+    global.fetch = vrai;
+    /* L utilisateur ouvre SA fenetre pendant l envoi. */
+    app.ouvrirNouvelleRessource();
+    const avant = stub.textOf(env.doc.getElementById("dlg-body"));
+    eq("la fenetre de l utilisateur est bien la",
+       avant.indexOf("dresse") >= 0, true);
+    if (resoudre) { resoudre(); }
+    return tic().then(tic);
+  })
+  .then(function () {
+    const corps = stub.textOf(env.doc.getElementById("dlg-body"));
+    eq("elle n a pas ete remplacee par Mises a jour", corps.indexOf("Paquets du système"), -1);
+    eq("et elle est toujours la", corps.indexOf("dresse") >= 0, true);
+  })
+  .then(function () {
+    console.log("");
+    console.log("  " + pass + " réussi(s), " + fail + " échoué(s)");
+    process.exit(fail === 0 ? 0 : 1);
+  })
+  .catch(function (e) {
+    console.log("  KO   la chaine asynchrone leve : " + (e && e.stack ? e.stack : e));
+    process.exit(1);
+  });

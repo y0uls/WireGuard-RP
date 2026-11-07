@@ -339,8 +339,11 @@ déjà (Pi-hole v6, serveur web…), il prend automatiquement le port 51821, et 
 > **Continuer vers le site**.
 
 **Sécurité**
-- Le panneau n'accepte que le réseau de la maison et le VPN : **il n'y a rien à ouvrir sur la box,
-  et il ne faut surtout pas le faire**.
+- Le panneau refuse toute connexion venue d'une adresse **publique** : **il n'y a rien à ouvrir
+  sur la box, et il ne faut surtout pas le faire**. En pratique cela veut dire votre réseau de la
+  maison et votre VPN ; la règle exacte est « toute adresse privée », donc un appareil posé sur un
+  autre réseau privé du Pi — un VLAN invités, un conteneur — atteint la page de connexion, qui
+  demande un mot de passe et bloque après cinq essais.
 - Il est servi en HTTPS et protégé par un mot de passe stocké haché. Les sessions sont protégées
   contre le CSRF, et l'accès est bloqué 5 minutes après 5 essais ratés.
 - Il ne fait qu'appeler la commande `wg-pi` : le terminal et le navigateur voient toujours les mêmes
@@ -415,9 +418,21 @@ supprimer une règle, activer ou couper le filtrage. Les commandes restent utile
 vite, ou quand le panneau n'est pas installé.
 
 Les règles portent sur ce qui **traverse** le Pi : le réseau de la maison, Internet, les
-autres appareils du VPN. Ce qui tourne **sur** le Pi — SSH, le panneau web, Pi-hole, un
-conteneur Docker — reste joignable par tous vos appareils du VPN, quelles que soient vos
-règles.
+autres appareils du VPN. Ce que le Pi **héberge lui-même** — SSH, le panneau web, un
+Pi-hole installé directement sur le Pi — reste joignable par tous vos appareils du VPN,
+quelles que soient vos règles : ces connexions s'arrêtent au Pi, elles ne le traversent
+pas.
+
+> [!IMPORTANT]
+> Un **conteneur Docker** fait exception, même si son port est publié sur le Pi. Docker
+> réécrit l'adresse de destination puis laisse le Pi **router** le paquet jusqu'au
+> conteneur : il traverse donc le Pi, et vos règles s'y appliquent. Déclarez le conteneur
+> comme une ressource et autorisez-le :
+>
+> ```bash
+> sudo wg-pi resource add pihole 172.18.0.5 --libelle="Pi-hole"
+> sudo wg-pi access allow tous res:pihole --proto=tcpudp --ports=53
+> ```
 
 ### Un exemple complet
 
@@ -442,11 +457,17 @@ sudo wg-pi access set p3 --ports=445,139
 
 # Réveiller un PC éteint depuis le VPN (Wake-on-LAN).
 sudo wg-pi resource add pc-jeu 192.168.1.18 --mac=aa:bb:cc:dd:ee:ff
-sudo wg-pi access allow gaming res:pc-jeu --proto=udp --ports=9
+sudo wg-pi access allow famille res:pc-jeu --proto=udp --ports=9
 
-# Une machine a changé d adresse : toutes les règles qui la citent suivent.
+# Une machine a changé d'adresse : toutes les règles qui la citent suivent.
 sudo wg-pi resource add nas 192.168.1.25
 ```
+
+> [!TIP]
+> Une adresse seule désigne **une** machine ; une adresse suivie de `/24` désigne **tout le
+> réseau**. `192.168.1.20/24`, qu'on recopie volontiers depuis les réglages réseau de sa
+> machine, voudrait donc dire « les 254 machines de 192.168.1.0/24, box comprise ». wg-pi
+> refuse cette écriture ambiguë et vous demande laquelle des deux vous voulez.
 
 > [!IMPORTANT]
 > Si vos appareils utilisent le **DNS de votre box** — c'est ce qui est proposé par défaut à
@@ -543,7 +564,7 @@ Le panneau web porte un rouage en haut à droite : il dit la version installée,
 dépôt, les paquets du système en attente, et met à jour wg-pi en un clic. En ligne de
 commande :
 
-| Commande | Ce qu elle fait |
+| Commande | Ce qu'elle fait |
 |---|---|
 | `sudo wg-pi update` | installer la dernière version de wg-pi (vos réglages ne changent pas) |
 | `sudo wg-pi maj-auto on` · `off` | activer ou désactiver les mises à jour de **sécurité** du système |
@@ -551,14 +572,20 @@ commande :
 
 > [!TIP]
 > `maj-auto on` confie les correctifs de sécurité du système à Debian lui-même
-> (`unattended-upgrades`). C est la protection qui demande le moins d attention : la
+> (`unattended-upgrades`). C'est la protection qui demande le moins d'attention : la
 > plupart des failles exploitées le sont des mois après leur correctif.
+
+Certaines mises à jour — le noyau, la bibliothèque C, systemd — ne prennent effet qu'au
+redémarrage. Tant qu'il n'a pas eu lieu, le panneau l'affiche en bandeau sur **tous** ses
+écrans, et `sudo wg-pi check` le dit aussi. Un `sudo reboot` suffit.
 
 ### Réveiller une machine éteinte depuis le VPN
 
 Donnez son adresse MAC à la ressource, et le paquet magique traversera le tunnel :
 
 ```bash
+sudo wg-pi group add gaming --libelle="Jeu"
+sudo wg-pi group join telephone gaming
 sudo wg-pi resource add pc-jeu 192.168.1.18 --mac=aa:bb:cc:dd:ee:ff
 sudo wg-pi access allow gaming res:pc-jeu --proto=udp --ports=9
 ```
@@ -588,16 +615,16 @@ ip neigh show 192.168.1.18
 
 Les destinations possibles :
 
-| Destination | Ce qu elle couvre |
+| Destination | Ce qu'elle couvre |
 |---|---|
 | `tout` | **Tout le trafic** : Internet, la maison, le Pi, et les autres appareils du VPN |
-| `internet` | Internet seulement — ni la maison, ni les autres appareils |
+| `internet` | Internet seulement — ni la maison, ni un autre réseau local du Pi, ni les autres appareils |
 | `maison` | le réseau de la maison |
 | `pi` | les services du Pi lui-même |
 | `res:<ressource>` | une machine ou un réseau que vous avez nommé |
-| `grp:<groupe>` | les appareils d un groupe, pour qu ils se joignent entre eux |
+| `grp:<groupe>` | les appareils d'un groupe, pour qu'ils se joignent entre eux |
 
-`tout` est le raccourci d un groupe d administration : une seule règle, qui reste juste
+`tout` est le raccourci d'un groupe d'administration : une seule règle, qui reste juste
 quand vous ajoutez un groupe plus tard. Sans elle, il en faudrait quatre, et une de plus
 à chaque nouveau groupe.
 
@@ -745,17 +772,19 @@ sudo wg-pi upnp
 
 - **« aucune réponse »** : aucun appareil UPnP sur le réseau, ou le Pi interroge la mauvaise
   interface.
-- **« des appareils UPnP répondent, mais pas de passerelle »** : c est le cas ci-dessus.
+- **« des appareils UPnP répondent, mais pas de passerelle »** : c'est le cas ci-dessus.
   Activez l UPnP IGD dans la box, ou ouvrez le port à la main.
 
 Si votre box ne sait pas faire d UPnP IGD — ou si vous préférez garder la main — ouvrez le
-port vous-même avec `sudo wg-pi box`, puis dites-le à wg-pi pour qu il cesse de vous avertir :
+port vous-même avec `sudo wg-pi box`, puis dites-le à wg-pi pour qu'il cesse de vous avertir :
 
 ```bash
 sudo wg-pi upnp off
 ```
 
-Le port reste ouvert : seule l ouverture **automatique** est désactivée.
+Le port reste ouvert : seule l'ouverture **automatique** est désactivée. Attention, beaucoup
+de box oublient une redirection UPnP quand elles redémarrent : vérifiez-la après une coupure
+de courant, avec `sudo wg-pi box`.
 </details>
 
 <details>

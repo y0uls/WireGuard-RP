@@ -42,7 +42,16 @@ docker exec wgpi-e2e-run bash -c 'tr -d "\r" < /repo/test/e2e.sh > /root/e2e.sh 
 
 ## Migration depuis une version antérieure
 
-Exportez d'abord la version publiée, puis lancez le test avec les deux fichiers :
+`e2e.sh` se termine par une **restauration**, donc il laisse wg-pi installé. Or
+`e2e-migration.sh` commence par installer la version publiée, ce que `cmd_install` refuse
+sur un système déjà installé (« wg-pi est déjà installé »). Si vous venez d'enchaîner le
+test précédent dans le même conteneur, repartez donc d'un système vierge :
+
+```bash
+docker exec wgpi-e2e-run bash -c 'command -v wg-pi >/dev/null && wg-pi uninstall --yes || true'
+```
+
+Exportez ensuite la version publiée, puis lancez le test avec les deux fichiers :
 
 ```bash
 git show HEAD:wg-pi.sh > /tmp/publie.sh

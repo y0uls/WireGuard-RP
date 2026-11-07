@@ -30,7 +30,7 @@ problèmes, pas le premier.
 | `role.sh` | le compte de consultation : ce qu'il voit, ce qui lui est refusé |
 | `detect-reachability.sh` | `detect_reachability` : la ligne peut-elle recevoir une connexion entrante ? |
 | `firewall.sh` | le pare-feu généré : sa syntaxe, sa structure, et son **exécution** sous commandes simulées |
-| `heredoc.sh` | le code embarqué dans le heredoc compile, et aucune fonction n'y est déclarée deux fois |
+| `heredoc.sh` | le code embarqué compile, aucune fonction n'y est déclarée deux fois, et aucun texte affiché n'a perdu son apostrophe |
 | `run-all.sh` | enchaîne tout et renvoie un code de sortie non nul si une étape a échoué |
 
 `VERBOSE=1 bash test/detect-reachability.sh` affiche en plus la phrase d'explication rendue à
@@ -52,8 +52,13 @@ Lancez-les dans un conteneur plutôt qu'en natif : Git Bash masque les retours c
 qui rend le contrôle des fins de ligne inopérant.
 
 ```bash
-docker run --rm -v "$PWD:/repo" debian:12-slim bash -c "apt-get -qq update && apt-get -qq install -y shellcheck python3 >/dev/null && bash /repo/test/run-all.sh /repo/wg-pi.sh"
+docker run --rm -v "$PWD:/repo" debian:12-slim bash -c "apt-get -qq update && apt-get -qq install -y shellcheck python3 nodejs >/dev/null && bash /repo/test/run-all.sh /repo/wg-pi.sh"
 ```
+
+`nodejs` n'est pas optionnel : sans lui, `ui.sh` et `heredoc.sh` ne tombent pas, ils
+**sautent** (« node absent, vérification du JavaScript ignorée ») et rendent 0. La suite
+concluait alors « VÉRIFICATION : tout est passé » en ayant laissé de côté toutes les
+assertions du panneau — le pire résultat possible, puisqu'il est vert.
 
 ## Reproduire l'intégration continue avant de déposer
 
@@ -78,11 +83,25 @@ qu'une commande soit absente, il confine le `PATH` à ses propres faux exécutab
 faux ne « désinstalle » rien : la vraie commande est juste derrière, et le test se met à
 mesurer la machine du développeur.
 
-Pour le vérifier :
+Pour le vérifier, il faut une image qui porte déjà les outils — sans réseau, aucun
+`apt-get install` n'aboutira. On la construit une fois :
 
 ```bash
-docker run --rm --network none -v "$PWD:/repo:ro" debian:12-slim bash -c "apt-get -qq install -y python3 >/dev/null 2>&1; cp -r /repo/wg-pi.sh /repo/test /tmp/ && cd /tmp/test && bash run-all.sh"
+docker build -t wgpi-test - <<'EOF'
+FROM debian:12-slim
+RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
+      shellcheck python3 nodejs iproute2 iptables curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+EOF
 ```
+
+Puis on lance la suite **sans aucun accès réseau** :
+
+```bash
+docker run --rm --network none -v "$PWD:/repo:ro" wgpi-test bash -c "cp -r /repo/wg-pi.sh /repo/test /tmp/ && cd /tmp/test && bash run-all.sh"
+```
+
+Si cette commande échoue, c'est qu'un test est allé chercher quelque chose dehors.
 
 ## Un test doit tomber quand le code casse
 

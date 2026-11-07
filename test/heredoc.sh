@@ -89,6 +89,17 @@ if command -v node >/dev/null 2>&1; then
     ko "fonction déclarée deux fois (la seconde écrase la première) :"
     sed "s/^/       /" "$TMP/dbl"
   fi
+
+  # Le heredoc du panneau est quote : l apostrophe n a jamais eu besoin d etre evitee.
+  # L habitude prise dans les COMMENTAIRES, ou elle genait, a pourtant deborde sur les
+  # chaines AFFICHEES : seize textes du panneau et deux messages du CLI l avaient perdue,
+  # dont un titre d onglet et deux titres de fenetre. Rien ne les regardait.
+  if node ./lib/elisions.js "$SCRIPT" >"$TMP/elis" 2>&1; then
+    ok "aucune élision sans apostrophe dans les textes affichés"
+  else
+    ko "élision écrite avec une espace au lieu d'une apostrophe :"
+    sed "s/^/       /" "$TMP/elis"
+  fi
 else
   echo "  --   node absent, vérification du JavaScript ignorée"
 fi

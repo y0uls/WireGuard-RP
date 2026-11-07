@@ -140,6 +140,26 @@ eq "retour des flux pair-a-pair par --ctdir" "$(iptables -S "WGPI-FWD-$BUF" | gr
 eq "la regle vers la ressource ne contraint pas l interface" \
    "$(iptables -S "WGPI-S-famille-$BUF" | grep '192.168.99.20' | grep -c ' -o ')" "0"
 eq "le miroir du sens deux est pose" "$(iptables -S "WGPI-S-famille-$BUF" | grep -c 'retour')" "2"
+# « Internet seulement » n excluait que le reseau de la box. Un Pi qui heberge des
+# conteneurs porte d autres reseaux locaux, et une seule option « ! -d » ne peut en nommer
+# qu un : ils sont ecartes dans une chaine a part. Ici on verifie qu un VRAI noyau accepte
+# cette chaine, son saut et ses RETURN.
+eq "la chaine internet existe" "$(iptables -S | grep -c "^-N WGPI-INET-$BUF")" "1"
+eq "le groupe invites y saute" "$(iptables -S "WGPI-S-invites-$BUF" | grep -c -- "-j WGPI-INET-$BUF")" "1"
+eq "et la destination internet ne nomme plus un reseau a la main" \
+   "$(iptables -S "WGPI-S-invites-$BUF" | grep -c -- "! -d ")" "0"
+# Autant de RETURN que le systeme declare de reseaux locaux : la liste est LUE, pas ecrite
+# en dur. Une valeur figee se perimerait en silence des qu un pont apparait.
+eq "autant de reseaux ecartes que le systeme en declare" \
+   "$(iptables -S "WGPI-INET-$BUF" | grep -c 'wgpi:local')" \
+   "$(bash -c "$LOAD; access_local_nets" | grep -c .)"
+eq "et la chaine se termine par l acceptation" \
+   "$(iptables -S "WGPI-INET-$BUF" | tail -1)" "-A WGPI-INET-$BUF -j ACCEPT"
+# RETURN et non REJECT : le groupe famille a internet ET la maison, et la maison doit
+# rester joignable. Un refus dans la chaine internet la lui retirerait.
+eq "aucun refus dans la chaine internet" "$(iptables -S "WGPI-INET-$BUF" | grep -c REJECT)" "0"
+eq "la maison reste autorisee pour famille" \
+   "$(iptables -S "WGPI-S-famille-$BUF" | grep -c -- "-d $(bash -c "$LOAD; echo \$LAN_NET") -m comment")" "1"
 eq "minuteur d annulation arme" "$(systemctl is-active wg-pi-access-rollback.timer)" "active"
 
 echo "-- confirmation et survie au redemarrage"
@@ -215,6 +235,35 @@ eq "administrateur : tout permis" "$(session "$ADMIN" admin)" "200 200 200 200 a
 eq "consultation : lecture seule appliquee" "$(session "$RO" lecture)" "200 403 403 403 lecture"
 eq "l appareil refuse n a PAS ete cree" "$(wg show wg0 allowed-ips | grep -c 'essai-lecture')" "0"
 eq "l appareil de l administrateur a bien ete cree" "$(wg-pi list 2>/dev/null | grep -c 'essai-admin')" "1"
+
+# Le releve des mises a jour, par HTTP reel. Signale depuis l usage reel : deux mises a jour
+# systeme installees, et le panneau continuait de les annoncer — il servait le cache de
+# quinze minutes du CLI — tandis que le redemarrage que ces paquets demandaient n etait dit
+# nulle part dans l interface. Ici on verifie les deux chemins sur une vraie installation.
+APIJAR=$(mktemp)
+curl -sk -c "$APIJAR" -o /dev/null -X POST --data-urlencode "password=$ADMIN" "https://127.0.0.1:$PORT/login"
+# Le champ est LU, pas greppe : « json.dumps » pose une espace apres les deux-points, et
+# un motif ecrit a la main sur cette espace passe ou echoue pour la mauvaise raison.
+champ() { curl -sk -b "$2" "https://127.0.0.1:$PORT$1" |
+  python3 -c "import json,sys; print(json.load(sys.stdin).get(sys.argv[1]))" "$3" 2>/dev/null; }
+rm -f /run/reboot-required
+eq "sans redemarrage demande, l etat le dit" "$(champ /api/state "$APIJAR" reboot)" "False"
+eq "et le releve des mises a jour aussi" "$(champ /api/systeme "$APIJAR" reboot)" "False"
+# Le systeme demande un redemarrage. L etat est releve toutes les deux secondes : il doit
+# le dire TOUT DE SUITE, sans attendre la peremption d un cache.
+: > /run/reboot-required
+eq "le redemarrage demande part avec l etat" "$(champ /api/state "$APIJAR" reboot)" "True"
+eq "et le releve des mises a jour le voit aussi" "$(champ /api/systeme "$APIJAR" reboot)" "True"
+# Le compte de paquets du releve doit etre celui du systeme MAINTENANT, et non celui du
+# cache : c est la moitie LOCALE, elle ne coute aucun acces reseau.
+PAQ=$(apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null | grep -c '^Inst ' || true)
+eq "le compte de paquets du releve est celui du systeme" "$(champ /api/systeme "$APIJAR" paquets)" "$PAQ"
+# Le compte de consultation y a droit aussi : savoir que son Pi doit redemarrer ne demande
+# aucun droit d ecriture.
+ROJAR=$(mktemp)
+curl -sk -c "$ROJAR" -o /dev/null -X POST --data-urlencode "password=$RO" "https://127.0.0.1:$PORT/login"
+eq "la consultation voit le redemarrage demande" "$(champ /api/systeme "$ROJAR" reboot)" "True"
+rm -f /run/reboot-required "$APIJAR" "$ROJAR"
 
 echo "-- sauvegarde et restauration"
 wg-pi backup >/tmp/e2e-backup.log 2>&1

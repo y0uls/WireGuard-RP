@@ -73,11 +73,30 @@ check "et son retrait aussi" "$(grep -c '^arp_libere() {' "$FW")" "1"
 # Corps complet de la fonction, et non une fenetre de N lignes : une fenetre fixe se
 # decale au premier ajout et le test passe au vert en ne regardant plus rien.
 check "base_up repose les associations" "$(awk '/^base_up()/,/^}/' "$FW" | grep -c 'arp_fige')" "1"
+# Le montage du tunnel reecrit les chaines du moteur. Avec WGPI_LOCKED, cmd_access_apply
+# sautait take_lock — alors que le parent est ici wg-quick, qui ne detient aucun verrou :
+# une ecriture venue de la CLI ou du panneau pouvait vider (-F) ce que le montage venait
+# de remplir. Hors terminal, take_lock attend son tour trente secondes au lieu d echouer.
+# Le drapeau WGPI_LOCKED est un arbitrage ASSUME, pas un oubli : systemd coupe a la fois
+# l environnement et l arbre de processus, donc le PostDown d une desinstallation
+# attendrait trente secondes le verrou que son propre appelant detient, puis renoncerait
+# — et les chaines du moteur survivraient a la desinstallation. Mesure sur un vrai noyau.
+# Le prix est nomme dans le commentaire du code : au demarrage, le montage n a pas
+# d exclusion, et le remede est « sudo wg-pi access-apply ».
+check "access_up saute le verrou, deliberement" \
+      "$(awk '/^access_up()/,/^}/' "$FW" | grep -c 'WGPI_LOCKED=1')" "1"
+check "access_down aussi" \
+      "$(awk '/^access_down()/,/^}/' "$FW" | grep -c 'WGPI_LOCKED=1')" "1"
+check "et ils appellent bien access-apply" \
+      "$(awk '/^access_up()/,/^}/' "$FW" | grep -c 'access-apply --boot')" "1"
 check "base_down les retire" "$(awk '/^base_down()/,/^}/' "$FW" | grep -c 'arp_libere')" "1"
 # Sans l interface du reseau local, « ip neigh » ne saurait pas ou poser l association.
 check "l interface du reseau local est transmise" "$(grep -c '^LAN_IF=' "$FW")" "1"
-# Un reseau entier n a pas de carte : le figer n aurait aucun sens.
-check "les reseaux sont ecartes" "$(grep -c 'case "$cible" in \*/\*)' "$FW")" "1"
+# Un reseau entier n a pas de carte : le figer n aurait aucun sens. Un « /32 » en est une,
+# en revanche, et il etait ecarte comme les autres — alors que « resource list » annoncait
+# « reveil : aa:bb:... » sur cette ligne, et qu « access check » ne disait rien.
+check "les reseaux sont ecartes" "$(grep -c '\*/\*)  continue ;;' "$FW")" "1"
+check "mais un /32 est une machine unique" "$(grep -c '\*/32) cible=${cible%/32} ;;' "$FW")" "1"
 # Le retrait doit porter sur ce que CE SCRIPT a pose, et sur rien d autre.
 #
 # Le deduire du fichier d acces laissait orpheline toute association dont l adresse avait
@@ -287,7 +306,7 @@ grep -q "ARP_STATE='$TMP/arp-figees'" "$FWX" || { echo "  KO   detournement de l
 
 STUB=$TMP/stub
 mkdir -p "$STUB"
-for c in iptables ip6tables ip sysctl systemctl conntrack modprobe logger; do
+for c in iptables ip6tables sysctl systemctl conntrack modprobe logger; do
   { echo "#!/bin/sh"
     echo "echo \"\$(basename \"\$0\") \$*\" >> \"\$CMDS\""
     echo "exit 0"
@@ -295,6 +314,23 @@ for c in iptables ip6tables ip sysctl systemctl conntrack modprobe logger; do
   chmod +x "$STUB/$c"
 done
 export CMDS=$TMP/cmds
+# « ip » a besoin de repondre a « neigh show » : c est la seule facon de distinguer une
+# entree permanente que NOUS venons de poser d une entree que l administrateur avait
+# posee lui-meme. Les adresses listees dans arp-deja sont declarees deja figees.
+export ARP_DEJA=$TMP/arp-deja
+: > "$ARP_DEJA"
+{ echo "#!/bin/sh"
+  echo 'echo "ip $*" >> "$CMDS"'
+  echo 'case "$1 $2" in'
+  echo '  "neigh show")'
+  echo '    if [ -s "$ARP_DEJA" ] && grep -qxF -- "$3" "$ARP_DEJA"; then'
+  echo '      echo "$3 lladdr aa:bb:cc:dd:ee:ff PERMANENT"'
+  echo '    fi'
+  echo '    ;;'
+  echo 'esac'
+  echo "exit 0"
+} > "$STUB/ip"
+chmod +x "$STUB/ip"
 
 # lance <verbe> [mode] [ligne du fichier d acces] : mode vide = pas de fichier du tout.
 lance() {
@@ -332,6 +368,20 @@ MAC_LIGNE="RES|nas|Le NAS|192.168.1.20|aa:bb:cc:dd:ee:ff"
 check "la MAC du fichier atteint ip neigh" \
       "$(lance up filtre "$MAC_LIGNE" | grep -c "ip neigh replace 192.168.1.20 lladdr aa:bb:cc:dd:ee:ff dev eth0 nud permanent")" "1"
 check "et la liste note ce qui a ete fige" "$(cat "$TMP/arp-figees" 2>/dev/null)" "192.168.1.20"
+# Une entree permanente DEJA posee n est pas la notre. « ip neigh replace » reussit aussi
+# dans ce cas, et l inscrire dans notre liste revient a s en approprier — puis a la
+# supprimer au premier rechargement du pare-feu. C est exactement ce que le commentaire
+# voisin promet d eviter : « ce n est pas a wg-pi de defaire ce qu il n a pas fait ».
+echo "192.168.1.20" > "$ARP_DEJA"
+SORTIE_DEJA=$(lance up filtre "$MAC_LIGNE")
+check "une entree deja permanente est quand meme (re)posee" \
+      "$(printf '%s' "$SORTIE_DEJA" | grep -c "ip neigh replace 192.168.1.20")" "1"
+check "mais wg-pi ne se l approprie PAS" \
+      "$(grep -c . "$TMP/arp-figees" 2>/dev/null || echo 0)" "0"
+# On remet l etat ou la suite des tests l attend : notre propre association, posee par nous.
+: > "$ARP_DEJA"
+lance up filtre "$MAC_LIGNE" >/dev/null
+check "et sans entree prealable, elle est bien notee" "$(cat "$TMP/arp-figees" 2>/dev/null)" "192.168.1.20"
 # Le retrait : seulement ce que NOUS avons fige, et rien d autre. Une entree permanente
 # posee par l administrateur contre l usurpation ARP ne doit pas disparaitre.
 echo "192.168.1.99" >> "$TMP/arp-figees"

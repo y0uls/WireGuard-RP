@@ -22,6 +22,7 @@ sed -e "s|^readonly STATE_DIR=.*|readonly STATE_DIR='$TMP/etc'|" \
     -e "s|^readonly WG_DIR=.*|readonly WG_DIR='$TMP/wg'|" \
     -e "s|^readonly LOCK_FILE=.*|readonly LOCK_FILE='$TMP/lock'|" \
     -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE='$TMP/log'|" \
+    -e "s|^readonly REBOOT_FILE=.*|readonly REBOOT_FILE='$TMP/reboot-required'|" \
     "$SCRIPT" > "$TMP/full.sh"
 head -n -1 "$TMP/full.sh" > "$SRC"
 
@@ -213,6 +214,54 @@ eq "aucun avertissement quand le groupe a Internet" "$(q "len(d[${DQ}acces${DQ}]
 ( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
 eq "ni hors filtrage" "$(q "len(d[${DQ}acces${DQ}][${DQ}avertissements${DQ}])")" "0"
 rm -rf "$TMP/etc/clients"
+
+echo "-- un octet de controle dans un libelle ne doit pas vider la page"
+# json_esc ne neutralisait que la tabulation et les fins de ligne. Un seul autre octet de
+# controle rend le document invalide, « json.loads » leve cote panneau, et c est la page
+# ENTIERE qui devient blanche — pour un caractere invisible. access_valid_label les refuse
+# a la saisie, mais le README presente access.conf comme modifiable a la main.
+CTRL=$(awk 'BEGIN{ printf "%c%c%c", 1, 11, 127 }')
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|g|Salon${CTRL}bis"; } > "$TMP/etc/access.conf"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "le document reste valide" \
+   "$(python3 -c "import json,sys; json.load(open(sys.argv[1])); print('oui')" "$TMP/out.json" 2>/dev/null)" "oui"
+eq "et le libelle reste lisible" \
+   "$(q "[g['libelle'] for g in d['acces']['groupes'] if g['id']=='g'][0]")" "Salon   bis"
+
+echo "-- la cible d une ressource publiee au panneau"
+# Trois lecteurs lisaient encore le champ brut : access_json, « resource list » et donc la
+# tuile du panneau. Resultat sur un fichier migre : le libelle de la regle et le pare-feu
+# disaient 192.168.7.0/24, la tuile disait 192.168.7.9/24 — une machine unique — et le
+# panneau est la seule interface du public vise.
+{
+  echo "V|1"; echo "MODE|filtre"
+  echo "RES|large|Tout le reseau|192.168.7.9/24"
+  echo "RES|seule|Une machine|192.168.7.20"
+} > "$TMP/etc/access.conf"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "la cible publiee est celle du noyau" \
+   "$(q "[r['cible'] for r in d['acces']['ressources'] if r['id']=='large'][0]")" "192.168.7.0/24"
+eq "une cible saine sort telle quelle" \
+   "$(q "[r['cible'] for r in d['acces']['ressources'] if r['id']=='seule'][0]")" "192.168.7.20"
+eq "le document reste valide" \
+   "$(python3 -c "import json,sys; json.load(open(sys.argv[1])); print('oui')" "$TMP/out.json" 2>/dev/null)" "oui"
+
+echo "-- le redemarrage demande voyage avec l etat"
+# Il ne se voyait que dans la fenetre « Mises a jour », qu il faut ouvrir expres, et qui
+# servait de surcroit un cache de quinze minutes. Signale depuis l usage reel : deux mises
+# a jour installees, le panneau continuait de les annoncer, et le redemarrage necessaire
+# n etait dit nulle part. Ici c est un simple test de fichier, donc gratuit : il part avec
+# l etat que le panneau releve toutes les deux secondes.
+eq "sans le fichier : faux" "$(q "d['reboot']")" "False"
+: > "$TMP/reboot-required"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "avec le fichier : vrai" "$(q "d['reboot']")" "True"
+# Un booleen JSON, pas une chaine : le panneau teste la valeur directement.
+eq "c est bien un booleen" "$(q "type(d['reboot']).__name__")" "bool"
+eq "le document reste valide" "$(python3 -c "import json,sys; json.load(open(sys.argv[1])); print('oui')" "$TMP/out.json" 2>/dev/null)" "oui"
+rm -f "$TMP/reboot-required"
+( source "$SRC"; cmd_json ) > "$TMP/out.json" 2>/dev/null || true
+eq "le fichier retire : faux de nouveau" "$(q "d['reboot']")" "False"
 
 echo "-- compatibilité : aucun fichier d accès"
 rm -f "$TMP/etc/access.conf"

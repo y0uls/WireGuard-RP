@@ -71,11 +71,20 @@ POLICY|p7|0|grp:invites|res:nas|any||aller|Desactivee : ne doit rien produire
 ACC
 
 LAN=192.168.1.0/24
-plan() { ( source "$SRC"; LAN_IF=eth0; LAN_NET="$LAN"; WG_PORT=51820; access_rules_plan "${1:-B}" "${2:-1}" ); }
+# Les reseaux locaux du Pi sont STUBES : les lire par « ip » ferait dependre le plan des
+# interfaces de la machine qui lance les tests. Deux reseaux au lieu d un, dont un pont
+# Docker : c est precisement la configuration que « internet » laissait joignable.
+DOCKER=172.18.0.0/16
+plan() { ( source "$SRC"; LAN_IF=eth0; LAN_NET="$LAN"; WG_PORT=51820
+           access_local_nets() { echo "$LAN"; echo "$DOCKER"; }
+           access_rules_plan "${1:-B}" "${2:-1}" ); }
 
 pass=0 fail=0
 ok() { echo "  OK   $1"; pass=$((pass + 1)); }
 ko() { echo "  KO   $1"; fail=$((fail + 1)); }
+# « eq » etait appele sans etre defini : la ligne sortait en « command not found » et son
+# assertion ne comptait ni comme reussie ni comme echouee. Un test muet est pire qu absent.
+eq() { if [[ $2 == "$3" ]]; then ok "$1"; else ko "$1"; echo "       obtenu  : [$2]"; echo "       attendu : [$3]"; fi; }
 has() { if grep -qF -- "$2" "$TMP/plan"; then ok "$1"; else ko "$1"; echo "       absent : $2"; fi; }
 hasnt() { if grep -qF -- "$2" "$TMP/plan"; then ko "$1"; echo "       present a tort : $2"; else ok "$1"; fi; }
 cnt() { local n; n=$(grep -cF -- "$3" "$TMP/plan"); if [[ $n == "$2" ]]; then ok "$1"; else ko "$1 (compte $n, attendu $2)"; fi; }
@@ -121,18 +130,36 @@ echo "-- traduction des destinations"
 # L interface de sortie n est contrainte que la ou c est necessaire. Observe sur un vrai
 # noyau : une ressource joignable autrement que par l interface de la box recevait une
 # regle qui ne pouvait jamais correspondre.
-has "internet exclut le tunnel et la maison"  "-A WGPI-S-invites-B ! -o wg0 ! -d 192.168.1.0/24"
+has "internet exclut le tunnel"               "-A WGPI-S-invites-B ! -o wg0"
+hasnt "et n exclut plus la maison a la main"   "! -d 192.168.1.0/24"
 has "maison cible le reseau, sans contrainte d interface" "-A WGPI-S-confiance-B -d 192.168.1.0/24"
 has "ressource ciblee par sa seule adresse"   "-A WGPI-S-confiance-B -d 192.168.1.20"
 hasnt "aucune contrainte -o eth0"             "-o eth0"
 has "groupe : une regle par appareil destinataire" "-A WGPI-S-confiance-B -o wg0 -d 10.8.0.2"
 has "groupe : le second appareil aussi"            "-A WGPI-S-confiance-B -o wg0 -d 10.8.0.3"
 
+echo "-- internet : les reseaux locaux du Pi sont ecartes dans WGPI-INET"
+# Une seule option « ! -d » ne peut nommer qu un reseau. Le Pi en a souvent plusieurs :
+# ponts Docker, seconde carte, VLAN. Ils sont donc ecartes dans une chaine a part.
+has "la chaine existe"                      "-N WGPI-INET-B"
+has "internet y saute"                      "-m comment --comment wgpi:pol:p2 -j WGPI-INET-B"
+has "la maison est ecartee"                 "-A WGPI-INET-B -d 192.168.1.0/24 -m comment --comment wgpi:local -j RETURN"
+has "le pont Docker aussi"                  "-A WGPI-INET-B -d 172.18.0.0/16 -m comment --comment wgpi:local -j RETURN"
+has "et le reste passe"                     "-A WGPI-INET-B -j ACCEPT"
+# RETURN et non REJECT : on revient dans la chaine du groupe, ou une regle « maison » ou
+# « ressource » plus bas peut encore autoriser cette destination. Un refus ici retirerait
+# au groupe des acces qu il a par ailleurs.
+hasnt "aucun refus dans la chaine internet"  "-A WGPI-INET-B -j REJECT"
+before "les reseaux locaux sont ecartes AVANT l acceptation" "wgpi:local" "-A WGPI-INET-B -j ACCEPT"
+# Le groupe « confiance » a internet ET la maison : la maison doit rester joignable, donc
+# la regle « maison » est toujours la, APRES le saut vers la chaine internet.
+before "internet est teste avant la maison" "wgpi:pol:p3" "wgpi:pol:p4"
+
 echo "-- protocoles et ports"
 # La plage s ecrit avec un tiret cote utilisateur et deux-points cote iptables.
 has "plage convertie en deux-points" "-p tcp -m multiport --dports 445,5000:5001"
 hasnt "aucun tiret residuel dans les ports" "--dports 445,5000-5001"
-has "protocole any sans port : aucun -p" "-A WGPI-S-invites-B ! -o wg0 ! -d 192.168.1.0/24  -m comment --comment wgpi:pol:p2 -j ACCEPT"
+has "protocole any sans port : aucun -p" "-A WGPI-S-invites-B ! -o wg0  -m comment --comment wgpi:pol:p2 -j WGPI-INET-B"
 
 echo "-- ordre des regles : le trafic de masse en premier"
 before "internet avant la maison"    "wgpi:pol:p3" "wgpi:pol:p4"
@@ -261,6 +288,37 @@ cnt "tcp pose toujours une ligne" "1" "wgpi:pol:p2"
 has "et garde ses ports" "-p tcp -m multiport --dports 443"
 cnt "icmp pose toujours une ligne" "1" "wgpi:pol:p3"
 has "et reste de l icmp" "-p icmp"
+
+echo
+echo "-- internet : la chaine suit la liste des reseaux locaux"
+# Un Pi sans Docker ni seconde carte ne doit pas payer de regle inutile, et un Pi qui en a
+# dix doit toutes les voir. La chaine est donc une fonction de la liste, pas une constante.
+{
+  echo "V|1"
+  echo "MODE|filtre"
+  echo "GROUP|invites|Invites"
+  echo "MEMBER|telephone|invites"
+  echo "POLICY|p1|1|grp:invites|internet|any||aller|Internet seulement"
+} > "$TMP/etc/access.conf"
+( source "$SRC"; LAN_IF=eth0; LAN_NET="$LAN"; WG_PORT=51820
+  access_local_nets() { echo "$LAN"; }
+  access_rules_plan B 1 ) > "$TMP/plan"
+cnt "un seul reseau local : un seul RETURN" "1" "wgpi:local"
+hasnt "et pas de pont Docker invente" "172.18.0.0/16"
+( source "$SRC"; LAN_IF=eth0; LAN_NET="$LAN"; WG_PORT=51820
+  access_local_nets() { echo "$LAN"; echo 172.17.0.0/16; echo 172.18.0.0/16; echo 10.10.0.0/16; }
+  access_rules_plan B 1 ) > "$TMP/plan"
+cnt "quatre reseaux locaux : quatre RETURN" "4" "wgpi:local"
+has "le VLAN est ecarte lui aussi" "-A WGPI-INET-B -d 10.10.0.0/16 -m comment --comment wgpi:local -j RETURN"
+# Sans aucun reseau local connu, « internet » resterait un ACCEPT nu : la chaine doit
+# quand meme exister, sinon le saut emis designerait une chaine absente et iptables
+# refuserait TOUT le plan.
+( source "$SRC"; LAN_IF=eth0; LAN_NET="$LAN"; WG_PORT=51820
+  access_local_nets() { :; }
+  access_rules_plan B 1 ) > "$TMP/plan"
+has "la chaine existe meme sans reseau local" "-N WGPI-INET-B"
+cnt "et elle ne porte alors aucun RETURN" "0" "wgpi:local"
+has "mais toujours son acceptation" "-A WGPI-INET-B -j ACCEPT"
 
 echo
 echo "  $pass réussi(s), $fail échoué(s)"

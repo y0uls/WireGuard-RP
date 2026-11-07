@@ -128,6 +128,18 @@ echo "save $*" >> "$IPT_DIR/ipt.log"
 printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' ':FORWARD ACCEPT [0:0]' ':OUTPUT ACCEPT [0:0]' 'COMMIT'
 SAVE
 chmod +x "$BIN/iptables-save"
+# ip6tables se NOMME dans le journal : sans cela ses appels seraient indistinguables de
+# ceux d iptables, et aucune assertion ne pourrait porter sur la famille IPv6.
+#
+# Son « -C » ECHOUE toujours : aucune regle ip6 n est en place dans ce bac a sable, et
+# repondre 0 ferait court-circuiter le « -I » qui suit — le code teste ne serait jamais
+# atteint, et l assertion passerait pour la mauvaise raison.
+{ echo "#!/bin/sh"
+  echo 'echo "ip6tables $*" >> "$IPT_DIR/ipt.log"'
+  echo 'case "$*" in *" -C "*) exit 1 ;; esac'
+  echo "exit 0"
+} > "$BIN/ip6tables"
+chmod +x "$BIN/ip6tables"
 cp "$BIN/iptables" "$BIN/iptables-restore"
 export IPT_DIR=$TMP
 export PATH="$BIN:$PATH"
@@ -139,7 +151,12 @@ eq() {
   if [[ $2 == "$3" ]]; then ok "$1"; else ko "$1"; echo "       obtenu  : [$2]"; echo "       attendu : [$3]"; fi
 }
 reset() { : > "$TMP/ipt.log"; : > "$TMP/ipt.exists"; : > "$TMP/ipt.fail"; rm -f "$TMP/ipt.S" "$TMP"/ipt.S.*; }
-load() { source "$SRC"; LAN_IF=eth0; LAN_NET=192.168.1.0/24; WG_PORT=51820; IPV6_NAT=0; }
+# access_local_nets est STUBEE : la lire par « ip » ferait dependre le garde-fou DNS et la
+# chaine WGPI-INET des interfaces de la machine qui lance les tests. Deux reseaux locaux,
+# dont un pont Docker — la configuration meme qui a revele le defaut.
+load() { source "$SRC"; LAN_IF=eth0; LAN_IP=192.168.1.50; LAN_NET=192.168.1.0/24
+         WG_PORT=51820; IPV6_NAT=0
+         access_local_nets() { echo 192.168.1.0/24; echo 172.18.0.0/16; }; }
 # Numero de la premiere ligne du journal contenant le motif, vide si absent.
 at() { grep -nF -- "$1" "$TMP/ipt.log" | head -n1 | cut -d: -f1; }
 before() {
@@ -153,13 +170,65 @@ eq "l autre tampon de A est B" "$(load; access_other_buffer A)" "B"
 eq "l autre tampon de B est A" "$(load; access_other_buffer B)" "A"
 
 echo "-- lecture de l etat dans le noyau"
+# « iptables -S FORWARD » commence par « -P FORWARD <politique> ». access_switch insere le
+# saut du moteur en POSITION 1, donc devant le socle conntrack pose a l installation : le
+# saut est en LIGNE 2 de la sortie, ce que access_jump_first teste par « NR == 2 ».
+forward_sain() {
+  printf '%s\n' "-P FORWARD ACCEPT" \
+    "-A FORWARD -i wg0 -j WGPI-FWD-B" \
+    "-A FORWARD -o wg0 ! -i wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" > "$TMP/ipt.S.FORWARD"
+}
+# Ce que le demon Docker laisse apres un redemarrage : il reinstalle ses regles avec
+# « -I FORWARD », donc DEVANT le saut du moteur, qui n est alors plus consulte.
+forward_docker_devant() {
+  printf '%s\n' "-P FORWARD DROP" \
+    "-A FORWARD -j DOCKER-USER" \
+    "-A FORWARD -j DOCKER-ISOLATION-STAGE-1" \
+    "-A FORWARD -o docker0 -j DOCKER" \
+    "-A FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.S.FORWARD"
+}
 reset
 eq "aucun saut : inactif" "$(load; access_kernel_state)" "inactif"
 
 reset
 echo "FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.exists"
 printf '%s\n' "-A WGPI-FWD-B -s 10.8.0.2 -j WGPI-S-tous-B" "-A WGPI-FWD-B -j WGPI-DENY-B" > "$TMP/ipt.S.WGPI-FWD-B"
-eq "saut present et chaine complete : actif" "$(load; access_kernel_state)" "actif"
+forward_sain
+eq "saut present, en tete, chaine complete : actif" "$(load; access_kernel_state)" "actif"
+
+# LE cas que personne ne regardait : la chaine est toujours la, « iptables -C » reussit
+# donc, mais le demon Docker a insere ses regles devant et le moteur n est plus consulte.
+# access_jump_first existait, avec le bon commentaire, et n avait AUCUN appelant dans le
+# produit : tout l affichage restait vert pendant que le cloisonnement ne s appliquait plus.
+reset
+echo "FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.exists"
+printf '%s\n' "-A WGPI-FWD-B -j WGPI-DENY-B" > "$TMP/ipt.S.WGPI-FWD-B"
+forward_docker_devant
+eq "saut relegue derriere Docker : incoherent" "$(load; access_kernel_state)" "incoherent"
+eq "et access_jump_first le dit" "$(load; access_jump_first && echo oui || echo non)" "non"
+# Le meme etat, remis en ordre : actif de nouveau.
+forward_sain
+eq "le saut remis en tete : actif" "$(load; access_kernel_state)" "actif"
+eq "et access_jump_first le confirme" "$(load; access_jump_first && echo oui || echo non)" "oui"
+
+# « access show » annoncait « Filtrage actif » sur la seule foi du fichier, alors que le
+# projet se donne par ecrit la regle inverse. C est la commande que le menu met en avant.
+printf '%s\n' "V|1" "MODE|filtre" "GROUP|g|G" "POLICY|p1|1|grp:g|internet|any||aller|Internet" > "$TMP/etc/access.conf"
+forward_sain
+eq "access show, noyau actif : il le dit" "$(load; access_show 2>&1 | grep -c 'Filtrage actif')" "1"
+forward_docker_devant
+eq "access show, noyau incoherent : il ne dit plus actif" \
+   "$(load; access_show 2>&1 | grep -c 'Filtrage actif')" "0"
+eq "il nomme le probleme" "$(load; access_show 2>&1 | grep -c 'ne l.applique pas')" "1"
+eq "et la commande qui repare" "$(load; access_show 2>&1 | grep -c 'access-apply')" "1"
+reset
+eq "access show, aucune regle dans le noyau : il le dit" \
+   "$(load; access_show 2>&1 | grep -c 'AUCUNE règle')" "1"
+eq "et il ne pretend pas filtrer" "$(load; access_show 2>&1 | grep -c 'Filtrage actif')" "0"
+# Hors filtrage, le message reste celui du mode ouvert.
+printf '%s\n' "V|1" "MODE|ouvert" "GROUP|g|G" > "$TMP/etc/access.conf"
+eq "mode ouvert : aucun cloisonnement" "$(load; access_show 2>&1 | grep -c 'Aucun cloisonnement')" "1"
+printf '%s\n' "V|1" "MODE|filtre" "GROUP|g|G" "POLICY|p1|1|grp:g|internet|any||aller|Internet" > "$TMP/etc/access.conf"
 
 # Une chaine d entree qui ne finit pas par le saut vers le refus laisse passer tout ce qui
 # n a pas correspondu : c est incoherent, pas actif.
@@ -321,8 +390,93 @@ reset
 # Deja actif : on ne refait rien.
 echo "FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.exists"
 printf '%s\n' "-A WGPI-FWD-B -j WGPI-DENY-B" > "$TMP/ipt.S.WGPI-FWD-B"
+forward_sain
 ( load; cmd_access_on ) >/dev/null 2>&1
 eq "deja actif : aucune reapplication" "$(grep -cE -- '-I (FORWARD|INPUT) 1 -i wg0 -j WGPI-' "$TMP/ipt.log")" "0"
+# En revanche, un saut relegue derriere Docker n est PAS « deja actif » : « access on »
+# doit reappliquer, puisque c est la remediation que le diagnostic prescrit.
+reset
+echo "FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.exists"
+printf '%s\n' "-A WGPI-FWD-B -j WGPI-DENY-B" > "$TMP/ipt.S.WGPI-FWD-B"
+forward_docker_devant
+( load; cmd_access_on ) >/dev/null 2>&1
+eq "saut relegue : access on reapplique" \
+   "$([[ $(grep -cE -- '-I (FORWARD|INPUT) 1 -i wg0 -j WGPI-' "$TMP/ipt.log") -ge 1 ]] && echo oui || echo non)" "oui"
+forward_sain
+
+echo "-- un access on qui echoue ne laisse pas MODE|filtre"
+# cmd_access_apply signale chacun de ses echecs par « die », et « die » fait « exit 1 ».
+# Appelee directement, elle tuait le processus entier : le rattrapage qui remet le mode a
+# « ouvert » n etait JAMAIS execute, et le filtrage se rallumait tout seul au montage
+# suivant du tunnel — alors que l utilisateur venait de lire « le filtrage n est donc pas
+# applique ». L appel passe desormais par un sous-shell.
+reset
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|g|G"
+  echo "POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert"; } > "$TMP/etc/access.conf"
+# On fait echouer l application la ou elle « die » : le plan refuse par le noyau.
+echo "-N WGPI-" > "$TMP/ipt.fail"
+( load; cmd_access_on ) >/dev/null 2>&1
+eq "le mode est remis a ouvert" "$(load; access_mode)" "ouvert"
+eq "et le code de retour dit l echec" \
+   "$(load; cmd_access_on >/dev/null 2>&1 && echo ok || echo echec)" "echec"
+: > "$TMP/ipt.fail"
+# Et une activation qui REUSSIT laisse bien le mode a filtre.
+reset
+{ echo "V|1"; echo "MODE|ouvert"; echo "GROUP|g|G"
+  echo "POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert"; } > "$TMP/etc/access.conf"
+( load; cmd_access_on ) >/dev/null 2>&1
+eq "une activation reussie ecrit filtre" "$(load; access_mode)" "filtre"
+
+echo "-- access off retablit les DEUX acceptations"
+# base_up pose l acceptation sur les deux familles hors filtrage. access_unswitch, chemin
+# de sortie a chaud, retirait bien la coupure IPv6 mais ne reposait que l IPv4 : sur un Pi
+# a IPv6 publique derriere ufw, « access off » annoncait « tous vos appareils peuvent a
+# nouveau tout joindre » et l IPv6 du VPN restait muette.
+reset
+( load; IPV6_NAT=1; access_unswitch ) >/dev/null 2>&1
+eq "l acceptation IPv4 est reposee" \
+   "$(grep -c -- '^-w -I FORWARD 1 -i wg0 -j ACCEPT' "$TMP/ipt.log")" "1"
+eq "et l IPv6 aussi" \
+   "$(grep -c -- '^ip6tables -w -I FORWARD 1 -i wg0 -j ACCEPT' "$TMP/ipt.log")" "1"
+# Sans IPv6 routee, rien a reposer de ce cote : poser une regle ip6tables sur un Pi sans
+# IPv6 serait du bruit, et le retrait de la coupure suffit.
+reset
+( load; IPV6_NAT=0; access_unswitch ) >/dev/null 2>&1
+eq "sans IPv6 routee, aucune regle ip6 n est posee" \
+   "$(grep -c -- '^ip6tables -w -I FORWARD 1' "$TMP/ipt.log")" "0"
+
+echo "-- un reseau local apparu APRES la derniere application"
+# La chaine « Internet seulement » est un instantane. Un pont cree depuis par un
+# « docker compose up » est joignable depuis un groupe cense n avoir qu Internet, et rien
+# ne provoque de reapplication : l etat lu dans le noyau reste « actif », puisque la
+# topologie des sauts est intacte. Le diagnostic est le seul endroit ou l ecart se voit.
+reset
+{ echo "V|1"; echo "MODE|filtre"; echo "GROUP|g|G"
+  echo "POLICY|p1|1|grp:tous|internet|any||aller|Internet"; } > "$TMP/etc/access.conf"
+echo "FORWARD -i wg0 -j WGPI-FWD-B" > "$TMP/ipt.exists"
+forward_sain
+# La chaine posee ne connait que la maison ; load() en declare deux.
+printf '%s\n' "-A WGPI-INET-B -d 192.168.1.0/24 -m comment --comment wgpi:local -j RETURN" \
+  "-A WGPI-INET-B -j ACCEPT" > "$TMP/ipt.S.WGPI-INET-B"
+eq "le reseau manquant est nomme" \
+   "$(load; access_inet_stale_warn 2>&1 | grep -c '172.18.0.0/16')" "1"
+eq "et la commande qui referme aussi" \
+   "$(load; access_inet_stale_warn 2>&1 | grep -c 'access-apply')" "1"
+eq "il rend non nul" "$(load; access_inet_stale_warn >/dev/null 2>&1 && echo oui || echo non)" "non"
+eq "la version note avale le code" "$(load; access_inet_stale_note >/dev/null 2>&1 && echo oui || echo non)" "oui"
+# La chaine a jour ne declenche rien.
+printf '%s\n' "-A WGPI-INET-B -d 192.168.1.0/24 -m comment --comment wgpi:local -j RETURN" \
+  "-A WGPI-INET-B -d 172.18.0.0/16 -m comment --comment wgpi:local -j RETURN" \
+  "-A WGPI-INET-B -j ACCEPT" > "$TMP/ipt.S.WGPI-INET-B"
+eq "une chaine a jour ne declenche rien" "$(load; access_inet_stale_warn 2>&1 | grep -c 'apparu')" "0"
+eq "et elle rend 0" "$(load; access_inet_stale_warn >/dev/null 2>&1 && echo oui || echo non)" "oui"
+# Hors filtrage, le sujet ne se pose pas.
+{ echo "V|1"; echo "MODE|ouvert"; } > "$TMP/etc/access.conf"
+eq "hors filtrage : rien a dire" "$(load; access_inet_stale_warn >/dev/null 2>&1 && echo oui || echo non)" "oui"
+rm -f "$TMP/ipt.S.WGPI-INET-B"
+# L etat ou la suite des tests l attend : mode filtre, une regle.
+{ echo "V|1"; echo "MODE|filtre"; echo "GROUP|g|G"
+  echo "POLICY|p1|1|grp:tous|internet|any||aller|Tout ouvert"; } > "$TMP/etc/access.conf"
 
 echo "-- la confirmation survit au redemarrage"
 CONF_FILE=$TMP/etc/access-confirme
@@ -360,28 +514,176 @@ eq "une nouvelle activation remet a zero la confirmation" \
    "$(load; access_set_confirmed 1; cmd_access_on >/dev/null 2>&1; access_confirmed && echo oui || echo non)" "non"
 
 echo "-- avertissement sur le DNS de la box"
-# « Internet seulement » exclut le reseau de la maison, donc la box. Si le DNS des
-# appareils EST la box, plus aucun nom ne se resout : il faut le dire AVANT d appliquer.
+# « Internet seulement » ecarte TOUS les reseaux locaux du Pi, donc la box. Si le DNS des
+# appareils est dans l un de ces reseaux, plus aucun nom ne se resout : il faut le dire
+# AVANT d appliquer.
 cat > "$TMP/etc/access.conf" <<'ACC'
 V|1
 MODE|ouvert
 GROUP|invites|Invites
+MEMBER|telephone|invites
 POLICY|p1|1|grp:invites|internet|any||aller|Internet seulement
 ACC
-eq "le groupe est signale" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_groups | cut -d'|' -f1)" "invites"
+# Le garde-fou raisonne par APPAREIL. Les appartenances CUMULENT les autorisations — le
+# moteur pose un saut par couple (appareil, groupe) — et juger chaque groupe seul rendait
+# l avertissement faux des que la couverture DNS etait posee sur un groupe et Internet sur
+# un autre, ce qui faisait de surcroit sortir « access check » en erreur.
+eq "l appareil est signale" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f1)" "telephone"
+eq "et l adresse de son DNS avec" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f2)" "192.168.1.1"
 eq "l avertissement donne la commande qui repare" \
    "$(load; CLIENT_DNS=192.168.1.1; access_dns_warn 2>&1 | grep -c 'resource add dns 192.168.1.1')" "1"
+# Le remede porte sur « tous », qui contient TOUJOURS tout le monde : la commande donnee
+# ne peut donc pas tomber a cote, quels que soient les groupes de l appareil bloque.
+eq "et il porte sur le groupe automatique" \
+   "$(load; CLIENT_DNS=192.168.1.1; access_dns_warn 2>&1 | grep -c 'access allow tous res:dns')" "2"
+eq "il nomme l appareil bloque" \
+   "$(load; CLIENT_DNS=192.168.1.1; access_dns_warn 2>&1 | grep -c 'telephone')" "1"
+# Le code de retour : « warn » rend non nul, « note » l avale. C est cette paire qui permet
+# de le brancher sur les chemins d ECRITURE sans transformer un avertissement en echec.
+eq "warn rend non nul quand il avertit" \
+   "$(load; CLIENT_DNS=192.168.1.1; access_dns_warn >/dev/null 2>&1 && echo oui || echo non)" "non"
+eq "note avale le code" \
+   "$(load; CLIENT_DNS=192.168.1.1; access_dns_note >/dev/null 2>&1 && echo oui || echo non)" "oui"
+
 # Un DNS public est deja sur Internet : rien a signaler.
-eq "DNS public : aucun avertissement" "$(load; CLIENT_DNS=1.1.1.1; access_dns_blocked_groups | wc -l)" "0"
-# Et une regle qui couvre la maison resout le probleme.
+eq "DNS public : aucun avertissement" "$(load; CLIENT_DNS=1.1.1.1; access_dns_blocked_devices | wc -l)" "0"
+# Un DNS sur un AUTRE reseau local du Pi — Pi-hole en conteneur, pont Docker. Depuis que
+# la chaine WGPI-INET ecarte tous les reseaux locaux, « internet » l exclut lui aussi ; le
+# garde-fou ne cherchait son DNS que dans LAN_NET et se taisait completement.
+eq "DNS sur un pont Docker : signale" \
+   "$(load; CLIENT_DNS=172.18.0.2; access_dns_blocked_devices | cut -d'|' -f2)" "172.18.0.2"
+# Le DNS qui est le Pi LUI-MEME passe par INPUT et non par FORWARD : il arrive toujours.
+# Avertir etait faux, et le remede dicte posait une regle dans une chaine de FORWARD ou un
+# tel paquet ne passe jamais — apres quoi le garde-fou se taisait, pour une mauvaise raison.
+eq "DNS = le Pi : rien a signaler" \
+   "$(load; CLIENT_DNS=192.168.1.50; access_dns_blocked_devices | wc -l)" "0"
+eq "DNS en boucle locale non plus" \
+   "$(load; CLIENT_DNS=127.0.0.1; access_dns_blocked_devices | wc -l)" "0"
+# Plusieurs DNS : le premier qui est derriere le filtre est celui qui compte.
+eq "le premier DNS local est retenu" \
+   "$(load; CLIENT_DNS=1.1.1.1,192.168.1.1; access_dns_blocked_devices | cut -d'|' -f2)" "192.168.1.1"
+
+echo "-- le DNS couvert par un AUTRE groupe du meme appareil"
 cat > "$TMP/etc/access.conf" <<'ACC'
 V|1
 MODE|ouvert
 GROUP|invites|Invites
-POLICY|p1|1|grp:invites|internet|any||aller|Internet
-POLICY|p2|1|grp:invites|maison|any||aller|La maison
+MEMBER|telephone|invites
+POLICY|p1|1|grp:tous|maison|any||aller|La maison, pour tous
+POLICY|p2|1|grp:invites|internet|any||aller|Internet seulement
 ACC
-eq "acces a la maison : aucun avertissement" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_groups | wc -l)" "0"
+# Dans le noyau, l appareil saute dans WGPI-S-invites PUIS dans WGPI-S-tous : le paquet
+# UDP/53 vers la box est accepte par la seconde. L avertissement serait donc faux.
+eq "le cumul des groupes est pris en compte" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | wc -l)" "0"
+# Et un appareil qui n est dans AUCUN groupe nomme depend des seules regles de « tous ».
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+POLICY|p1|1|grp:tous|internet|any||aller|Internet seulement
+ACC
+eq "le groupe automatique est traite comme les autres" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f1)" "telephone"
+# Sans regle internet, le sujet ne se pose pas.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+POLICY|p1|1|grp:invites|maison|any||aller|La maison seulement
+ACC
+eq "sans regle internet : hors sujet" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | wc -l)" "0"
+
+echo "-- couverture du DNS : la destination ne suffit pas, le port compte"
+# Une regle « maison » restreinte au partage de fichiers comptait comme couverture du
+# DNS : l avertissement se taisait sur une configuration ou aucun nom ne se resout.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:invites|maison|tcp|445|aller|Le partage de fichiers
+ACC
+eq "la maison sur le mauvais port ne couvre pas le DNS" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f1)" "telephone"
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:invites|maison|udp|53|aller|Le DNS
+ACC
+eq "la maison en UDP 53 couvre le DNS" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | wc -l)" "0"
+
+# Une ressource RESEAU qui contient le DNS : « /32 » etait concatene sans regarder, donc
+# la comparaison echouait sur « 192.168.1.0/24 » et une ressource qui couvre pourtant le
+# DNS ne comptait pas — avertissement FAUX, compte comme un probleme par « wg-pi check ».
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+RES|lan|Le reseau de la maison|192.168.1.0/24
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:invites|res:lan|any||aller|Le reseau
+ACC
+eq "une ressource reseau couvrant le DNS compte" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | wc -l)" "0"
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+RES|lan|Le reseau de la maison|192.168.1.0/24
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:invites|res:lan|tcp|445|aller|Le partage
+ACC
+eq "la meme ressource sur le mauvais port ne couvre pas" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f1)" "telephone"
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+RES|nas|Le NAS|192.168.1.20
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:invites|res:nas|udp|53|aller|Un DNS qui n existe pas la
+ACC
+eq "une autre machine, meme en UDP 53, ne couvre pas" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | cut -d'|' -f1)" "telephone"
+# Et le remede que l avertissement propose lui-meme doit le faire taire : sinon il envoie
+# l utilisateur dans le vide.
+cat > "$TMP/etc/access.conf" <<'ACC'
+V|1
+MODE|ouvert
+GROUP|invites|Invites
+MEMBER|telephone|invites
+RES|dns|Le DNS de la box|192.168.1.1
+POLICY|p1|1|grp:invites|internet|any||aller|Internet
+POLICY|p2|1|grp:tous|res:dns|udp|53|aller|Le DNS
+ACC
+eq "le remede propose fait taire l avertissement" "$(load; CLIENT_DNS=192.168.1.1; access_dns_blocked_devices | wc -l)" "0"
+
+# La fonction de port, cas par cas.
+eq "any sans ports couvre"      "$(load; access_dns_port_ok any "" && echo oui || echo non)" oui
+eq "udp sans ports couvre"      "$(load; access_dns_port_ok udp "" && echo oui || echo non)" oui
+eq "udp 53 couvre"              "$(load; access_dns_port_ok udp 53 && echo oui || echo non)" oui
+eq "tcpudp 53 couvre"           "$(load; access_dns_port_ok tcpudp 53 && echo oui || echo non)" oui
+eq "une plage contenant 53 couvre" "$(load; access_dns_port_ok udp 50-60 && echo oui || echo non)" oui
+eq "53 dans une liste couvre"   "$(load; access_dns_port_ok udp 123,53,443 && echo oui || echo non)" oui
+# Le TCP seul ne couvre pas : les resolveurs essaient l UDP d abord, et une resolution
+# qui ne tient pas dans un paquet est l exception, pas la regle.
+eq "tcp seul ne couvre pas"     "$(load; access_dns_port_ok tcp 53 && echo oui || echo non)" non
+eq "icmp ne couvre pas"         "$(load; access_dns_port_ok icmp "" && echo oui || echo non)" non
+eq "un autre port ne couvre pas" "$(load; access_dns_port_ok udp 443 && echo oui || echo non)" non
+eq "une plage sans 53 ne couvre pas" "$(load; access_dns_port_ok udp 60-70 && echo oui || echo non)" non
+
+# Un zero en tete est refuse A LA SAISIE : iptables lit « 053 » comme de l OCTAL, donc 43.
+# La regle ouvrait un autre port que celui affiche partout, et le garde-fou DNS — qui
+# normalise en decimal — declarait couvert un DNS en realite ferme.
+eq "053 est refuse"             "$(load; access_valid_ports 053 && echo oui || echo non)" non
+eq "040-060 aussi"             "$(load; access_valid_ports 040-060 && echo oui || echo non)" non
+eq "une liste qui en contient un" "$(load; access_valid_ports 53,080 && echo oui || echo non)" non
+eq "la borne haute compte aussi" "$(load; access_valid_ports 40-060 && echo oui || echo non)" non
+eq "53 reste accepte"           "$(load; access_valid_ports 53 && echo oui || echo non)" oui
+eq "une plage normale aussi"    "$(load; access_valid_ports 5000-5001 && echo oui || echo non)" oui
+eq "et le port 0 seul reste refuse" "$(load; access_valid_ports 0 && echo oui || echo non)" non
 echo
 echo "-- modification, reapplication, et coherence du filet"
 # Le critere n est pas « on reapplique » mais « la configuration a-t-elle change ».
